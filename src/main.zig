@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const sst = @import("sstable.zig");
+const CsvTokenizer = @import("csv_reader.zig").CsvTokenizer;
 const Memtable = @import("memtable.zig").Memtable;
 const WAL = @import("wal.zig").WAL;
 
@@ -10,6 +11,8 @@ const hasher = std.hash.Murmur2_64;
 const Allocator = std.mem.Allocator;
 const SSTable = sst.SSTable;
 const Row = sst.SSTableRow;
+
+pub const CSV = CsvTokenizer(std.fs.File.Reader);
 
 const DatabaseOpts = struct {
     data_dir: []const u8,
@@ -21,6 +24,7 @@ const DatabaseOpts = struct {
 
 const Database = struct {
     alloc: Allocator,
+    capacity: usize,
     mtable: Memtable(u64, []const u8),
     opts: DatabaseOpts,
     sstables: std.ArrayList(*SSTable),
@@ -30,11 +34,18 @@ const Database = struct {
     const Error = error{};
 
     pub fn init(alloc: Allocator, opts: DatabaseOpts) !Self {
-        var wal = try WAL.init(opts.data_dir, opts.wal_capacity);
+        const pathname = opts.data_dir;
+        const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "wal.dat"});
+        defer alloc.free(filename);
+
+        var wal = try WAL.init(filename, opts.wal_capacity);
         var sstables = std.ArrayList(*SSTable).init(alloc);
         var memtable = try Memtable(u64, []const u8).init(alloc);
+        var capacity = opts.sst_capacity / @sizeOf(Row);
+
         return .{
             .alloc = alloc,
+            .capacity = capacity,
             .mtable = memtable,
             .opts = opts,
             .sstables = sstables,
@@ -46,7 +57,9 @@ const Database = struct {
         self.mtable.deinit();
         for (self.sstables.items) |table| {
             table.deinit();
+            self.alloc.destroy(table);
         }
+        self.sstables.deinit();
         self.* = undefined;
     }
 
@@ -80,25 +93,31 @@ const Database = struct {
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
         const k: u64 = hasher.hash(key);
         try self.wal.write(k, value);
+        if (self.mtable.count() >= self.capacity) {
+            try self.flush();
+        }
         try self.mtable.put(k, value);
     }
 
     fn flush(self: *Self) !void {
-        var sstable = try SSTable(Row).init(
-            self.alloc, self.opts.data_dir, self.opts.sst_capacity);
-        self.sstables.append(sstable);
+        const pathname = self.opts.data_dir;
+        const filename = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{pathname, "sstable.dat"});
+        defer self.alloc.free(filename);
+        var sstable = try SSTable.init(
+            self.alloc, filename, self.opts.sst_capacity);
         try self.mtable.flush(sstable);
+        try self.sstables.append(sstable);
         var tmp = self.mtable;
         defer tmp.deinit();
-        self.mtable = try Memtable(i64, []const u8).init(self.alloc);
+        self.mtable = try Memtable(u64, []const u8).init(self.alloc);
     }
 };
 
 pub fn defaultDatabase(alloc: Allocator) !Database {
     const opts: DatabaseOpts = .{
         .data_dir = "data",
-        .wal_capacity = std.mem.page_size,
-        .sst_capacity = std.mem.page_size,
+        .wal_capacity = std.mem.page_size * std.mem.page_size,
+        .sst_capacity = std.mem.page_size * std.mem.page_size,
     };
     return try databaseFromOpts(alloc, opts);
 }

@@ -33,6 +33,10 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             return self.hash_map.get(key);
         }
 
+        pub fn count(self: Self) usize {
+            return self.hash_map.count();
+        }
+
         pub const Iterator = struct {
             hash_iter: std.AutoArrayHashMap(K, V).Iterator,
 
@@ -64,8 +68,8 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
 
         pub fn flush(self: *Self, sstable: *SSTable) !void {
             var iter = self.iterator();
-            for (iter.next()) |row| {
-                try sstable.write(row.key_ptr, row.val_ptr);
+            while (iter.next()) |row| {
+                try sstable.write(row.key_ptr.*, row.value_ptr.*);
             }
         }
     };

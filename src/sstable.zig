@@ -91,7 +91,7 @@ test "SSTable" {
     const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
-    defer testDir.dir.deleteDir(pathname) catch {};
+    defer testDir.dir.deleteTree(pathname) catch {};
 
     // given
     const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "sstable.dat"});
@@ -108,4 +108,5 @@ test "SSTable" {
     // then
     const actual = try st.read(key);
     try testing.expect(std.mem.eql(u8, expected, actual));
+
 }

@@ -14,6 +14,8 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    // Add custom modules so they can be referenced from our test directory
+    const lsm = b.addModule("lsm", .{ .source_file = .{ .path = "src/main.zig" } });
 
     const lib = b.addStaticLibrary(.{
         .name = "lib_lsm",
@@ -44,4 +46,22 @@ pub fn build(b: *std.Build) void {
     // This will evaluate the `test` step rather than the default, which is "install".
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_main_tests.step);
+
+    {
+        const exe = b.addExecutable(.{
+            .name = "lsm",
+            .root_source_file = .{ .path = "test/main.zig" },
+            .target = target,
+            .optimize = optimize,
+        });
+        b.installArtifact(exe);
+        exe.addModule("lsm", lsm);
+        const run_cmd = b.addRunArtifact(exe);
+        run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+        const run_step = b.step("run-lsm", "Run the test app");
+        run_step.dependOn(&run_cmd.step);
+    }
 }

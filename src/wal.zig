@@ -23,27 +23,41 @@ pub const WAL = struct {
         return .{.data = data};
     }
 
+    pub fn deinit(self: *Self) void {
+        self.data.deinit();
+        self.* = undefined;
+    }
+
     pub fn write(self: *Self, key: u64, value: []const u8) Error!void {
         return try self.data.append(Row{ .key = key, .value = value.ptr });
     }
 
-    pub const Iterator = struct {
-        data: std.io.Reader,
+    pub const Result = struct {
+        key: u64,
+        value: []const u8,
+    };
 
-        pub fn next(it: *Iterator) ?Row {
-            if (it.data.read()) |row| {
-                return row;
-            }
-            return null;
+    pub const Iterator = struct {
+        idx: usize,
+        data: MMap(Row),
+
+        pub fn next(it: *Iterator) ?Result {
+            const row = it.data.read(it.*.idx) catch return null;
+            it.*.idx += 1;
+            const value = std.mem.span(row.value);
+            return .{
+                .key = row.key,
+                .value = value,
+            };
         }
 
         pub fn reset(it: *Iterator) void {
-            it.hash_iter.reset();
+            it.*.idx = 0;
         }
     };
 
     pub fn iterator(self: Self) Iterator {
-        return .{.data = self.data.buf.reader()};
+        return .{.idx = 0, .data = self.data };
     }
 };
 
@@ -54,13 +68,21 @@ test WAL {
     const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
-    defer testDir.dir.deleteDir(pathname) catch {};
+    defer testDir.dir.deleteTree(pathname) catch {};
 
-    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "sstable.dat"});
+    // given
+    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "wal.dat"});
     defer alloc.free(filename);
     var st = try WAL.init(filename, std.mem.page_size);
+    defer st.deinit();
 
-    const key = std.hash.Murmur2_64.hash("__key__");
-    const expected = "__value__";
+    // when
+    const key: u64 = std.hash.Murmur2_64.hash("__key__");
+    const expected: []const u8 = "__value__";
     try st.write(key, expected);
+
+    // then
+    var iter = st.iterator();
+    var actual = iter.next();
+    try testing.expectEqualStrings(expected, actual.?.value);
 }

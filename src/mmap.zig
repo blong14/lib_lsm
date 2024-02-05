@@ -97,7 +97,7 @@ test "MMap append" {
     const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
-    defer testDir.dir.deleteDir(pathname) catch {};
+    defer testDir.dir.deleteTree(pathname) catch {};
 
     // given
     const key = std.hash.Murmur2_64.hash("__key__");
@@ -133,7 +133,7 @@ test "MMap insert" {
     const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
-    defer testDir.dir.deleteDir(pathname) catch {};
+    defer testDir.dir.deleteTree(pathname) catch {};
 
     // given
     const key = std.hash.Murmur2_64.hash("__key__");
