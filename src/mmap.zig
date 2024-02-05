@@ -15,7 +15,7 @@ pub fn MMap(comptime T: type) type {
 
         const Self = @This();
 
-        pub const Error = error {
+        pub const Error = error{
             EndOfStream,
             ReadError,
             PipeBusy,
@@ -64,8 +64,8 @@ pub fn MMap(comptime T: type) type {
             const index: usize = self.size * idx;
             try self.buf.seekTo(index);
             const start: usize = try self.buf.getPos();
-            const end: usize =  try self.buf.getEndPos() - self.size;
-            copyForwards(u8, self.buf.buffer[start + self.size..], self.buf.buffer[start..end]);
+            const end: usize = try self.buf.getEndPos() - self.size;
+            copyForwards(u8, self.buf.buffer[start + self.size ..], self.buf.buffer[start..end]);
             try self.buf.writer().writeStruct(value);
             self.count += 1;
         }
@@ -101,24 +101,24 @@ test "MMap append" {
 
     // given
     const key = std.hash.Murmur2_64.hash("__key__");
-    const expected: Row = .{.key = key, .value = "__value__"};
-    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "append.dat"});
+    const expected: Row = .{ .key = key, .value = "__value__" };
+    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "append.dat" });
     defer alloc.free(filename);
 
     var map = try MMap(Row).init(filename, std.mem.page_size);
     defer map.deinit();
 
     // when
-    try map.append(Row{.key = std.hash.Murmur2_64.hash("__key_0__"), .value = "__value0__"});
-    try map.append(Row{.key = std.hash.Murmur2_64.hash("__key_1__"), .value = "__value1__"});
-    try map.append(Row{.key = std.hash.Murmur2_64.hash("__key_2__"), .value = "__value2__"});
+    try map.append(Row{ .key = std.hash.Murmur2_64.hash("__key_0__"), .value = "__value0__" });
+    try map.append(Row{ .key = std.hash.Murmur2_64.hash("__key_1__"), .value = "__value1__" });
+    try map.append(Row{ .key = std.hash.Murmur2_64.hash("__key_2__"), .value = "__value2__" });
     try map.append(expected);
 
     // then
     try testing.expect(map.count == 4);
 
     const actual = try map.read(3);
-    std.debug.print("{d} {s}\n", .{actual.key, actual.value});
+    std.debug.print("{d} {s}\n", .{ actual.key, actual.value });
     try testing.expect(expected.key == actual.key);
 }
 
@@ -137,8 +137,8 @@ test "MMap insert" {
 
     // given
     const key = std.hash.Murmur2_64.hash("__key__");
-    var expected: Row = .{.key = key, .value = "__expected__"};
-    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "insert.dat"});
+    var expected: Row = .{ .key = key, .value = "__expected__" };
+    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "insert.dat" });
     defer alloc.free(filename);
 
     var map = try MMap(Row).init(filename, std.mem.page_size);
@@ -163,6 +163,6 @@ test "MMap insert" {
     try testing.expect(map.count == 4);
 
     var actual = try map.read(1);
-    std.debug.print("{d} {s}\n", .{actual.key, actual.value});
+    std.debug.print("{d} {s}\n", .{ actual.key, actual.value });
     try testing.expect(expected.key == actual.key);
 }

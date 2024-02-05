@@ -24,7 +24,7 @@ pub const SSTable = struct {
         var data = try MMap(SSTableRow).init(path, capacity);
         const cap = capacity / @sizeOf(SSTableRow);
         const st = try alloc.create(Self);
-        st.* = .{.alloc = alloc, .capacity = cap, .data = data};
+        st.* = .{ .alloc = alloc, .capacity = cap, .data = data };
         return st;
     }
 
@@ -81,7 +81,6 @@ pub const SSTable = struct {
         const idx = try self.findIndex(key, 0, count - 1);
         try self.data.insert(idx, SSTableRow{ .key = key, .value = value.ptr });
     }
-
 };
 
 test "SSTable" {
@@ -94,7 +93,7 @@ test "SSTable" {
     defer testDir.dir.deleteTree(pathname) catch {};
 
     // given
-    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "sstable.dat"});
+    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "sstable.dat" });
     defer alloc.free(filename);
     var st = try SSTable.init(alloc, filename, std.mem.page_size);
     defer alloc.destroy(st);
@@ -108,5 +107,4 @@ test "SSTable" {
     // then
     const actual = try st.read(key);
     try testing.expect(std.mem.eql(u8, expected, actual));
-
 }

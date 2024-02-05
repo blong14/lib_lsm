@@ -30,7 +30,7 @@ pub fn main() !void {
             },
             .row_end => {
                 db.write(row[key], row[value]) catch |err| {
-                    std.debug.print("count {d} {s}\n", .{count, @errorName(err)});
+                    std.debug.print("count {d} {s}\n", .{ count, @errorName(err) });
                     return;
                 };
                 count += 1;
@@ -41,7 +41,7 @@ pub fn main() !void {
     }
 
     const end = timer.read();
-    std.debug.print("total rows read {d} in {}ms\n", .{count, (end-start)/1_000_000});
+    std.debug.print("total rows read {d} in {}ms\n", .{ count, (end - start) / 1_000_000 });
     db.deinit();
     _ = gpa.deinit();
 }

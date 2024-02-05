@@ -17,7 +17,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
 
         pub fn init(alloc: Allocator) !Self {
             var map = std.AutoArrayHashMap(K, V).init(alloc);
-            return .{.hash_map = map};
+            return .{ .hash_map = map };
         }
 
         pub fn deinit(self: *Self) void {
@@ -63,7 +63,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
 
         pub fn iterator(self: Self) Iterator {
             var iter = self.hash_map.iterator();
-            return .{.hash_iter = iter};
+            return .{ .hash_iter = iter };
         }
 
         pub fn flush(self: *Self, sstable: *SSTable) !void {

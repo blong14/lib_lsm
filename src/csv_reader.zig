@@ -383,6 +383,4 @@ fn expectToken(comptime expected: CsvToken, maybe_actual: ?CsvToken) !void {
     }
 }
 
-test "csv reading" {
-
-}
+test "csv reading" {}

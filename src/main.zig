@@ -35,7 +35,7 @@ const Database = struct {
 
     pub fn init(alloc: Allocator, opts: DatabaseOpts) !Self {
         const pathname = opts.data_dir;
-        const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "wal.dat"});
+        const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "wal.dat" });
         defer alloc.free(filename);
 
         var wal = try WAL.init(filename, opts.wal_capacity);
@@ -101,10 +101,9 @@ const Database = struct {
 
     fn flush(self: *Self) !void {
         const pathname = self.opts.data_dir;
-        const filename = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{pathname, "sstable.dat"});
+        const filename = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ pathname, "sstable.dat" });
         defer self.alloc.free(filename);
-        var sstable = try SSTable.init(
-            self.alloc, filename, self.opts.sst_capacity);
+        var sstable = try SSTable.init(self.alloc, filename, self.opts.sst_capacity);
         try self.mtable.flush(sstable);
         try self.sstables.append(sstable);
         var tmp = self.mtable;

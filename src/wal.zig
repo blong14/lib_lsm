@@ -20,7 +20,7 @@ pub const WAL = struct {
 
     pub fn init(path: []const u8, capacity: usize) Error!Self {
         var data = try MMap(Row).init(path, capacity);
-        return .{.data = data};
+        return .{ .data = data };
     }
 
     pub fn deinit(self: *Self) void {
@@ -57,7 +57,7 @@ pub const WAL = struct {
     };
 
     pub fn iterator(self: Self) Iterator {
-        return .{.idx = 0, .data = self.data };
+        return .{ .idx = 0, .data = self.data };
     }
 };
 
@@ -71,7 +71,7 @@ test WAL {
     defer testDir.dir.deleteTree(pathname) catch {};
 
     // given
-    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{pathname, "wal.dat"});
+    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "wal.dat" });
     defer alloc.free(filename);
     var st = try WAL.init(filename, std.mem.page_size);
     defer st.deinit();
