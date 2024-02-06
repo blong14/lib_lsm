@@ -4,6 +4,7 @@ const sst = @import("sstable.zig");
 const CsvTokenizer = @import("csv_reader.zig").CsvTokenizer;
 const Memtable = @import("memtable.zig").Memtable;
 const WAL = @import("wal.zig").WAL;
+pub const MessageQueue = @import("msgqueue.zig").MessageQueue;
 
 const io = std.io;
 const testing = std.testing;

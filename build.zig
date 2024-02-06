@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
     b.installArtifact(lib);
+    // lib.linkLibC();
 
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
@@ -56,6 +57,7 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(exe);
         exe.addModule("lsm", lsm);
+        exe.linkLibC();
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
         if (b.args) |args| {
