@@ -41,8 +41,6 @@ const QuoteFieldReadResult = struct {
 };
 
 fn CsvReader(comptime Reader: type) type {
-
-    // TODO comptime
     return struct {
         buffer: []u8,
         current: []u8,
@@ -363,24 +361,3 @@ pub fn CsvTokenizer(comptime Reader: type) type {
         }
     };
 }
-
-fn expectToken(comptime expected: CsvToken, maybe_actual: ?CsvToken) !void {
-    if (maybe_actual) |actual| {
-        if (@intFromEnum(expected) != @intFromEnum(actual)) {
-            std.log.warn("Expected {?} but is {?}\n", .{ expected, actual });
-            return error.TestFailed;
-        }
-
-        switch (expected) {
-            .field => {
-                try testing.expectEqualStrings(expected.field, actual.field);
-            },
-            else => {},
-        }
-    } else {
-        std.log.warn("Expected {?} but is {?}\n", .{ expected, maybe_actual });
-        return error.TestFailed;
-    }
-}
-
-test "csv reading" {}
