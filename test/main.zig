@@ -5,11 +5,16 @@ pub fn main() !void {
     var mainTimer = try std.time.Timer.start();
     const mainStart = mainTimer.read();
 
-    var mailbox = try lsm.MessageQueue([2][]const u8).init(".");
+    const msg = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    var mailbox = try lsm.MessageQueue(msg).init(".");
     defer mailbox.deinit();
 
     const writer = try std.Thread.spawn(.{}, struct {
-        pub fn publish(outbox: lsm.MessageQueue([2][]const u8).Writer) void {
+        pub fn publish(outbox: lsm.MessageQueue(msg).Writer) void {
             defer outbox.done() catch |err| {
                 std.debug.print("publish error {s}\n", .{@errorName(err)});
             };
@@ -34,6 +39,8 @@ pub fn main() !void {
                 return;
             };
 
+            const key: usize = 0;
+            const value: usize = 1;
             var count: usize = 0;
             var idx: usize = 0;
             var row = [_][]const u8{undefined} ** 2;
@@ -44,7 +51,8 @@ pub fn main() !void {
                         idx += 1;
                     },
                     .row_end => {
-                        outbox.publish(row) catch |err| {
+                        const m: msg = .{.key = row[key], .value = row[value]};
+                        outbox.publish(m) catch |err| {
                             std.debug.print("error publishing row {s}\n", .{@errorName(err)});
                             break;
                         };
@@ -61,7 +69,7 @@ pub fn main() !void {
     }.publish, .{mailbox.publisher()});
 
     const reader = try std.Thread.spawn(.{}, struct {
-        pub fn consume(inbox: lsm.MessageQueue([2][]const u8).ReadIter) void {
+        pub fn consume(inbox: lsm.MessageQueue(msg).ReadIter) void {
             var timer = std.time.Timer.start() catch |err| {
                 std.debug.print("consume error {s}\n", .{@errorName(err)});
                 return;
@@ -78,11 +86,9 @@ pub fn main() !void {
             };
             defer db.deinit();
 
-            const key: usize = 0;
-            const value: usize = 1;
             var count: usize = 0;
             while (inbox.next()) |row| {
-                db.write(row[key], row[value]) catch |err| {
+                db.write(row.key, row.value) catch |err| {
                     std.debug.print("count {d} {s}\n", .{ count, @errorName(err) });
                     return;
                 };
