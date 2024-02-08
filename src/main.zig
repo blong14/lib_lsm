@@ -44,6 +44,8 @@ const Database = struct {
         var memtable = try Memtable(u64, []const u8).init(alloc);
         var capacity = opts.sst_capacity / @sizeOf(Row);
 
+        std.debug.print("init memtable cap {d} sstable opts {d} sizeof Row {d}\n", .{capacity, opts.sst_capacity, @sizeOf(Row)});
+
         return .{
             .alloc = alloc,
             .capacity = capacity,
@@ -57,6 +59,7 @@ const Database = struct {
     pub fn deinit(self: *Self) void {
         self.mtable.deinit();
         for (self.sstables.items) |table| {
+            std.debug.print("deinit\n", .{});
             table.deinit();
             self.alloc.destroy(table);
         }
@@ -92,6 +95,7 @@ const Database = struct {
     }
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
+        if (key.len == 0) return error.WriteError;
         const k: u64 = hasher.hash(key);
         try self.wal.write(k, value);
         if (self.mtable.count() >= self.capacity) {
@@ -101,12 +105,14 @@ const Database = struct {
     }
 
     fn flush(self: *Self) !void {
+        std.debug.print("flushing...\n", .{});
         const pathname = self.opts.data_dir;
         const filename = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ pathname, "sstable.dat" });
         defer self.alloc.free(filename);
         var sstable = try SSTable.init(self.alloc, filename, self.opts.sst_capacity);
-        try self.mtable.flush(sstable);
+        errdefer sstable.deinit();
         try self.sstables.append(sstable);
+        try self.mtable.flush(sstable);
         var tmp = self.mtable;
         defer tmp.deinit();
         self.mtable = try Memtable(u64, []const u8).init(self.alloc);
@@ -117,7 +123,7 @@ pub fn defaultDatabase(alloc: Allocator) !Database {
     const opts: DatabaseOpts = .{
         .data_dir = "data",
         .wal_capacity = std.mem.page_size * std.mem.page_size,
-        .sst_capacity = std.mem.page_size * std.mem.page_size,
+        .sst_capacity = std.mem.page_size,
     };
     return try databaseFromOpts(alloc, opts);
 }
