@@ -83,6 +83,10 @@ pub fn MMap(comptime T: type) type {
             try self.buf.seekTo(index);
             return try self.buf.reader().readStruct(T);
         }
+
+        pub fn getCount(self: Self) usize {
+            return self.count;
+        }
     };
 }
 
