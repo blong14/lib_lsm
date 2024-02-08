@@ -147,7 +147,7 @@ pub fn MessageQueue(comptime T: type) type {
 
 test MessageQueue {
     const testing = std.testing;
-    const Elem = struct {
+    const Elem = extern struct {
         data: usize,
         const Self = @This();
     };
@@ -173,7 +173,7 @@ test MessageQueue {
 
 test "Test count" {
     const testing = std.testing;
-    const Elem = struct {
+    const Elem = extern struct {
         data: usize,
         const Self = @This();
     };
