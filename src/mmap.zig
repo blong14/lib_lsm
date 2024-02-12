@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const Allocator = std.mem.Allocator;
 const File = std.fs.File;
 const FixedBuffer = std.io.FixedBufferStream;
 
@@ -23,12 +24,7 @@ pub fn MMap(comptime T: type) type {
             WriteError,
         } || std.os.OpenError || std.os.WriteError || std.os.MMapError;
 
-        pub fn init(path: []const u8, capacity: usize) Error!Self {
-            const file = try std.fs.cwd().createFile(path, .{
-                .read = true,
-                .truncate = false,
-            });
-            try file.setEndPos(capacity);
+        pub fn init(alloc: Allocator, file: std.fs.File, capacity: usize) Error!*Self {
             var data = try std.os.mmap(
                 null,
                 capacity,
@@ -37,18 +33,19 @@ pub fn MMap(comptime T: type) type {
                 file.handle,
                 0,
             );
-            return .{
+            var mmap = try alloc.create(Self);
+            mmap.* = .{
                 .buf = std.io.fixedBufferStream(data),
                 .count = 0,
                 .file = file,
                 .len = capacity / @sizeOf(T),
                 .size = @sizeOf(T),
             };
+            return mmap;
         }
 
         pub fn deinit(self: *Self) void {
             std.os.munmap(self.buf.buffer);
-            self.file.close();
             self.* = undefined;
         }
 
@@ -91,13 +88,15 @@ pub fn MMap(comptime T: type) type {
 }
 
 test "MMap append" {
+    const XFile = @import("file.zig");
     const testing = std.testing;
+    var alloc = testing.allocator;
+
     const Row = extern struct {
         key: u64,
         value: [*c]const u8,
     };
 
-    var alloc = testing.allocator;
     const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
@@ -106,10 +105,15 @@ test "MMap append" {
     // given
     const key = std.hash.Murmur2_64.hash("__key__");
     const expected: Row = .{ .key = key, .value = "__value__" };
+
     const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "append.dat" });
     defer alloc.free(filename);
 
-    var map = try MMap(Row).init(filename, std.mem.page_size);
+    var file = try XFile.openWithCapacity(filename, std.mem.page_size);
+    defer file.close();
+
+    var map = try MMap(Row).init(alloc, file, std.mem.page_size);
+    defer alloc.destroy(map);
     defer map.deinit();
 
     // when
@@ -122,18 +126,19 @@ test "MMap append" {
     try testing.expect(map.count == 4);
 
     const actual = try map.read(3);
-    std.debug.print("{d} {s}\n", .{ actual.key, actual.value });
     try testing.expect(expected.key == actual.key);
 }
 
 test "MMap insert" {
+    const XFile = @import("file.zig");
     const testing = std.testing;
+    var alloc = testing.allocator;
+
     const Row = extern struct {
         key: u64,
         value: [*c]const u8,
     };
 
-    var alloc = testing.allocator;
     const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
@@ -142,10 +147,15 @@ test "MMap insert" {
     // given
     const key = std.hash.Murmur2_64.hash("__key__");
     var expected: Row = .{ .key = key, .value = "__expected__" };
+
     const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "insert.dat" });
     defer alloc.free(filename);
 
-    var map = try MMap(Row).init(filename, std.mem.page_size);
+    var file = try XFile.openWithCapacity(filename, std.mem.page_size);
+    defer file.close();
+
+    var map = try MMap(Row).init(alloc, file, std.mem.page_size);
+    defer alloc.destroy(map);
     defer map.deinit();
 
     // when
@@ -167,6 +177,5 @@ test "MMap insert" {
     try testing.expect(map.count == 4);
 
     var actual = try map.read(1);
-    std.debug.print("{d} {s}\n", .{ actual.key, actual.value });
     try testing.expect(expected.key == actual.key);
 }
