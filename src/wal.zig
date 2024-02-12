@@ -1,16 +1,19 @@
 const std = @import("std");
 
+const File = @import("file.zig");
 const MMap = @import("mmap.zig").MMap;
 
 const Allocator = std.mem.Allocator;
 
 pub const WAL = struct {
+    alloc: Allocator,
+    data: *MMap(Row),
+    file: std.fs.File,
+
     const Row = extern struct {
         key: u64,
         value: [*c]const u8,
     };
-
-    data: MMap(Row),
 
     const Self = @This();
 
@@ -18,13 +21,18 @@ pub const WAL = struct {
         NotFound,
     } || MMap(Row).Error;
 
-    pub fn init(path: []const u8, capacity: usize) Error!Self {
-        var data = try MMap(Row).init(path, capacity);
-        return .{ .data = data };
+    pub fn init(alloc: Allocator, path: []const u8, capacity: usize) Error!*Self {
+        var file = try File.openWithCapacity(path, capacity);
+        var data = try MMap(Row).init(alloc, file, capacity);
+        var wal = try alloc.create(Self);
+        wal.* = .{ .alloc = alloc, .data = data, .file = file };
+        return wal;
     }
 
     pub fn deinit(self: *Self) void {
         self.data.deinit();
+        self.alloc.destroy(self.data);
+        self.file.close();
         self.* = undefined;
     }
 
@@ -39,7 +47,7 @@ pub const WAL = struct {
 
     pub const Iterator = struct {
         idx: usize,
-        data: MMap(Row),
+        data: *MMap(Row),
 
         pub fn next(it: *Iterator) ?Result {
             const row = it.data.read(it.*.idx) catch return null;
@@ -63,8 +71,8 @@ pub const WAL = struct {
 
 test WAL {
     const testing = std.testing;
-
     var alloc = testing.allocator;
+
     const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
@@ -73,7 +81,9 @@ test WAL {
     // given
     const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "wal.dat" });
     defer alloc.free(filename);
-    var st = try WAL.init(filename, std.mem.page_size);
+
+    var st = try WAL.init(alloc, filename, std.mem.page_size);
+    defer alloc.destroy(st);
     defer st.deinit();
 
     // when

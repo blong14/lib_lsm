@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const File = @import("file.zig");
 const MMap = @import("mmap.zig").MMap;
 
 const Allocator = std.mem.Allocator;
@@ -12,7 +13,8 @@ pub const SSTableRow = extern struct {
 pub const SSTable = struct {
     alloc: Allocator,
     capacity: usize,
-    data: MMap(SSTableRow),
+    data: *MMap(SSTableRow),
+    file: std.fs.File,
 
     const Self = @This();
 
@@ -21,15 +23,18 @@ pub const SSTable = struct {
     } || MMap(SSTableRow).Error;
 
     pub fn init(alloc: Allocator, path: []const u8, capacity: usize) Error!*Self {
-        var data = try MMap(SSTableRow).init(path, capacity);
+        var file = try File.openWithCapacity(path, capacity);
+        var data = try MMap(SSTableRow).init(alloc, file, capacity);
         const cap = capacity / @sizeOf(SSTableRow);
         const st = try alloc.create(Self);
-        st.* = .{ .alloc = alloc, .capacity = cap, .data = data };
+        st.* = .{ .alloc = alloc, .capacity = cap, .data = data, .file = file };
         return st;
     }
 
     pub fn deinit(self: *Self) void {
         self.data.deinit();
+        self.alloc.destroy(self.data);
+        self.file.close();
         self.* = undefined;
     }
 
@@ -51,7 +56,7 @@ pub const SSTable = struct {
 
     fn equalto(self: *Self, key: u64, idx: usize) bool {
         const entry = self.data.read(idx) catch |err| {
-            std.debug.print("Oops {s}\n", .{@errorName(err)});
+            std.debug.print("equalto {s}\n", .{@errorName(err)});
             return false;
         };
         return key == entry.key;
@@ -59,7 +64,7 @@ pub const SSTable = struct {
 
     fn greaterthan(self: *Self, key: u64, idx: usize) bool {
         const entry = self.data.read(idx) catch |err| {
-            std.debug.print("Oops greaterthan {s}\n", .{@errorName(err)});
+            std.debug.print("greaterthan {s}\n", .{@errorName(err)});
             return false;
         };
         return key > entry.key;
@@ -76,19 +81,22 @@ pub const SSTable = struct {
 
     pub fn write(self: *Self, key: u64, value: []const u8) Error!void {
         const count: usize = self.data.getCount();
-        std.debug.print("writing to sstable count {d}...\n", .{count});
         if ((count == 0) or (self.greaterthan(key, count - 1))) {
             return try self.data.append(SSTableRow{ .key = key, .value = value.ptr });
         }
         const idx = try self.findIndex(key, 0, count - 1);
         try self.data.insert(idx, SSTableRow{ .key = key, .value = value.ptr });
     }
+
+    pub fn append(self: *Self, key: u64, value: []const u8) Error!void {
+        return try self.data.append(SSTableRow{ .key = key, .value = value.ptr });
+    }
 };
 
 test "SSTable" {
     const testing = std.testing;
-
     var alloc = testing.allocator;
+
     const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
@@ -97,6 +105,7 @@ test "SSTable" {
     // given
     const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "sstable.dat" });
     defer alloc.free(filename);
+
     var st = try SSTable.init(alloc, filename, std.mem.page_size);
     defer alloc.destroy(st);
     defer st.deinit();
