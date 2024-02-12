@@ -2,46 +2,39 @@ const std = @import("std");
 
 const sst = @import("sstable.zig");
 const CsvTokenizer = @import("csv_reader.zig").CsvTokenizer;
-const Memtable = @import("memtable.zig").Memtable;
+const mtbl = @import("memtable.zig");
 const WAL = @import("wal.zig").WAL;
 pub const MessageQueue = @import("msgqueue.zig").MessageQueue;
+const options = @import("opts.zig");
 
 const io = std.io;
 const testing = std.testing;
 const hasher = std.hash.Murmur2_64;
 const Allocator = std.mem.Allocator;
+const Memtable = mtbl.Memtable;
+const MemtableOpts = mtbl.MemtableOpts;
+const Opts = options.Opts;
 const SSTable = sst.SSTable;
+const SSTableOpts = sst.SSTableOpts;
 const Row = sst.SSTableRow;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
 
-const DatabaseOpts = struct {
-    data_dir: []const u8,
-    // write-ahead log opts
-    wal_capacity: usize,
-    // sstable opts
-    sst_capacity: usize,
-};
-
 const Database = struct {
     alloc: Allocator,
     capacity: usize,
-    mtable: Memtable(u64, []const u8),
-    opts: DatabaseOpts,
+    mtable: *Memtable(u64, []const u8),
+    opts: Opts,
+    mtables: std.ArrayList(*Memtable(u64, []const u8)),
     sstables: std.ArrayList(*SSTable),
-    wal: WAL,
 
     const Self = @This();
     const Error = error{};
 
-    pub fn init(alloc: Allocator, opts: DatabaseOpts) !Self {
-        const pathname = opts.data_dir;
-        const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "wal.dat" });
-        defer alloc.free(filename);
-
-        var wal = try WAL.init(filename, opts.wal_capacity);
+    pub fn init(alloc: Allocator, opts: Opts) !Self {
+        var mtables = std.ArrayList(*Memtable(u64, []const u8)).init(alloc);
         var sstables = std.ArrayList(*SSTable).init(alloc);
-        var memtable = try Memtable(u64, []const u8).init(alloc);
+        var mtable = try Memtable(u64, []const u8).init(alloc, opts);
         var capacity = opts.sst_capacity / @sizeOf(Row);
 
         std.debug.print("init memtable cap {d} sstable opts {d} sizeof Row {d}\n", .{capacity, opts.sst_capacity, @sizeOf(Row)});
@@ -49,15 +42,22 @@ const Database = struct {
         return .{
             .alloc = alloc,
             .capacity = capacity,
-            .mtable = memtable,
+            .mtable = mtable,
             .opts = opts,
+            .mtables = mtables,
             .sstables = sstables,
-            .wal = wal,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.mtable.deinit();
+        self.alloc.destroy(self.mtable);
+        for (self.mtables.items) |table| {
+            std.debug.print("deinit\n", .{});
+            table.deinit();
+            self.alloc.destroy(table);
+        }
+        self.mtables.deinit();
         for (self.sstables.items) |table| {
             std.debug.print("deinit\n", .{});
             table.deinit();
@@ -78,6 +78,11 @@ const Database = struct {
             if (self.mtable.get(key)) |value| {
                 return value;
             }
+            for (self.mtables.items) |table| {
+                if (table.get(key)) |value| {
+                    return value;
+                }
+            }
             for (self.sstables.items) |table| {
                 const value = table.read(key) catch |err| switch (err) {
                     error.NotFound => continue,
@@ -94,10 +99,38 @@ const Database = struct {
         return self.lookup(k);
     }
 
+    // const MergeIterator = struct {
+    //     mtables: std.ArrayList(*Memtable(u64, []const u8)),
+    //
+    //     pub fn next(it: *MergeIterator) ?[]const u8 {
+    //         for (it.mtables.items) |mtable| {
+    //             var iter = mtable.iterator();
+    //             while (iter.next()) |row| {
+    //                 it.key = row.key;
+    //                 it.value = row.value;
+    //             }
+    //         }
+    //     }
+    // };
+    //
+    // fn mergeIterator() MergeIterator {
+    //     return .{};
+    // }
+
+    // pub fn scan(self: Self, start: []const u8, end: []const u8) !std.ArrayList([]const u8) {
+    //     const start_key: u64 = hasher.hash(start);
+    //     const end_key: u64 = hasher.hash(end);
+    //     var out = try std.ArrayList([]const u8).init(self.alloc);
+    //     var merge_iter = self.mergeIterator(start_key, end_key);
+    //     while (merge_iter.next()) |value| {
+    //         out.append(value);
+    //     }
+    //     return out;
+    // }
+
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
         if (key.len == 0) return error.WriteError;
         const k: u64 = hasher.hash(key);
-        try self.wal.write(k, value);
         if (self.mtable.count() >= self.capacity) {
             try self.flush();
         }
@@ -110,25 +143,18 @@ const Database = struct {
         const filename = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ pathname, "sstable.dat" });
         defer self.alloc.free(filename);
         var sstable = try SSTable.init(self.alloc, filename, self.opts.sst_capacity);
-        errdefer sstable.deinit();
         try self.sstables.append(sstable);
         try self.mtable.flush(sstable);
-        var tmp = self.mtable;
-        defer tmp.deinit();
-        self.mtable = try Memtable(u64, []const u8).init(self.alloc);
+        try self.mtables.append(self.mtable);
+        self.mtable = try Memtable(u64, []const u8).init(self.alloc, self.opts);
     }
 };
 
 pub fn defaultDatabase(alloc: Allocator) !Database {
-    const opts: DatabaseOpts = .{
-        .data_dir = "data",
-        .wal_capacity = std.mem.page_size * std.mem.page_size,
-        .sst_capacity = std.mem.page_size,
-    };
-    return try databaseFromOpts(alloc, opts);
+    return try databaseFromOpts(alloc, options.defaultOpts());
 }
 
-pub fn databaseFromOpts(alloc: Allocator, opts: DatabaseOpts) !Database {
+pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !Database {
     return try Database.init(alloc, opts);
 }
 

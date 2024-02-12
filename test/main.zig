@@ -85,6 +85,7 @@ pub fn main() !void {
                 return;
             };
             defer db.deinit();
+            errdefer db.deinit();
 
             var count: usize = 0;
             while (inbox.next()) |row| {
