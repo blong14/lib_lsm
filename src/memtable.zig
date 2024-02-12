@@ -1,13 +1,20 @@
 const std = @import("std");
 
 const sst = @import("sstable.zig");
+const log = @import("wal.zig");
+const options = @import("opts.zig");
+const tbm = @import("tablemap.zig");
 
 const Allocator = std.mem.Allocator;
+const Opts = options.Opts;
 const SSTable = sst.SSTable;
+const TableMap = tbm.TableMap;
 
 pub fn Memtable(comptime K: type, comptime V: type) type {
     return struct {
-        hash_map: std.AutoArrayHashMap(K, V),
+        alloc: Allocator,
+        hash_map: *TableMap,
+        wal: *log.WAL,
 
         const Self = @This();
 
@@ -15,13 +22,22 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             Full,
         };
 
-        pub fn init(alloc: Allocator) !Self {
-            var map = std.AutoArrayHashMap(K, V).init(alloc);
-            return .{ .hash_map = map };
+        pub fn init(alloc: Allocator, opts: Opts) !*Self {
+            const filename = try std.fmt.allocPrint(
+            alloc, "{s}/{s}", .{ opts.data_dir, "wal.dat" });
+            defer alloc.free(filename);
+            var wal = try log.WAL.init(alloc, filename, opts.wal_capacity);
+            var map = try TableMap.init(alloc);
+            var mtable = try alloc.create(Self);
+            mtable.* = .{ .alloc = alloc, .hash_map = map, .wal = wal };
+            return mtable;
         }
 
         pub fn deinit(self: *Self) void {
             self.hash_map.deinit();
+            self.alloc.destroy(self.hash_map);
+            self.wal.deinit();
+            self.alloc.destroy(self.wal);
             self.* = undefined;
         }
 
@@ -30,7 +46,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         }
 
         pub fn get(self: Self, key: K) ?V {
-            return self.hash_map.get(key);
+            return self.hash_map.get(key) catch return null;
         }
 
         pub fn count(self: Self) usize {
@@ -38,18 +54,18 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         }
 
         pub const Iterator = struct {
-            hash_iter: std.AutoArrayHashMap(K, V).Iterator,
+            hash_iter: TableMap.Iterator,
 
-            const Entry = struct {
-                key_ptr: *K,
-                value_ptr: *V,
+            const Row = struct {
+                key: K,
+                value: V,
             };
 
-            pub fn next(it: *Iterator) ?Entry {
-                if (it.hash_iter.next()) |entry| {
-                    return Entry{
-                        .key_ptr = entry.key_ptr,
-                        .value_ptr = entry.value_ptr,
+            pub fn next(it: *Iterator) ?Row {
+                if (it.hash_iter.next()) {
+                    return Row{
+                        .key = it.hash_iter.key(),
+                        .value = it.hash_iter.value(),
                     };
                 }
                 return null;
@@ -67,10 +83,19 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         }
 
         pub fn flush(self: *Self, sstable: *SSTable) !void {
+            var timer = std.time.Timer.start() catch |err| {
+                std.debug.print("flush error {s}\n", .{@errorName(err)});
+                return;
+            };
+            const start = timer.read();
+            var written: usize = 0;
             var iter = self.iterator();
             while (iter.next()) |row| {
-                try sstable.write(row.key_ptr.*, row.value_ptr.*);
+                try sstable.append(row.key, row.value);
+                written += 1;
             }
+            const end = timer.read();
+            std.debug.print("total rows writen {d} in {}ms\n", .{ written, (end - start) / 1_000_000 });
         }
     };
 }
@@ -80,7 +105,8 @@ test Memtable {
     const alloc = testing.allocator;
 
     // given
-    var table = try Memtable(i64, []const u8).init(alloc);
+    var table = try Memtable(u64, []const u8).init(alloc, options.defaultOpts());
+    defer alloc.destroy(table);
     defer table.deinit();
 
     // when
@@ -91,10 +117,12 @@ test Memtable {
     try testing.expectEqualStrings("__value__", actual.?);
 
     // when
+    var next_actual: []const u8 = undefined;
     var iter = table.iterator();
-    const entry = iter.next();
-    actual = entry.?.value_ptr.*;
+    if (iter.next()) |nxt| {
+        next_actual = nxt.value[0..];
+    }
 
-    // then
-    try testing.expectEqualStrings("__value__", actual.?);
+// then
+    try testing.expectEqualStrings("__value__", next_actual);
 }
