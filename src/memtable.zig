@@ -23,8 +23,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         };
 
         pub fn init(alloc: Allocator, opts: Opts) !*Self {
-            const filename = try std.fmt.allocPrint(
-            alloc, "{s}/{s}", .{ opts.data_dir, "wal.dat" });
+            const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ opts.data_dir, "wal.dat" });
             defer alloc.free(filename);
             var wal = try log.WAL.init(alloc, filename, opts.wal_capacity);
             var map = try TableMap.init(alloc);
@@ -123,6 +122,6 @@ test Memtable {
         next_actual = nxt.value[0..];
     }
 
-// then
+    // then
     try testing.expectEqualStrings("__value__", next_actual);
 }

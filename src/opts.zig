@@ -9,7 +9,7 @@ pub const Opts = struct {
 };
 
 pub fn defaultOpts() Opts {
-     return .{
+    return .{
         .data_dir = "data",
         // TODO: temp
         .sst_capacity = PageSize * PageSize / 2,

@@ -51,7 +51,7 @@ pub fn main() !void {
                         idx += 1;
                     },
                     .row_end => {
-                        const m: msg = .{.key = row[key], .value = row[value]};
+                        const m: msg = .{ .key = row[key], .value = row[value] };
                         outbox.publish(m) catch |err| {
                             std.debug.print("error publishing row {s}\n", .{@errorName(err)});
                             break;
