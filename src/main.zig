@@ -37,7 +37,7 @@ const Database = struct {
         var mtable = try Memtable(u64, []const u8).init(alloc, opts);
         var capacity = opts.sst_capacity / @sizeOf(Row);
 
-        std.debug.print("init memtable cap {d} sstable opts {d} sizeof Row {d}\n", .{capacity, opts.sst_capacity, @sizeOf(Row)});
+        std.debug.print("init memtable cap {d} sstable opts {d} sizeof Row {d}\n", .{ capacity, opts.sst_capacity, @sizeOf(Row) });
 
         return .{
             .alloc = alloc,
@@ -99,34 +99,13 @@ const Database = struct {
         return self.lookup(k);
     }
 
-    // const MergeIterator = struct {
-    //     mtables: std.ArrayList(*Memtable(u64, []const u8)),
-    //
-    //     pub fn next(it: *MergeIterator) ?[]const u8 {
-    //         for (it.mtables.items) |mtable| {
-    //             var iter = mtable.iterator();
-    //             while (iter.next()) |row| {
-    //                 it.key = row.key;
-    //                 it.value = row.value;
-    //             }
-    //         }
-    //     }
-    // };
-    //
-    // fn mergeIterator() MergeIterator {
-    //     return .{};
-    // }
-
-    // pub fn scan(self: Self, start: []const u8, end: []const u8) !std.ArrayList([]const u8) {
-    //     const start_key: u64 = hasher.hash(start);
-    //     const end_key: u64 = hasher.hash(end);
-    //     var out = try std.ArrayList([]const u8).init(self.alloc);
-    //     var merge_iter = self.mergeIterator(start_key, end_key);
-    //     while (merge_iter.next()) |value| {
-    //         out.append(value);
-    //     }
-    //     return out;
-    // }
+    pub fn scan(self: Self, start: []const u8, end: []const u8) ![]mtbl.Entry {
+        const start_key = hasher.hash(start);
+        const end_key = hasher.hash(end);
+        var out = std.ArrayList(mtbl.Entry).init(self.alloc);
+        try self.mtable.scan(start_key, end_key, &out);
+        return out.toOwnedSlice();
+    }
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
         if (key.len == 0) return error.WriteError;
@@ -174,4 +153,29 @@ test "basic functionality" {
     // then
     const actual = db.read(key);
     try testing.expectEqualStrings(value, actual.?);
+}
+
+test "scan" {
+    var alloc = testing.allocator;
+
+    var db = try defaultDatabase(alloc);
+    defer db.deinit();
+
+    // given
+    const start = "akey_a";
+    const end = "ckey_c";
+    const value = "__value__";
+
+    // when
+    try db.write("akey_a", value);
+    try db.write("bkey_b", value);
+    try db.write("ckey_c", value);
+    try db.write("dkey_d", value);
+
+    // then
+    const items = try db.scan(start, end);
+    defer alloc.free(items);
+    std.debug.print("{any}\n", .{items});
+    try testing.expect(items.len == 3);
+    // try testing.expectEqualStrings(value, actual.?);
 }

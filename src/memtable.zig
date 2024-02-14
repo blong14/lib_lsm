@@ -6,6 +6,7 @@ const options = @import("opts.zig");
 const tbm = @import("tablemap.zig");
 
 const Allocator = std.mem.Allocator;
+pub const Entry = tbm.MapEntry;
 const Opts = options.Opts;
 const SSTable = sst.SSTable;
 const TableMap = tbm.TableMap;
@@ -50,6 +51,14 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
 
         pub fn count(self: Self) usize {
             return self.hash_map.count();
+        }
+
+        pub fn scan(self: *Self, start: u64, end: u64, out: *std.ArrayList(tbm.MapEntry)) !void {
+            var scnr = try self.hash_map.scanner(start, end);
+            while (scnr.hasNext()) {
+                const entry = try scnr.next();
+                try out.append(entry.?);
+            }
         }
 
         pub const Iterator = struct {
