@@ -14,11 +14,13 @@ const Allocator = std.mem.Allocator;
 const Memtable = mtbl.Memtable;
 const MemtableOpts = mtbl.MemtableOpts;
 const Opts = options.Opts;
+const Row = sst.SSTableRow;
 const SSTable = sst.SSTable;
 const SSTableOpts = sst.SSTableOpts;
-const Row = sst.SSTableRow;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
+pub const MemtableList = std.ArrayList(*Memtable(u64, []const u8));
+pub const SSTableList = std.ArrayList(*SSTable);
 
 const Database = struct {
     alloc: Allocator,
@@ -31,15 +33,16 @@ const Database = struct {
     const Self = @This();
     const Error = error{};
 
-    pub fn init(alloc: Allocator, opts: Opts) !Self {
-        var mtables = std.ArrayList(*Memtable(u64, []const u8)).init(alloc);
-        var sstables = std.ArrayList(*SSTable).init(alloc);
+    pub fn init(alloc: Allocator, opts: Opts) !*Self {
+        var mtables = MemtableList.init(alloc);
+        var sstables = SSTableList.init(alloc);
         var mtable = try Memtable(u64, []const u8).init(alloc, opts);
         var capacity = opts.sst_capacity / @sizeOf(Row);
 
         std.debug.print("init memtable cap {d} sstable opts {d} sizeof Row {d}\n", .{ capacity, opts.sst_capacity, @sizeOf(Row) });
 
-        return .{
+        var db = try alloc.create(Self);
+        db.* = .{
             .alloc = alloc,
             .capacity = capacity,
             .mtable = mtable,
@@ -47,19 +50,18 @@ const Database = struct {
             .mtables = mtables,
             .sstables = sstables,
         };
+        return db;
     }
 
     pub fn deinit(self: *Self) void {
         self.mtable.deinit();
         self.alloc.destroy(self.mtable);
         for (self.mtables.items) |table| {
-            std.debug.print("deinit\n", .{});
             table.deinit();
             self.alloc.destroy(table);
         }
         self.mtables.deinit();
         for (self.sstables.items) |table| {
-            std.debug.print("deinit\n", .{});
             table.deinit();
             self.alloc.destroy(table);
         }
@@ -129,11 +131,11 @@ const Database = struct {
     }
 };
 
-pub fn defaultDatabase(alloc: Allocator) !Database {
+pub fn defaultDatabase(alloc: Allocator) !*Database {
     return try databaseFromOpts(alloc, options.defaultOpts());
 }
 
-pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !Database {
+pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
     return try Database.init(alloc, opts);
 }
 
@@ -141,6 +143,7 @@ test "basic functionality" {
     var alloc = testing.allocator;
 
     var db = try defaultDatabase(alloc);
+    defer alloc.destroy(db);
     defer db.deinit();
 
     // given
@@ -159,6 +162,7 @@ test "scan" {
     var alloc = testing.allocator;
 
     var db = try defaultDatabase(alloc);
+    defer alloc.destroy(db);
     defer db.deinit();
 
     // given

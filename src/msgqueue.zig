@@ -11,12 +11,14 @@ const sys = @cImport({
 });
 
 const errno = std.os.errno;
+const Allocator = std.mem.Allocator;
 
 /// `MessageQueue` is a System V message queue wrapper.
 /// The calling process must have write permission on the message queue
 /// in order to send a message, and read permission to receive a message.
 pub fn MessageQueue(comptime T: type) type {
     return struct {
+        alloc: Allocator,
         msgsize: usize,
         msqid: c_int,
         msqproj: c_int,
@@ -26,6 +28,7 @@ pub fn MessageQueue(comptime T: type) type {
 
         const MessageQueueError = error{
             EOQ, // queue has been closed
+            OutOfMemory,
             ReadError,
             WriteError,
         };
@@ -38,24 +41,29 @@ pub fn MessageQueue(comptime T: type) type {
         const EOQ = 2;
 
         /// Creates a `MessageQueue` with msqid derived from the given file path.
-        pub fn init(path: [*c]const u8) MessageQueueError!Self {
+        pub fn init(alloc: Allocator, path: [*c]const u8) MessageQueueError!*Self {
             const msqproj = 1;
             const key = sys.ftok(path, msqproj);
             if (key == -1) {
                 c.perror("unable to create msqid");
                 return MessageQueueError.ReadError;
             }
+
             const msqid = sys.msgget(key, 0o666 | sys.IPC_CREAT);
             if (msqid == -1) {
                 c.perror("unable to get message queue");
                 return MessageQueueError.WriteError;
             }
-            return .{
+
+            var msgq = try alloc.create(Self);
+            msgq.* = .{
+                .alloc = alloc,
                 .msgsize = @sizeOf(T),
                 .msqid = msqid,
                 .msqproj = msqproj,
                 .msqtype = 1,
             };
+            return msgq;
         }
 
         /// Remove the message queue
@@ -156,7 +164,9 @@ test MessageQueue {
 
     // Create a mailbox to read and write messages to.
     // The main thread will be in charge of cleaning up the mailbox
-    var mailbox = try MessageQueue(Elem).init(".");
+    var alloc = testing.allocator;
+    var mailbox = try MessageQueue(Elem).init(alloc, ".");
+    defer alloc.destroy(mailbox);
     defer mailbox.deinit();
 
     const reader = mailbox.subscribe();
@@ -182,7 +192,9 @@ test "Test count" {
 
     // Create a mailbox to read and write messages to.
     // The main thread will be in charge of cleaning up the mailbox
-    var mailbox = try MessageQueue(Elem).init(".");
+    var alloc = testing.allocator;
+    var mailbox = try MessageQueue(Elem).init(alloc, ".");
+    defer alloc.destroy(mailbox);
     defer mailbox.deinit();
 
     // Count all messages
