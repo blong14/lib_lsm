@@ -7,7 +7,9 @@ pub const MapEntry = struct {
 };
 
 const TableMapError = error{
+    Empty,
     NotFound,
+    OutOfMemory,
 };
 
 const MapEntryTable = std.MultiArrayList(MapEntry);
@@ -33,19 +35,20 @@ pub const TableMap = struct {
     }
 
     pub fn findIndex(self: Self, key: u64, low: usize, high: usize) usize {
-        if (high < low) {
-            return high + 1;
+        var start = low;
+        var end = high;
+        while (start < end) {
+            const mid: usize = start + (end - start) / 2;
+            const entry = self.impl.items(.key)[mid];
+            if (key < entry) {
+                end = mid;
+            } else if (key > entry) {
+                start = mid + 1;
+            } else {
+                return mid;
+            }
         }
-        const mid = low + ((high - low) / 2);
-        const entry = self.impl.items(.key)[mid];
-        if (key < entry) {
-            if (mid == 0) return mid;
-            return self.findIndex(key, low, mid - 1);
-        } else if (key == entry) {
-            return mid;
-        } else {
-            return self.findIndex(key, mid + 1, high);
-        }
+        return start;
     }
 
     fn equalto(self: Self, key: u64, idx: usize) bool {
@@ -78,7 +81,7 @@ pub const TableMap = struct {
         return self.impl.get(idx).value;
     }
 
-    pub fn put(self: *Self, k: u64, v: []const u8) !void {
+    pub fn put(self: *Self, k: u64, v: []const u8) TableMapError!void {
         const cnt: usize = self.count();
         if ((cnt == 0) or (self.greaterthan(k, cnt - 1))) {
             return try self.impl.append(self.gpa, MapEntry{ .key = k, .value = v });
@@ -87,12 +90,17 @@ pub const TableMap = struct {
         try self.impl.insert(self.gpa, idx, MapEntry{ .key = k, .value = v });
     }
 
+    pub fn append(self: *Self, k: u64, v: []const u8) !void {
+        return try self.impl.append(self.gpa, MapEntry{ .key = k, .value = v });
+    }
+
     const ScanIterator = struct {
-        mtable: *TableMap,
-        last_returned: ?MapEntry,
-        nxt: ?MapEntry,
-        start: u64,
         end: u64,
+        end_idx: usize,
+        idx: usize,
+        last_returned: ?MapEntry,
+        mtable: *TableMap,
+        nxt: ?MapEntry,
 
         pub fn advance(it: *ScanIterator, r: ?MapEntry) !void {
             var nxt: ?MapEntry = null;
@@ -100,15 +108,8 @@ pub const TableMap = struct {
             if (it.last_returned != null) {
                 const cnt = it.mtable.count();
                 if (cnt > 0) {
-                    const idx = it.mtable.findIndex(it.last_returned.?.key, 0, cnt - 1);
-                    nxt = it.mtable.getEntryByIdx(idx + 1) catch null;
-                }
-            }
-            if (nxt != null and it.start > nxt.?.key) {
-                const cnt = it.mtable.count();
-                if (cnt > 0) {
-                    const start_idx = it.mtable.findIndex(it.start, 0, cnt - 1);
-                    nxt = it.mtable.getEntryByIdx(start_idx) catch null;
+                    it.idx += 1;
+                    nxt = it.mtable.getEntryByIdx(it.idx) catch null;
                 }
             }
             it.*.nxt = nxt;
@@ -126,15 +127,23 @@ pub const TableMap = struct {
         }
     };
 
-    pub fn scanner(self: *Self, start: u64, end: u64) !ScanIterator {
+    pub fn scanner(self: *Self, start: u64, end: u64) TableMapError!ScanIterator {
+        const cnt = self.count();
+        if (cnt == 0) return TableMapError.Empty;
+        const start_idx: usize = self.findIndex(start, 0, cnt - 1);
+        var end_idx: usize = self.findIndex(end, 0, cnt - 1);
+        _ = self.getEntryByIdx(end_idx) catch {
+            end_idx = cnt - 1;
+        };
         var sc: ScanIterator = .{
+            .idx = start_idx,
             .last_returned = null,
             .mtable = self,
             .nxt = null,
-            .start = start,
+            .end_idx = end_idx,
             .end = end,
         };
-        const entry = self.impl.get(0);
+        const entry = self.impl.get(sc.idx);
         try sc.advance(entry);
         return sc;
     }
@@ -154,6 +163,7 @@ pub const TableMap = struct {
         }
 
         pub fn next(it: *Iterator) bool {
+            if (it.*.idx >= it.data.count()) return false;
             const entry = it.data.impl.get(it.*.idx);
             it.*.k = entry.key;
             it.*.v = entry.value;
@@ -209,7 +219,6 @@ test "TableMap Scan" {
     try tm.put(first, value);
     try tm.put(second, value);
     try tm.put(third, value);
-    std.debug.print("{d}\n", .{tm.count()});
 
     var items = std.ArrayList(MapEntry).init(testing.allocator);
     defer items.deinit();
