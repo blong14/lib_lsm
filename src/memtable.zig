@@ -1,12 +1,12 @@
 const std = @import("std");
 
-const sst = @import("sstable.zig");
 const log = @import("wal.zig");
 const options = @import("opts.zig");
+const sst = @import("sstable.zig");
 const tbm = @import("tablemap.zig");
 
 const Allocator = std.mem.Allocator;
-pub const Entry = tbm.MapEntry;
+const Entry = tbm.MapEntry;
 const Opts = options.Opts;
 const SSTable = sst.SSTable;
 const TableMap = tbm.TableMap;
@@ -42,6 +42,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         }
 
         pub fn put(self: *Self, key: K, value: V) !void {
+            try self.wal.write(key, value);
             try self.hash_map.put(key, value);
         }
 
