@@ -1,24 +1,26 @@
 const std = @import("std");
 
-const sst = @import("sstable.zig");
-const CsvTokenizer = @import("csv_reader.zig").CsvTokenizer;
+const csv = @import("csv_reader.zig");
+const log = @import("wal.zig");
 const mtbl = @import("memtable.zig");
-const WAL = @import("wal.zig").WAL;
-pub const MessageQueue = @import("msgqueue.zig").MessageQueue;
+const sst = @import("sstable.zig");
 const options = @import("opts.zig");
 
 const io = std.io;
 const testing = std.testing;
 const hasher = std.hash.Murmur2_64;
 const Allocator = std.mem.Allocator;
+const CsvTokenizer = csv.CsvTokenizer;
 const Memtable = mtbl.Memtable;
 const MemtableOpts = mtbl.MemtableOpts;
 const Opts = options.Opts;
 const Row = sst.SSTableRow;
 const SSTable = sst.SSTable;
 const SSTableOpts = sst.SSTableOpts;
+const WAL = log.WAL;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
+pub const MessageQueue = @import("msgqueue.zig").MessageQueue;
 pub const MemtableList = std.ArrayList(*Memtable(u64, []const u8));
 pub const SSTableList = std.ArrayList(*SSTable);
 
@@ -101,14 +103,6 @@ const Database = struct {
         return self.lookup(k);
     }
 
-    pub fn scan(self: Self, start: []const u8, end: []const u8) ![]mtbl.Entry {
-        const start_key = hasher.hash(start);
-        const end_key = hasher.hash(end);
-        var out = std.ArrayList(mtbl.Entry).init(self.alloc);
-        try self.mtable.scan(start_key, end_key, &out);
-        return out.toOwnedSlice();
-    }
-
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
         if (key.len == 0) return error.WriteError;
         const k: u64 = hasher.hash(key);
@@ -156,30 +150,4 @@ test "basic functionality" {
     // then
     const actual = db.read(key);
     try testing.expectEqualStrings(value, actual.?);
-}
-
-test "scan" {
-    var alloc = testing.allocator;
-
-    var db = try defaultDatabase(alloc);
-    defer alloc.destroy(db);
-    defer db.deinit();
-
-    // given
-    const start = "akey_a";
-    const end = "ckey_c";
-    const value = "__value__";
-
-    // when
-    try db.write("akey_a", value);
-    try db.write("bkey_b", value);
-    try db.write("ckey_c", value);
-    try db.write("dkey_d", value);
-
-    // then
-    const items = try db.scan(start, end);
-    defer alloc.free(items);
-    std.debug.print("{any}\n", .{items});
-    try testing.expect(items.len == 3);
-    // try testing.expectEqualStrings(value, actual.?);
 }
