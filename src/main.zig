@@ -4,6 +4,7 @@ const csv = @import("csv_reader.zig");
 const log = @import("wal.zig");
 const mtbl = @import("memtable.zig");
 const sst = @import("sstable.zig");
+const tm = @import("tablemap.zig");
 const options = @import("opts.zig");
 
 const io = std.io;
@@ -17,11 +18,12 @@ const Opts = options.Opts;
 const Row = sst.SSTableRow;
 const SSTable = sst.SSTable;
 const SSTableOpts = sst.SSTableOpts;
+const TableMap = tm.TableMap;
 const WAL = log.WAL;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
 pub const MessageQueue = @import("msgqueue.zig").MessageQueue;
-pub const MemtableList = std.ArrayList(*Memtable(u64, []const u8));
+pub const MemtableList = TableMap(*Memtable(u64, []const u8));
 pub const SSTableList = std.ArrayList(*SSTable);
 
 const Database = struct {
@@ -29,16 +31,16 @@ const Database = struct {
     capacity: usize,
     mtable: *Memtable(u64, []const u8),
     opts: Opts,
-    mtables: std.ArrayList(*Memtable(u64, []const u8)),
-    sstables: std.ArrayList(*SSTable),
+    mtables: *MemtableList,
+    sstables: SSTableList,
 
     const Self = @This();
     const Error = error{};
 
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
-        var mtables = MemtableList.init(alloc);
+        var mtables = try MemtableList.init(alloc);
         var sstables = SSTableList.init(alloc);
-        var mtable = try Memtable(u64, []const u8).init(alloc, opts);
+        var mtable = try Memtable(u64, []const u8).init(alloc, 0, opts);
         var capacity = opts.sst_capacity / @sizeOf(Row);
 
         std.debug.print("init memtable cap {d} sstable opts {d} sizeof Row {d}\n", .{ capacity, opts.sst_capacity, @sizeOf(Row) });
@@ -58,11 +60,14 @@ const Database = struct {
     pub fn deinit(self: *Self) void {
         self.mtable.deinit();
         self.alloc.destroy(self.mtable);
-        for (self.mtables.items) |table| {
+        var mtable_iter = self.mtables.iterator();
+        while (mtable_iter.next()) {
+            var table = mtable_iter.value();
             table.deinit();
             self.alloc.destroy(table);
         }
         self.mtables.deinit();
+        self.alloc.destroy(self.mtables);
         for (self.sstables.items) |table| {
             table.deinit();
             self.alloc.destroy(table);
@@ -82,11 +87,16 @@ const Database = struct {
             if (self.mtable.get(key)) |value| {
                 return value;
             }
-            for (self.mtables.items) |table| {
+
+            var mtables_iter = self.mtables.iterator();
+            while (mtables_iter.next()) {
+                // TODO: reverse iterate
+                const table = mtables_iter.value();
                 if (table.get(key)) |value| {
                     return value;
                 }
             }
+
             for (self.sstables.items) |table| {
                 const value = table.read(key) catch |err| switch (err) {
                     error.NotFound => continue,
@@ -107,9 +117,15 @@ const Database = struct {
         if (key.len == 0) return error.WriteError;
         const k: u64 = hasher.hash(key);
         if (self.mtable.count() >= self.capacity) {
-            try self.flush();
+            try self.freeze();
         }
         try self.mtable.put(k, value);
+    }
+
+    fn freeze(self: *Self) !void {
+        const current_id = self.mtable.getId();
+        try self.mtables.put(current_id, self.mtable);
+        self.mtable = try Memtable(u64, []const u8).init(self.alloc, current_id + 1, self.opts);
     }
 
     fn flush(self: *Self) !void {
@@ -120,8 +136,6 @@ const Database = struct {
         var sstable = try SSTable.init(self.alloc, filename, self.opts.sst_capacity);
         try self.sstables.append(sstable);
         try self.mtable.flush(sstable);
-        try self.mtables.append(self.mtable);
-        self.mtable = try Memtable(u64, []const u8).init(self.alloc, self.opts);
     }
 };
 
