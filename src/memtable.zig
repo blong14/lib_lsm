@@ -14,7 +14,8 @@ const TableMap = tbm.TableMap;
 pub fn Memtable(comptime K: type, comptime V: type) type {
     return struct {
         alloc: Allocator,
-        hash_map: *TableMap,
+        hash_map: *TableMap(V),
+        id: K,
         wal: *log.WAL,
 
         const Self = @This();
@@ -23,13 +24,18 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             Full,
         };
 
-        pub fn init(alloc: Allocator, opts: Opts) !*Self {
+        pub fn init(alloc: Allocator, id: K, opts: Opts) !*Self {
             const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ opts.data_dir, "wal.dat" });
             defer alloc.free(filename);
             var wal = try log.WAL.init(alloc, filename, opts.wal_capacity);
-            var map = try TableMap.init(alloc);
+            var map = try TableMap(V).init(alloc);
             var mtable = try alloc.create(Self);
-            mtable.* = .{ .alloc = alloc, .hash_map = map, .wal = wal };
+            mtable.* = .{
+                .alloc = alloc,
+                .hash_map = map,
+                .id = id,
+                .wal = wal,
+            };
             return mtable;
         }
 
@@ -39,6 +45,10 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             self.wal.deinit();
             self.alloc.destroy(self.wal);
             self.* = undefined;
+        }
+
+        pub fn getId(self: Self) K {
+            return self.id;
         }
 
         pub fn put(self: *Self, key: K, value: V) !void {
@@ -63,7 +73,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         }
 
         pub const Iterator = struct {
-            hash_iter: TableMap.Iterator,
+            hash_iter: TableMap(V).Iterator,
 
             const Row = struct {
                 key: K,
@@ -114,7 +124,7 @@ test Memtable {
     const alloc = testing.allocator;
 
     // given
-    var table = try Memtable(u64, []const u8).init(alloc, options.defaultOpts());
+    var table = try Memtable(u64, []const u8).init(alloc, 0, options.defaultOpts());
     defer alloc.destroy(table);
     defer table.deinit();
 
