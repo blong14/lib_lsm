@@ -186,6 +186,51 @@ pub fn TableMap(comptime V: type) type {
                 .data = self,
             };
         }
+
+        pub const ReverseIterator = struct {
+            idx: usize,
+            k: u64,
+            v: V,
+            data: *Self,
+
+            pub fn key(it: ReverseIterator) u64 {
+                return it.k;
+            }
+
+            pub fn value(it: ReverseIterator) V {
+                return it.v;
+            }
+
+            pub fn next(it: *ReverseIterator) bool {
+                const entry = it.data.impl.get(it.*.idx);
+                it.*.k = entry.key;
+                it.*.v = entry.value;
+                if (it.*.idx == 0) return false;
+                it.*.idx -= 1;
+                return true;
+            }
+
+            pub fn reset(it: *ReverseIterator) void {
+                var start_idx: usize = it.impl.len;
+                if (start_idx > 0) {
+                    start_idx -= 1;
+                }
+                it.*.idx = start_idx;
+            }
+        };
+
+        pub fn reverseIterator(self: *Self) ReverseIterator {
+            var start_idx: usize = self.impl.len;
+            if (start_idx > 0) {
+                start_idx -= 1;
+            }
+            return .{
+                .idx = start_idx,
+                .k = 0,
+                .v = undefined,
+                .data = self,
+            };
+        }
     };
 }
 

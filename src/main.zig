@@ -88,9 +88,8 @@ const Database = struct {
                 return value;
             }
 
-            var mtables_iter = self.mtables.iterator();
+            var mtables_iter = self.mtables.reverseIterator();
             while (mtables_iter.next()) {
-                // TODO: reverse iterate
                 const table = mtables_iter.value();
                 if (table.get(key)) |value| {
                     return value;
