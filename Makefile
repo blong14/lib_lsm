@@ -1,10 +1,11 @@
 # Executable
+BUILD_OPTS = -Dcpu=x86_64 -Doptimize=ReleaseFast
 EXEC = zig-out/bin/lsm
 
 .PHONY: clean
 
 build:
-	zig build run-lsm
+	zig build $(BUILD_OPTS) run-lsm
 
 clean:
 	rm -f $(EXEC) callgrind.out.* massif.out.*
