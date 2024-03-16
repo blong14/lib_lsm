@@ -151,10 +151,11 @@ pub fn TableMap(comptime V: type) type {
         }
 
         pub const Iterator = struct {
+            data: *Self,
             idx: usize,
+            start_idx: usize,
             k: u64,
             v: V,
-            data: *Self,
 
             pub fn key(it: Iterator) u64 {
                 return it.k;
@@ -162,6 +163,16 @@ pub fn TableMap(comptime V: type) type {
 
             pub fn value(it: Iterator) V {
                 return it.v;
+            }
+
+            pub fn prev(it: *Iterator) bool {
+                if (it.data.count() == 0) return false;
+                const entry = it.data.impl.get(it.*.idx);
+                it.*.k = entry.key;
+                it.*.v = entry.value;
+                if (it.*.idx == 0) return false;
+                it.*.idx -= 1;
+                return true;
             }
 
             pub fn next(it: *Iterator) bool {
@@ -174,61 +185,17 @@ pub fn TableMap(comptime V: type) type {
             }
 
             pub fn reset(it: *Iterator) void {
-                it.*.idx = 0;
+                it.*.idx = it.start_idx;
             }
         };
 
-        pub fn iterator(self: *Self) Iterator {
+        pub fn iterator(self: *Self, start: usize) Iterator {
             return .{
-                .idx = 0,
+                .data = self,
+                .idx = start,
+                .start_idx = start,
                 .k = 0,
                 .v = undefined,
-                .data = self,
-            };
-        }
-
-        pub const ReverseIterator = struct {
-            idx: usize,
-            k: u64,
-            v: V,
-            data: *Self,
-
-            pub fn key(it: ReverseIterator) u64 {
-                return it.k;
-            }
-
-            pub fn value(it: ReverseIterator) V {
-                return it.v;
-            }
-
-            pub fn next(it: *ReverseIterator) bool {
-                const entry = it.data.impl.get(it.*.idx);
-                it.*.k = entry.key;
-                it.*.v = entry.value;
-                if (it.*.idx == 0) return false;
-                it.*.idx -= 1;
-                return true;
-            }
-
-            pub fn reset(it: *ReverseIterator) void {
-                var start_idx: usize = it.impl.len;
-                if (start_idx > 0) {
-                    start_idx -= 1;
-                }
-                it.*.idx = start_idx;
-            }
-        };
-
-        pub fn reverseIterator(self: *Self) ReverseIterator {
-            var start_idx: usize = self.impl.len;
-            if (start_idx > 0) {
-                start_idx -= 1;
-            }
-            return .{
-                .idx = start_idx,
-                .k = 0,
-                .v = undefined,
-                .data = self,
             };
         }
     };

@@ -74,20 +74,24 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
 
         pub const Iterator = struct {
             hash_iter: TableMap(V).Iterator,
+            k: u64,
+            v: V,
 
-            const Row = struct {
-                key: K,
-                value: V,
-            };
+            pub fn key(it: Iterator) u64 {
+                return it.k;
+            }
 
-            pub fn next(it: *Iterator) ?Row {
+            pub fn value(it: Iterator) V {
+                return it.v;
+            }
+
+            pub fn next(it: *Iterator) bool {
                 if (it.hash_iter.next()) {
-                    return Row{
-                        .key = it.hash_iter.key(),
-                        .value = it.hash_iter.value(),
-                    };
+                    it.*.k = it.hash_iter.key();
+                    it.*.v = it.hash_iter.value();
+                    return true;
                 }
-                return null;
+                return false;
             }
 
             /// Reset the iterator to the initial index
@@ -97,8 +101,8 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         };
 
         pub fn iterator(self: Self) Iterator {
-            var iter = self.hash_map.iterator();
-            return .{ .hash_iter = iter };
+            var iter = self.hash_map.iterator(0);
+            return .{ .hash_iter = iter, .k = 0, .v = undefined };
         }
 
         pub fn flush(self: *Self, sstable: *SSTable) !void {
@@ -124,22 +128,22 @@ test Memtable {
     const alloc = testing.allocator;
 
     // given
-    var table = try Memtable(u64, []const u8).init(alloc, 0, options.defaultOpts());
-    defer alloc.destroy(table);
-    defer table.deinit();
+    var mtable = try Memtable(u64, []const u8).init(alloc, 0, options.defaultOpts());
+    defer alloc.destroy(mtable);
+    defer mtable.deinit();
 
     // when
-    try table.put(1, "__value__");
-    var actual = table.get(1);
+    try mtable.put(1, "__value__");
+    var actual = mtable.get(1);
 
     // then
     try testing.expectEqualStrings("__value__", actual.?);
 
     // when
     var next_actual: []const u8 = undefined;
-    var iter = table.iterator();
-    if (iter.next()) |nxt| {
-        next_actual = nxt.value[0..];
+    var iter = mtable.iterator();
+    if (iter.next()) {
+        next_actual = iter.value();
     }
 
     // then
