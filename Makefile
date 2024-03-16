@@ -1,14 +1,18 @@
 # Executable
 EXEC = zig-out/bin/lsm
 
-# Valgrind options
-VALGRIND_OPTIONS = --tool=callgrind
+.PHONY: clean
 
-.PHONY: clean valgrind
+build:
+	zig build run-lsm
 
 clean:
-	rm -f $(EXEC) callgrind.out.*
+	rm -f $(EXEC) callgrind.out.* massif.out.*
 
-valgrind: $(EXEC)
+callgrind: $(EXEC)
 	# kcachegrind
-	valgrind $(VALGRIND_OPTIONS) ./$(EXEC)
+	valgrind --tool=callgrind ./$(EXEC)
+
+massif: $(EXEC)
+	# ms_print
+	valgrind --tool=massif --time-unit=B ./$(EXEC)
