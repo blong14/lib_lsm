@@ -5,6 +5,10 @@ EXEC = zig-out/bin/lsm
 .PHONY: clean
 
 build:
+	# gdb --tui zig-out/bin/lsm
+	# b src/tablemap.zig:76
+	# r
+	# ipcrm -q <tab>
 	zig build $(BUILD_OPTS) run-lsm
 
 clean:
