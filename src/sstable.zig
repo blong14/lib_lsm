@@ -22,9 +22,9 @@ pub const SSTable = struct {
         NotFound,
     } || MMap(SSTableRow).Error;
 
-    pub fn init(alloc: Allocator, path: []const u8, capacity: usize) Error!*Self {
-        var file = try File.openWithCapacity(path, capacity);
-        var data = try MMap(SSTableRow).init(alloc, file, capacity);
+    pub fn init(alloc: Allocator, path: []const u8, capacity: usize) !*Self {
+        const file = try File.openWithCapacity(path, capacity);
+        const data = try MMap(SSTableRow).init(alloc, file, capacity);
         const cap = capacity / @sizeOf(SSTableRow);
         const st = try alloc.create(Self);
         st.* = .{ .alloc = alloc, .capacity = cap, .data = data, .file = file };
@@ -45,7 +45,9 @@ pub const SSTable = struct {
         const mid = low + ((high - low) / 2);
         const entry = try self.data.read(mid);
         if (key < entry.key) {
-            if (mid == 0) return mid;
+            if (mid == 0) {
+                return mid;
+            }
             return self.findIndex(key, low, mid - 1);
         } else if (key == entry.key) {
             return mid;
@@ -72,14 +74,18 @@ pub const SSTable = struct {
 
     pub fn read(self: *Self, key: u64) anyerror![]const u8 {
         const count = self.data.count;
-        if (count == 0) return Error.NotFound;
+        if (count == 0) {
+            return Error.NotFound;
+        }
         const idx = try self.findIndex(key, 0, count - 1);
-        if ((idx == -1) or (idx == count)) return Error.NotFound;
+        if ((idx == -1) or (idx == count)) {
+            return Error.NotFound;
+        }
         const row = try self.data.read(idx);
         return std.mem.span(row.value);
     }
 
-    pub fn write(self: *Self, key: u64, value: []const u8) Error!void {
+    pub fn write(self: *Self, key: u64, value: []const u8) !void {
         const count: usize = self.data.getCount();
         if ((count == 0) or (self.greaterthan(key, count - 1))) {
             return try self.data.append(SSTableRow{ .key = key, .value = value.ptr });
@@ -88,7 +94,7 @@ pub const SSTable = struct {
         try self.data.insert(idx, SSTableRow{ .key = key, .value = value.ptr });
     }
 
-    pub fn append(self: *Self, key: u64, value: []const u8) Error!void {
+    pub fn append(self: *Self, key: u64, value: []const u8) !void {
         return try self.data.append(SSTableRow{ .key = key, .value = value.ptr });
     }
 };

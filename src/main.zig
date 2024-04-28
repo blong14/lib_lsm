@@ -49,14 +49,14 @@ const Database = struct {
     const Error = error{};
 
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
-        var mtables = try MemtableList.init(alloc);
-        var sstables = SSTableList.init(alloc);
-        var mtable = try Memtable(u64, []const u8).init(alloc, 0, opts);
-        var capacity = opts.sst_capacity / @sizeOf(Row);
+        const mtables = try MemtableList.init(alloc);
+        const sstables = SSTableList.init(alloc);
+        const mtable = try Memtable(u64, []const u8).init(alloc, 0, opts);
+        const capacity = opts.sst_capacity / @sizeOf(Row);
 
         std.debug.print("init memtable cap {d} sstable opts {d} sizeof Row {d}\n", .{ capacity, opts.sst_capacity, @sizeOf(Row) });
 
-        var db = try alloc.create(Self);
+        const db = try alloc.create(Self);
         db.* = .{
             .alloc = alloc,
             .capacity = capacity,
@@ -125,7 +125,7 @@ const Database = struct {
             var iters = std.ArrayList(Memtable(u64, []const u8).Iterator).init(alloc);
             var table_iter = m.mtbls.iterator(0);
             while (table_iter.next()) {
-                var iter = table_iter.value().Iterator();
+                const iter = table_iter.value().Iterator();
                 try iters.append(iter);
             }
             return .{
@@ -163,7 +163,9 @@ const Database = struct {
     };
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
-        if (key.len == 0) return error.WriteError;
+        if (key.len == 0) {
+            return error.WriteError;
+        }
         const k: u64 = hasher.hash(key);
         if (self.mtable.count() >= self.capacity) {
             try self.freeze();
@@ -182,7 +184,7 @@ const Database = struct {
         const pathname = self.opts.data_dir;
         const filename = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ pathname, "sstable.dat" });
         defer self.alloc.free(filename);
-        var sstable = try SSTable.init(self.alloc, filename, self.opts.sst_capacity);
+        const sstable = try SSTable.init(self.alloc, filename, self.opts.sst_capacity);
         try self.sstables.append(sstable);
         try self.mtable.flush(sstable);
     }

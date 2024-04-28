@@ -27,9 +27,9 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         pub fn init(alloc: Allocator, id: K, opts: Opts) !*Self {
             const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ opts.data_dir, "wal.dat" });
             defer alloc.free(filename);
-            var wal = try log.WAL.init(alloc, filename, opts.wal_capacity);
-            var map = try TableMap(V).init(alloc);
-            var mtable = try alloc.create(Self);
+            const wal = try log.WAL.init(alloc, filename, opts.wal_capacity);
+            const map = try TableMap(V).init(alloc);
+            const mtable = try alloc.create(Self);
             mtable.* = .{
                 .alloc = alloc,
                 .hash_map = map,
@@ -101,7 +101,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         };
 
         pub fn iterator(self: Self) Iterator {
-            var iter = self.hash_map.iterator(0);
+            const iter = self.hash_map.iterator(0);
             return .{ .hash_iter = iter, .k = 0, .v = undefined };
         }
 
@@ -134,7 +134,7 @@ test Memtable {
 
     // when
     try mtable.put(1, "__value__");
-    var actual = mtable.get(1);
+    const actual = mtable.get(1);
 
     // then
     try testing.expectEqualStrings("__value__", actual.?);

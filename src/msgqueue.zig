@@ -10,7 +10,7 @@ const sys = @cImport({
     @cInclude("sys/types.h");
 });
 
-const errno = std.os.errno;
+const errno = std.posix.errno;
 const Allocator = std.mem.Allocator;
 
 /// `MessageQueue` is a System V message queue wrapper.
@@ -55,7 +55,7 @@ pub fn MessageQueue(comptime T: type) type {
                 return MessageQueueError.WriteError;
             }
 
-            var msgq = try alloc.create(Self);
+            const msgq = try alloc.create(Self);
             msgq.* = .{
                 .alloc = alloc,
                 .msgsize = @sizeOf(T),

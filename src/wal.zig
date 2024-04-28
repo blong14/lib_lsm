@@ -21,10 +21,10 @@ pub const WAL = struct {
         NotFound,
     } || MMap(Row).Error;
 
-    pub fn init(alloc: Allocator, path: []const u8, capacity: usize) Error!*Self {
-        var file = try File.openWithCapacity(path, capacity);
-        var data = try MMap(Row).init(alloc, file, capacity);
-        var wal = try alloc.create(Self);
+    pub fn init(alloc: Allocator, path: []const u8, capacity: usize) !*Self {
+        const file = try File.openWithCapacity(path, capacity);
+        const data = try MMap(Row).init(alloc, file, capacity);
+        const wal = try alloc.create(Self);
         wal.* = .{ .alloc = alloc, .data = data, .file = file };
         return wal;
     }
@@ -36,7 +36,7 @@ pub const WAL = struct {
         self.* = undefined;
     }
 
-    pub fn write(self: *Self, key: u64, value: []const u8) Error!void {
+    pub fn write(self: *Self, key: u64, value: []const u8) !void {
         return try self.data.append(Row{ .key = key, .value = value.ptr });
     }
 
@@ -93,6 +93,6 @@ test WAL {
 
     // then
     var iter = st.iterator();
-    var actual = iter.next();
+    const actual = iter.next();
     try testing.expectEqualStrings(expected, actual.?.value);
 }

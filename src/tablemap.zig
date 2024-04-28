@@ -23,7 +23,7 @@ pub fn TableMap(comptime V: type) type {
         impl: *MapEntryTable,
 
         pub fn init(alloc: Allocator) !*Self {
-            var impl = try alloc.create(MapEntryTable);
+            const impl = try alloc.create(MapEntryTable);
             impl.* = MapEntryTable{};
             const tm = try alloc.create(Self);
             tm.* = .{ .gpa = alloc, .impl = impl };
@@ -69,13 +69,17 @@ pub fn TableMap(comptime V: type) type {
 
         pub fn getEntryByIdx(self: Self, idx: usize) TableMapError!MapEntry {
             const cnt = self.count();
-            if (idx >= cnt) return TableMapError.NotFound;
+            if (idx >= cnt) {
+                return TableMapError.NotFound;
+            }
             return self.impl.get(idx);
         }
 
         pub fn get(self: Self, k: u64) TableMapError!V {
             const cnt = self.count();
-            if (cnt == 0) return TableMapError.NotFound;
+            if (cnt == 0) {
+                return TableMapError.NotFound;
+            }
             const idx = self.findIndex(k, 0, cnt - 1);
             if ((idx == cnt) or !self.equalto(k, idx)) {
                 return TableMapError.NotFound;
@@ -118,7 +122,9 @@ pub fn TableMap(comptime V: type) type {
             }
 
             pub fn hasNext(it: *ScanIterator) bool {
-                if (it.*.nxt == null) return false;
+                if (it.*.nxt == null) {
+                    return false;
+                }
                 return it.*.nxt.?.key <= it.end;
             }
 
@@ -131,7 +137,9 @@ pub fn TableMap(comptime V: type) type {
 
         pub fn scanner(self: *Self, start: u64, end: u64) TableMapError!ScanIterator {
             const cnt = self.count();
-            if (cnt == 0) return TableMapError.Empty;
+            if (cnt == 0) {
+                return TableMapError.Empty;
+            }
             const start_idx: usize = self.findIndex(start, 0, cnt - 1);
             var end_idx: usize = self.findIndex(end, 0, cnt - 1);
             _ = self.getEntryByIdx(end_idx) catch {
@@ -166,17 +174,23 @@ pub fn TableMap(comptime V: type) type {
             }
 
             pub fn prev(it: *Iterator) bool {
-                if (it.data.count() == 0) return false;
+                if (it.data.count() == 0) {
+                    return false;
+                }
                 const entry = it.data.impl.get(it.*.idx);
                 it.*.k = entry.key;
                 it.*.v = entry.value;
-                if (it.*.idx == 0) return false;
+                if (it.*.idx == 0) {
+                    return false;
+                }
                 it.*.idx -= 1;
                 return true;
             }
 
             pub fn next(it: *Iterator) bool {
-                if (it.*.idx >= it.data.count()) return false;
+                if (it.*.idx >= it.data.count()) {
+                    return false;
+                }
                 const entry = it.data.impl.get(it.*.idx);
                 it.*.k = entry.key;
                 it.*.v = entry.value;
@@ -205,7 +219,7 @@ test TableMap {
     const testing = std.testing;
 
     const tm = try TableMap([]const u8).init(testing.allocator);
-    var key: u64 = std.hash.Murmur2_64.hash("__key__");
+    const key: u64 = std.hash.Murmur2_64.hash("__key__");
     const value = "__value__";
 
     try tm.put(key, value);
@@ -227,9 +241,9 @@ test "TableMap Scan" {
     defer tm.deinit();
 
     const value = "__value__";
-    var first: u64 = std.hash.Murmur2_64.hash("aa");
-    var second: u64 = std.hash.Murmur2_64.hash("bb");
-    var third: u64 = std.hash.Murmur2_64.hash("cc");
+    const first: u64 = std.hash.Murmur2_64.hash("aa");
+    const second: u64 = std.hash.Murmur2_64.hash("bb");
+    const third: u64 = std.hash.Murmur2_64.hash("cc");
 
     try tm.put(first, value);
     try tm.put(second, value);

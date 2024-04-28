@@ -22,18 +22,18 @@ pub fn MMap(comptime T: type) type {
             PipeBusy,
             SharingViolation,
             WriteError,
-        } || std.os.OpenError || std.os.WriteError || std.os.MMapError;
+        };
 
-        pub fn init(alloc: Allocator, file: std.fs.File, capacity: usize) Error!*Self {
-            var data = try std.os.mmap(
+        pub fn init(alloc: Allocator, file: std.fs.File, capacity: usize) !*Self {
+            const data = try std.posix.mmap(
                 null,
                 capacity,
-                std.os.PROT.READ | std.os.PROT.WRITE,
-                std.os.MAP.SHARED,
+                std.posix.PROT.READ | std.posix.PROT.WRITE,
+                .{ .TYPE = .SHARED, .ANONYMOUS = false },
                 file.handle,
                 0,
             );
-            var mmap = try alloc.create(Self);
+            const mmap = try alloc.create(Self);
             mmap.* = .{
                 .buf = std.io.fixedBufferStream(data),
                 .count = 0,
@@ -45,19 +45,23 @@ pub fn MMap(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            std.os.munmap(self.buf.buffer);
+            std.posix.munmap(self.buf.buffer);
             self.* = undefined;
         }
 
-        pub fn append(self: *Self, value: T) Error!void {
-            if (self.count == self.len) return Error.WriteError;
+        pub fn append(self: *Self, value: T) !void {
+            if (self.count == self.len) {
+                return Error.WriteError;
+            }
             try self.buf.seekTo(self.size * self.count);
             try self.buf.writer().writeStruct(value);
             self.count += 1;
         }
 
-        pub fn insert(self: *Self, idx: usize, value: T) Error!void {
-            if (self.count == self.len) return Error.WriteError;
+        pub fn insert(self: *Self, idx: usize, value: T) !void {
+            if (self.count == self.len) {
+                return Error.WriteError;
+            }
             const index: usize = self.size * idx;
             try self.buf.seekTo(index);
             const start: usize = try self.buf.getPos();
@@ -67,16 +71,20 @@ pub fn MMap(comptime T: type) type {
             self.count += 1;
         }
 
-        pub fn update(self: *Self, idx: usize, value: T) Error!void {
+        pub fn update(self: *Self, idx: usize, value: T) !void {
             const index: usize = self.size * idx;
-            if (index >= self.len) return Error.WriteError;
+            if (index >= self.len) {
+                return Error.WriteError;
+            }
             try self.buf.seekTo(index);
             try self.buf.writer().writeStruct(value);
         }
 
-        pub fn read(self: *Self, idx: usize) Error!T {
+        pub fn read(self: *Self, idx: usize) !T {
             const index: usize = self.size * idx;
-            if (index >= self.len) return Error.ReadError;
+            if (index >= self.len) {
+                return Error.ReadError;
+            }
             try self.buf.seekTo(index);
             return try self.buf.reader().readStruct(T);
         }
@@ -146,7 +154,7 @@ test "MMap insert" {
 
     // given
     const key = std.hash.Murmur2_64.hash("__key__");
-    var expected: Row = .{ .key = key, .value = "__expected__" };
+    const expected: Row = .{ .key = key, .value = "__expected__" };
 
     const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "insert.dat" });
     defer alloc.free(filename);
@@ -176,6 +184,6 @@ test "MMap insert" {
     // then
     try testing.expect(map.count == 4);
 
-    var actual = try map.read(1);
+    const actual = try map.read(1);
     try testing.expect(expected.key == actual.key);
 }

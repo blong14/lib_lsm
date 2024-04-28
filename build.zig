@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
     // Add custom modules so they can be referenced from our test directory
-    const lsm = b.addModule("lsm", .{ .source_file = .{ .path = "src/main.zig" } });
+    const lsm = b.addModule("lsm", .{ .root_source_file = .{ .path = "src/main.zig" } });
 
     const lib = b.addStaticLibrary(.{
         .name = "lib_lsm",
@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         b.installArtifact(exe);
-        exe.addModule("lsm", lsm);
+        exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
