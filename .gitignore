@@ -5,5 +5,5 @@ zig-out/
 
 data
 
-callgrind.out.*
-massif.out.*
+callgrind.o
+massif.o
