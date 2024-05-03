@@ -167,10 +167,11 @@ const Database = struct {
             return error.WriteError;
         }
         const k: u64 = hasher.hash(key);
+        try self.mtable.put(k, value);
         if (self.mtable.count() >= self.capacity) {
+            try self.flush();
             try self.freeze();
         }
-        try self.mtable.put(k, value);
     }
 
     fn freeze(self: *Self) !void {
@@ -180,11 +181,8 @@ const Database = struct {
     }
 
     fn flush(self: *Self) !void {
-        std.debug.print("flushing...\n", .{});
-        const pathname = self.opts.data_dir;
-        const filename = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ pathname, "sstable.dat" });
-        defer self.alloc.free(filename);
-        const sstable = try SSTable.init(self.alloc, filename, self.opts.sst_capacity);
+        const current_id = self.mtable.getId();
+        const sstable = try SSTable.init(self.alloc, current_id, self.opts);
         try self.sstables.append(sstable);
         try self.mtable.flush(sstable);
     }

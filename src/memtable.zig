@@ -106,19 +106,10 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         }
 
         pub fn flush(self: *Self, sstable: *SSTable) !void {
-            var timer = std.time.Timer.start() catch |err| {
-                std.debug.print("flush error {s}\n", .{@errorName(err)});
-                return;
-            };
-            const start = timer.read();
-            var written: usize = 0;
             var iter = self.iterator();
-            while (iter.next()) |row| {
-                try sstable.append(row.key, row.value);
-                written += 1;
+            while (iter.next()) {
+                try sstable.append(iter.key(), iter.value());
             }
-            const end = timer.read();
-            std.debug.print("total rows writen {d} in {}ms\n", .{ written, (end - start) / 1_000_000 });
         }
     };
 }

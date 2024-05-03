@@ -23,7 +23,8 @@ pub const WAL = struct {
 
     pub fn init(alloc: Allocator, path: []const u8, capacity: usize) !*Self {
         const file = try File.openWithCapacity(path, capacity);
-        const data = try MMap(Row).init(alloc, file, capacity);
+        const data = try MMap(Row).init(alloc, capacity);
+        try data.connect(file);
         const wal = try alloc.create(Self);
         wal.* = .{ .alloc = alloc, .data = data, .file = file };
         return wal;
