@@ -14,7 +14,7 @@ build: $(wildcard ./src/*.zig)
 	zig build $(BUILD_OPTS) run-lsm
 
 clean:
-	rm -f $(EXEC) callgrind.o massif.o
+	rm -f $(EXEC) callgrind.o massif.o data/*.dat
 
 callgrind.o: $(EXEC)
 	# kcachegrind
