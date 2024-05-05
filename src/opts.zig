@@ -12,7 +12,7 @@ pub fn defaultOpts() Opts {
     return .{
         .data_dir = "data",
         // TODO: temp
-        .sst_capacity = PageSize * PageSize / 2,
+        .sst_capacity = PageSize * 16,
         .wal_capacity = PageSize * PageSize,
     };
 }
