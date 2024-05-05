@@ -108,7 +108,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         pub fn flush(self: *Self, sstable: *SSTable) !void {
             var iter = self.iterator();
             while (iter.next()) {
-                try sstable.append(iter.key(), iter.value());
+                try sstable.write(iter.key(), iter.value());
             }
         }
     };

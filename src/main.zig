@@ -2,10 +2,11 @@ const std = @import("std");
 
 const csv = @import("csv_reader.zig");
 const log = @import("wal.zig");
+const file_utils = @import("file.zig");
 const mtbl = @import("memtable.zig");
+const options = @import("opts.zig");
 const sst = @import("sstable.zig");
 const tm = @import("tablemap.zig");
-const options = @import("opts.zig");
 
 const io = std.io;
 const testing = std.testing;
@@ -166,12 +167,12 @@ const Database = struct {
         if (key.len == 0) {
             return error.WriteError;
         }
-        const k: u64 = hasher.hash(key);
-        try self.mtable.put(k, value);
         if (self.mtable.count() >= self.capacity) {
             try self.flush();
             try self.freeze();
         }
+        const k: u64 = hasher.hash(key);
+        try self.mtable.put(k, value);
     }
 
     fn freeze(self: *Self) !void {
@@ -182,7 +183,11 @@ const Database = struct {
 
     fn flush(self: *Self) !void {
         const current_id = self.mtable.getId();
+        const filename = try std.fmt.allocPrint(self.alloc, "{s}/{d}.dat", .{ self.opts.data_dir, current_id });
+        defer self.alloc.free(filename);
+        const file = try file_utils.openWithCapacity(filename, self.opts.sst_capacity);
         const sstable = try SSTable.init(self.alloc, current_id, self.opts);
+        try sstable.connect(file);
         try self.sstables.append(sstable);
         try self.mtable.flush(sstable);
     }
