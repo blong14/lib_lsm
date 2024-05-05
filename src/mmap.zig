@@ -42,7 +42,7 @@ pub fn MMap(comptime T: type) type {
         pub fn connect(self: *Self, file: std.fs.File) !void {
             const data = try std.posix.mmap(
                 null,
-                self.len,
+                self.size * self.len,
                 std.posix.PROT.READ | std.posix.PROT.WRITE,
                 .{ .TYPE = .SHARED, .ANONYMOUS = false },
                 file.handle,
