@@ -24,7 +24,7 @@ const TableMap = tm.TableMap;
 const WAL = log.WAL;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
-pub const MessageQueue = @import("msgqueue.zig").MessageQueue;
+pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
 pub const MemtableList = TableMap(*Memtable(u64, []const u8));
 pub const SSTableList = std.ArrayList(*SSTable);
 

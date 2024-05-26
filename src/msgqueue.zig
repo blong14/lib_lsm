@@ -13,10 +13,10 @@ const sys = @cImport({
 const errno = std.posix.errno;
 const Allocator = std.mem.Allocator;
 
-/// `MessageQueue` is a System V message queue wrapper.
+/// `ProcessMessageQueue` is a System V message queue wrapper.
 /// The calling process must have write permission on the message queue
 /// in order to send a message, and read permission to receive a message.
-pub fn MessageQueue(comptime T: type) type {
+pub fn ProcessMessageQueue(comptime T: type) type {
     return struct {
         alloc: Allocator,
         msgsize: usize,
@@ -129,6 +129,7 @@ pub fn MessageQueue(comptime T: type) type {
                 }
             }
 
+            /// Signals consumers that this writer is done sending messages.
             pub fn done(self: Writer) MessageQueueError!void {
                 var end: Message = .{ .mtype = EOQ, .mdata = undefined };
                 switch (errno(sys.msgsnd(self.msqid, &end, self.msgsize, 0))) {
@@ -153,7 +154,7 @@ pub fn MessageQueue(comptime T: type) type {
     };
 }
 
-test MessageQueue {
+test ProcessMessageQueue {
     const testing = std.testing;
     const Elem = extern struct {
         data: usize,
@@ -165,13 +166,13 @@ test MessageQueue {
     // Create a mailbox to read and write messages to.
     // The main thread will be in charge of cleaning up the mailbox
     var alloc = testing.allocator;
-    var mailbox = try MessageQueue(Elem).init(alloc, ".");
+    var mailbox = try ProcessMessageQueue(Elem).init(alloc, ".");
     defer alloc.destroy(mailbox);
     defer mailbox.deinit();
 
     const reader = mailbox.subscribe();
     const writer = try std.Thread.spawn(.{}, struct {
-        pub fn publish(outbox: MessageQueue(Elem).Writer, data: Elem) !void {
+        pub fn publish(outbox: ProcessMessageQueue(Elem).Writer, data: Elem) !void {
             try outbox.publish(data);
         }
     }.publish, .{ mailbox.publisher(), elem });
@@ -193,14 +194,14 @@ test "Test count" {
     // Create a mailbox to read and write messages to.
     // The main thread will be in charge of cleaning up the mailbox
     var alloc = testing.allocator;
-    var mailbox = try MessageQueue(Elem).init(alloc, ".");
+    var mailbox = try ProcessMessageQueue(Elem).init(alloc, ".");
     defer alloc.destroy(mailbox);
     defer mailbox.deinit();
 
     // Count all messages
     const reader = mailbox.subscribe();
     const writer = try std.Thread.spawn(.{}, struct {
-        pub fn publish(outbox: MessageQueue(Elem).Writer, data: []Elem) !void {
+        pub fn publish(outbox: ProcessMessageQueue(Elem).Writer, data: []Elem) !void {
             defer outbox.done() catch |err| {
                 std.debug.print("Oops {s}\n", .{@errorName(err)});
             };
