@@ -40,7 +40,7 @@ pub fn ProcessMessageQueue(comptime T: type) type {
 
         const EOQ = 2;
 
-        /// Creates a `MessageQueue` with msqid derived from the given file path.
+        /// Creates a `ProcessMessageQueue` with msqid derived from the given file path.
         pub fn init(alloc: Allocator, path: [*c]const u8) MessageQueueError!*Self {
             const msqproj = 1;
             const key = sys.ftok(path, msqproj);
