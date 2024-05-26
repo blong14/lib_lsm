@@ -1,20 +1,29 @@
 # Executable
+BIN := zig-out/bin
 BUILD_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
 EXEC := zig-out/bin/lsm
+SOURCES := $(wildcard ./src/*.zig)
 
-.PHONY: clean
+# 3rd party deps
+# sudo apt install libzmq5-dev
+# zig fetch --global-cache-dir zig-cache --save=zzmq 'https://github.com/nine-lives-later/zzmq/archive/refs/tags/v0.2.2-zig0.12.tar.gz'
+
+.PHONY: clean test
 
 all: build callgrind.o massif.o
 
-build: $(wildcard ./src/*.zig)
-	# gdb --tui zig-out/bin/lsm
-	# b src/tablemap.zig:76
-	# r
-	# ipcrm -q <tab>
-	zig build $(BUILD_OPTS) run-lsm
+# gdb --tui zig-out/bin/lsm
+# b src/tablemap.zig:76
+# r
+# ipcrm -q <tab>
+build: $(SOURCES)
+	@zig build $(BUILD_OPTS)
 
 clean:
-	rm -f $(EXEC) callgrind.o massif.o data/*.dat
+	rm -f $(BIN)/* callgrind.o massif.o data/*.dat
+
+test: $(SOURCES)
+	@zig build test --summary all
 
 callgrind.o: $(EXEC)
 	# kcachegrind

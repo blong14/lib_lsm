@@ -1,4 +1,5 @@
 const std = @import("std");
+const cmds = @import("test/build.zig");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -14,56 +15,63 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
     // Add custom modules so they can be referenced from our test directory
     const lsm = b.addModule("lsm", .{ .root_source_file = .{ .path = "src/main.zig" } });
 
-    const lib = b.addStaticLibrary(.{
-        .name = "lib_lsm",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
-        .root_source_file = .{ .path = "src/main.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // This declares intent for the library to be installed into the standard
-    // location when the user invokes the "install" step (the default step when
-    // running `zig build`).
-    b.installArtifact(lib);
-    // lib.linkLibC();
-
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
-    const main_tests = b.addTest(.{
-        .root_source_file = .{ .path = "src/main.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const run_main_tests = b.addRunArtifact(main_tests);
-
-    // This creates a build step. It will be visible in the `zig build --help` menu,
-    // and can be selected like this: `zig build test`
-    // This will evaluate the `test` step rather than the default, which is "install".
-    const test_step = b.step("test", "Run library tests");
-    test_step.dependOn(&run_main_tests.step);
-
+    // Main library build definition
     {
-        const exe = b.addExecutable(.{
-            .name = "lsm",
-            .root_source_file = .{ .path = "test/main.zig" },
+        const lib = b.addStaticLibrary(.{
+            .name = "lib_lsm",
+            // In this case the main source file is merely a path, however, in more
+            // complicated build scripts, this could be a generated file.
+            .root_source_file = .{ .path = "src/main.zig" },
             .target = target,
             .optimize = optimize,
         });
-        b.installArtifact(exe);
+
+        // This declares intent for the library to be installed into the standard
+        // location when the user invokes the "install" step (the default step when
+        // running `zig build`).
+        b.installArtifact(lib);
+        lib.linkLibC();
+
+        // Creates a step for unit testing. This only builds the test executable
+        // but does not run it.
+        const main_tests = b.addTest(.{
+            .root_source_file = .{ .path = "src/main.zig" },
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const run_main_tests = b.addRunArtifact(main_tests);
+
+        // This creates a build step. It will be visible in the `zig build --help` menu,
+        // and can be selected like this: `zig build test`
+        // This will evaluate the `test` step rather than the default, which is "install".
+        const test_step = b.step("test", "Run library tests");
+        test_step.dependOn(&run_main_tests.step);
+    }
+
+    // Integration tests
+
+    // IPC based concurrency with SystemV
+    {
+        const exe = cmds.buildSystemV(b, target, optimize);
         exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();
-        const run_cmd = b.addRunArtifact(exe);
-        run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-        const run_step = b.step("run-lsm", "Run the test app");
-        run_step.dependOn(&run_cmd.step);
+    }
+
+    // ZeroMQ based concurrency
+    {
+        const zzmq = b.dependency("zzmq", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        const exe = cmds.buildZmq(b, target, optimize);
+        exe.root_module.addImport("lsm", lsm);
+        exe.root_module.addImport("zmq", zzmq.module("zzmq"));
+        exe.linkSystemLibrary("zmq");
+        exe.linkLibC();
     }
 }
