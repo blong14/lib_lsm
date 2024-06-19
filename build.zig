@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Add custom modules so they can be referenced from our test directory
-    const lsm = b.addModule("lsm", .{ .root_source_file = .{ .path = "src/main.zig" } });
+    const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/main.zig") });
 
     // Main library build definition
     {
@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
             .name = "lib_lsm",
             // In this case the main source file is merely a path, however, in more
             // complicated build scripts, this could be a generated file.
-            .root_source_file = .{ .path = "src/main.zig" },
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -39,11 +39,10 @@ pub fn build(b: *std.Build) void {
         // Creates a step for unit testing. This only builds the test executable
         // but does not run it.
         const main_tests = b.addTest(.{
-            .root_source_file = .{ .path = "src/main.zig" },
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
         });
-
         const run_main_tests = b.addRunArtifact(main_tests);
 
         // This creates a build step. It will be visible in the `zig build --help` menu,
@@ -70,7 +69,7 @@ pub fn build(b: *std.Build) void {
         });
         const exe = cmds.buildZmq(b, target, optimize);
         exe.root_module.addImport("lsm", lsm);
-        exe.root_module.addImport("zmq", zzmq.module("zzmq"));
+        exe.root_module.addImport("zzmq", zzmq.module("zzmq"));
         exe.linkSystemLibrary("zmq");
         exe.linkLibC();
     }

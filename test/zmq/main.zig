@@ -2,24 +2,34 @@ const std = @import("std");
 const lsm = @import("lsm");
 const zzmq = @import("zzmq");
 
-const msg = struct {
-    key: []const u8,
-    value: []const u8,
+const FixedBuffer = std.io.FixedBufferStream([]u8);
+
+const Msg = extern struct {
+    key: [*c]const u8,
+    value: [*c]const u8,
+};
+
+var stopRunning_ = std.atomic.Value(bool).init(false);
+const stopRunning = &stopRunning_;
+
+fn sig_handler(_: c_int) align(1) callconv(.C) void {
+    stopRunning.store(true, .seq_cst);
+}
+
+const sig_ign = std.os.linux.Sigaction{
+    .handler = .{ .handler = &sig_handler },
+    .mask = std.os.linux.empty_sigset,
+    .flags = 0,
 };
 
 pub fn main() !void {
     var mainTimer = try std.time.Timer.start();
     const mainStart = mainTimer.read();
 
-    var garena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer garena.deinit();
-
-    const galloc = garena.allocator();
-    var mailbox = try lsm.MessageQueue([]msg).init(galloc, ".");
-    defer mailbox.deinit();
-
     const reader = try std.Thread.spawn(.{}, struct {
-        pub fn consume(inbox: lsm.MessageQueue([]msg).ReadIter) void {
+        pub fn consume() void {
+            std.debug.print("starting consumer...\n", .{});
+
             var timer = std.time.Timer.start() catch |err| {
                 std.debug.print("consume error {s}\n", .{@errorName(err)});
                 return;
@@ -29,28 +39,85 @@ pub fn main() !void {
             defer arena.deinit();
 
             const alloc = arena.allocator();
+
             var db = lsm.defaultDatabase(alloc) catch |err| {
                 std.debug.print("consume error {s}\n", .{@errorName(err)});
                 return;
             };
             defer db.deinit();
 
+            var context = zzmq.ZContext.init(alloc) catch |err| {
+                std.debug.print("context error {s}\n", .{@errorName(err)});
+                return;
+            };
+            defer context.deinit();
+
+            var socket = zzmq.ZSocket.init(zzmq.ZSocketType.Pair, &context) catch |err| {
+                std.debug.print("socket init error {s}\n", .{@errorName(err)});
+                return;
+            };
+            defer socket.deinit();
+
+            std.debug.print("connecting to socket...\n", .{});
+            socket.bind("tcp://127.0.0.1:5555") catch |err| {
+                std.debug.print("not able to connect {s}\n", .{@errorName(err)});
+                return;
+            };
+
             const start = timer.read();
             var count: usize = 0;
-            while (inbox.next()) |row| {
-                for (row) |item| {
-                    db.write(item.key, item.value) catch |err| {
+            while (!stopRunning.load(.seq_cst)) {
+                var msg = socket.receive(.{ .dontwait = true }) catch |err| switch (err) {
+                    error.NonBlockingQueueEmpty => continue,
+                    else => {
+                        std.debug.print("socket recv error: {s} {}\n", .{ @errorName(err), err });
+                        return;
+                    },
+                };
+                const data = msg.data() catch |err| {
+                    std.debug.print("invalid msg data: {s} {}\n", .{ @errorName(err), err });
+                    continue;
+                };
+                var buf: FixedBuffer = std.io.fixedBufferStream(@constCast(data));
+                while (true) {
+                    const r = buf.reader().readStruct(Msg) catch |err| {
+                        std.debug.print("invalid MSG data: {s} {}\n", .{ @errorName(err), err });
+                        break;
+                    };
+                    const key = std.mem.span(r.key);
+                    const value = std.mem.span(r.value);
+                    db.write(key, value) catch |err| {
                         std.debug.print("count {d} {s}\n", .{ count, @errorName(err) });
+                        msg.deinit();
                         return;
                     };
                     count += 1;
                 }
+                msg.deinit();
             }
+
             const end = timer.read();
             std.debug.print("total rows read {d} in {}ms\n", .{ count, (end - start) / 1_000_000 });
         }
-    }.consume, .{mailbox.subscribe()});
-    const writer = mailbox.publisher();
+    }.consume, .{});
+
+    var garena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer garena.deinit();
+
+    const galloc = garena.allocator();
+
+    var context = try zzmq.ZContext.init(galloc);
+    defer context.deinit();
+
+    var socket = try zzmq.ZSocket.init(zzmq.ZSocketType.Pair, &context);
+    defer socket.deinit();
+
+    _ = std.os.linux.sigaction(std.os.linux.SIG.HUP, &sig_ign, null);
+    _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sig_ign, null);
+    _ = std.os.linux.sigaction(std.os.linux.SIG.QUIT, &sig_ign, null);
+    _ = std.os.linux.sigaction(std.os.linux.SIG.TERM, &sig_ign, null);
+
+    try socket.connect("tcp://127.0.0.1:5555");
 
     const file = std.fs.cwd().openFile("data/input.csv", .{}) catch |err| {
         std.debug.print("publish error {s}\n", .{@errorName(err)});
@@ -66,8 +133,11 @@ pub fn main() !void {
         return;
     };
 
-    var out = std.ArrayList(msg).init(galloc);
-    defer out.deinit();
+    const outSize = @sizeOf(Msg) * std.mem.page_size;
+    const out = try galloc.alloc(u8, outSize);
+    defer galloc.free(out);
+
+    var buf: FixedBuffer = std.io.fixedBufferStream(out);
 
     const writeStart = mainTimer.read();
     var count: usize = 0;
@@ -80,14 +150,20 @@ pub fn main() !void {
                 idx += 1;
             },
             .row_end => {
-                const r: msg = .{ .key = row[0], .value = row[1] };
-                try out.append(r);
-                if (out.items.len >= std.mem.page_size) {
-                    writer.publish(out.items) catch |err| {
+                const r: Msg = .{ .key = row[0].ptr, .value = row[1].ptr };
+                try buf.writer().writeStruct(r);
+                if (buf.getWritten().len >= outSize) {
+                    var msg = try zzmq.ZMessage.init(galloc, buf.getWritten());
+                    defer msg.deinit();
+                    std.debug.print("sending on socket...\n", .{});
+                    socket.send(&msg, .{
+                        .more = false,
+                        .dontwait = false,
+                    }) catch |err| {
                         std.debug.print("error publishing row {s}\n", .{@errorName(err)});
                         return;
                     };
-                    out.clearRetainingCapacity();
+                    buf.reset();
                 }
                 count += 1;
                 row = [2][]const u8{ undefined, undefined };
@@ -95,18 +171,19 @@ pub fn main() !void {
             },
         }
     }
-    if (out.items.len > 0) {
-        writer.publish(out.items) catch |err| {
+    if ((buf.getEndPos() catch 0) > 0) {
+        var msg = try zzmq.ZMessage.init(galloc, buf.getWritten());
+        defer msg.deinit();
+        socket.send(&msg, .{}) catch |err| {
             std.debug.print("error publishing row {s}\n", .{@errorName(err)});
             return;
         };
+        buf.reset();
     }
     const writeEnd = mainTimer.read();
     std.debug.print("total rows writen {d} in {}ms\n", .{ count, (writeEnd - writeStart) / 1_000_000 });
-    writer.done() catch |err| {
-        std.debug.print("publish error {s}\n", .{@errorName(err)});
-    };
 
+    stopRunning.store(true, .seq_cst);
     reader.join();
 
     const mainEnd = mainTimer.read();

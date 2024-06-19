@@ -17,6 +17,7 @@ all: build callgrind.o massif.o
 # r
 # ipcrm -q <tab>
 build: $(SOURCES)
+	@zig fmt .
 	@zig build $(BUILD_OPTS)
 
 clean:

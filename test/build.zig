@@ -8,7 +8,7 @@ const ResolvedTarget = std.Build.ResolvedTarget;
 pub fn buildSystemV(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *CompileStep {
     const exe = b.addExecutable(.{
         .name = "lsm",
-        .root_source_file = .{ .path = "test/systemv/main.zig" },
+        .root_source_file = b.path("test/systemv/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -23,10 +23,10 @@ pub fn buildSystemV(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *
     return exe;
 }
 
-pub fn buildZmq(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *CompileStep  {
+pub fn buildZmq(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *CompileStep {
     const exe = b.addExecutable(.{
         .name = "zmq",
-        .root_source_file = .{ .path = "test/zmq/main.zig" },
+        .root_source_file = b.path("test/zmq/main.zig"),
         .target = target,
         .optimize = optimize,
     });

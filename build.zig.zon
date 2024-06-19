@@ -7,7 +7,7 @@
     // This field is optional.
     // This is currently advisory only; Zig does not yet do anything
     // with this value.
-    .minimum_zig_version = "0.12.0",
+    .minimum_zig_version = "0.13.0",
 
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
@@ -16,8 +16,8 @@
     // internet connectivity.
     .dependencies = .{
         .zzmq = .{
-            .url = "https://github.com/nine-lives-later/zzmq/archive/refs/tags/v0.2.2-zig0.12.tar.gz",
-            .hash = "122048ba004ea870098285b895c9f9dfefe33027d0982c7df0efe2a07bb6040cebea",
+            .url = "https://github.com/nine-lives-later/zzmq/archive/refs/tags/v0.2.2-zig0.13.tar.gz",
+            .hash = "12204e64356f0588ded157216663f4c384fcc7acb76447faec3ec4aaccb868b287f9",
         },
     },
     .paths = .{
