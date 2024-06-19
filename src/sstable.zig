@@ -13,13 +13,13 @@ const Opts = options.Opts;
 pub const Block = struct {
     alloc: Allocator,
     capacity: usize,
-    data:  FixedBuffer([]align(std.mem.page_size) u8),
-    offset:  FixedBuffer([]align(std.mem.page_size) u8),
+    data: FixedBuffer([]align(std.mem.page_size) u8),
+    offset: FixedBuffer([]align(std.mem.page_size) u8),
     count: u16,
 
     const Self = @This();
 
-    const Error = error {
+    const Error = error{
         WriteError,
     };
 
@@ -50,8 +50,8 @@ pub const Block = struct {
         block.* = .{
             .alloc = alloc,
             .capacity = capacity,
-            .data = std.io.fixedBufferStream(@as([]align(std.mem.page_size)u8, @alignCast(data))),
-            .offset = std.io.fixedBufferStream(@as([]align(std.mem.page_size)u8, @alignCast(offset))),
+            .data = std.io.fixedBufferStream(@as([]align(std.mem.page_size) u8, @alignCast(data))),
+            .offset = std.io.fixedBufferStream(@as([]align(std.mem.page_size) u8, @alignCast(offset))),
             .count = 0,
         };
         return block;
@@ -125,11 +125,7 @@ pub const SSTable = struct {
         NotFound,
     } || AppendOnlyMMap.Error;
 
-    const IndexValue = struct {
-        idx: usize,
-        key: u64,
-        len: u64
-    };
+    const IndexValue = struct { idx: usize, key: u64, len: u64 };
 
     pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
         const cap = opts.sst_capacity / @sizeOf(SSTableRow);
