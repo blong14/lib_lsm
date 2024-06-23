@@ -64,7 +64,7 @@ pub fn TableMap(comptime V: type) type {
         }
 
         pub fn count(self: Self) usize {
-            return self.impl.len;
+            return self.impl.*.len;
         }
 
         pub fn getEntryByIdx(self: Self, idx: usize) TableMapError!MapEntry {

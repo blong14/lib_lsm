@@ -84,13 +84,15 @@ pub fn main() !void {
                         std.debug.print("invalid MSG data: {s} {}\n", .{ @errorName(err), err });
                         break;
                     };
-                    const key = std.mem.span(r.key);
-                    const value = std.mem.span(r.value);
-                    db.write(key, value) catch |err| {
-                        std.debug.print("count {d} {s}\n", .{ count, @errorName(err) });
-                        msg.deinit();
-                        return;
-                    };
+                    std.debug.print("{s}\n\n", .{r.value});
+                    // const key = std.mem.span(r.key);
+                    // const value = std.mem.span(r.value);
+                    // std.debug.print("{d} key {d} value {d} - diff {d}\n", .{ count, key.len, value.len, (key.len - value.len) });
+                    //                   db.write(key, value) catch |err| {
+                    //                      std.debug.print("count {d} {s}\n", .{ count, @errorName(err) });
+                    //                       msg.deinit();
+                    //                      return;
+                    //                 };
                     count += 1;
                 }
                 msg.deinit();

@@ -37,6 +37,7 @@ pub fn main() !void {
             const start = timer.read();
             var count: usize = 0;
             while (inbox.next()) |row| {
+                std.debug.print("count {d}\n", .{count});
                 for (row) |item| {
                     db.write(item.key, item.value) catch |err| {
                         std.debug.print("count {d} {s}\n", .{ count, @errorName(err) });
@@ -46,7 +47,26 @@ pub fn main() !void {
                 }
             }
             const end = timer.read();
-            std.debug.print("total rows read {d} in {}ms\n", .{ count, (end - start) / 1_000_000 });
+            std.debug.print("total rows consumed {d} in {}ms\n", .{ count, (end - start) / 1_000_000 });
+
+            db.flush() catch |err| {
+                std.debug.print("error flushing db {s}\n", .{@errorName(err)});
+                return;
+            };
+
+            std.debug.print("iterating keys...\n", .{});
+            var iter = db.iterator() catch |err| {
+                std.debug.print("db iter error {s}\n", .{@errorName(err)});
+                return;
+            };
+
+            const readStart = timer.read();
+            var readCount: usize = 0;
+            while (iter.next() catch false) {
+                readCount += 1;
+            }
+            const readEnd = timer.read();
+            std.debug.print("total rows read {d} in {}ms\n", .{ readCount, (readEnd - readStart) / 1_000_000 });
         }
     }.consume, .{mailbox.subscribe()});
     const writer = mailbox.publisher();
@@ -95,6 +115,7 @@ pub fn main() !void {
         }
     }
     if (out.items.len > 0) {
+        std.debug.print("final publish\n", .{});
         writer.publish(out.items) catch |err| {
             std.debug.print("error publishing row {s}\n", .{@errorName(err)});
             return;
