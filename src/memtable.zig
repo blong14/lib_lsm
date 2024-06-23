@@ -100,13 +100,15 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             }
         };
 
-        pub fn iterator(self: Self) Iterator {
-            const iter = self.hash_map.iterator(0);
-            return .{ .hash_iter = iter, .k = 0, .v = undefined };
+        pub fn iterator(self: Self) !*Iterator {
+            const hiter = self.hash_map.iterator(0);
+            const iter = try self.alloc.create(Iterator);
+            iter.* = .{ .hash_iter = hiter, .k = 0, .v = undefined };
+            return iter;
         }
 
         pub fn flush(self: *Self, sstable: *SSTable) !void {
-            var iter = self.iterator();
+            var iter = try self.iterator();
             while (iter.next()) {
                 try sstable.write(iter.key(), iter.value());
             }
@@ -132,7 +134,8 @@ test Memtable {
 
     // when
     var next_actual: []const u8 = undefined;
-    var iter = mtable.iterator();
+    var iter = try mtable.iterator();
+    defer alloc.destroy(iter);
     if (iter.next()) {
         next_actual = iter.value();
     }

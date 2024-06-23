@@ -70,6 +70,9 @@ const Database = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.flush() catch |err| {
+            std.debug.print("db flush error {s}\n", .{@errorName(err)});
+        };
         self.mtable.deinit();
         self.alloc.destroy(self.mtable);
         var mtable_iter = self.mtables.iterator(0);
@@ -117,21 +120,26 @@ const Database = struct {
     }
 
     const MergeIterator = struct {
-        mtbls: std.ArrayList(Memtable(u64, []const u8).Iterator),
+        mtbls: std.ArrayList(*Memtable(u64, []const u8).Iterator),
         queue: std.PriorityQueue(KV, void, lessThan),
         k: u64,
         v: []const u8,
 
-        pub fn init(alloc: Allocator, m: *MemtableList) MergeIterator {
-            var iters = std.ArrayList(Memtable(u64, []const u8).Iterator).init(alloc);
-            var table_iter = m.mtbls.iterator(0);
+        pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
+            var iters = std.ArrayList(*Memtable(u64, []const u8).Iterator).init(alloc);
+            var table_iter = m.mtables.iterator(0);
             while (table_iter.next()) {
-                const iter = table_iter.value().Iterator();
+                const iter = try table_iter.value().iterator();
                 try iters.append(iter);
             }
-            return .{
-                .mtbls = iters,
-            };
+
+            const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
+            std.debug.print("MergeIterator init with {d} memtables & 1 priority queue\n", .{iters.items.len});
+
+            const mi = try alloc.create(MergeIterator);
+            mi.*.mtbls = iters;
+            mi.*.queue = queue;
+            return mi;
         }
 
         pub fn deinit(self: *MergeIterator) void {
@@ -157,11 +165,19 @@ const Database = struct {
                     try mi.queue.add(row);
                 }
             }
+            if (mi.queue.count() == 0) {
+                return false;
+            }
             const nxt = mi.queue.remove();
             mi.*.k = nxt.k;
             mi.*.v = nxt.v;
+            return true;
         }
     };
+
+    pub fn iterator(self: *Self) !*MergeIterator {
+        return try MergeIterator.init(self.alloc, self);
+    }
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
         if (key.len == 0) {
@@ -169,7 +185,6 @@ const Database = struct {
         }
         if (self.mtable.count() >= self.capacity) {
             try self.flush();
-            try self.freeze();
         }
         const k: u64 = hasher.hash(key);
         try self.mtable.put(k, value);
@@ -181,7 +196,11 @@ const Database = struct {
         self.mtable = try Memtable(u64, []const u8).init(self.alloc, current_id + 1, self.opts);
     }
 
-    fn flush(self: *Self) !void {
+    pub fn flush(self: *Self) !void {
+        if (self.mtable.count() == 0) {
+            return;
+        }
+        std.debug.print("flushing memtable...\n", .{});
         const current_id = self.mtable.getId();
         const filename = try std.fmt.allocPrint(self.alloc, "{s}/{d}.dat", .{ self.opts.data_dir, current_id });
         defer self.alloc.free(filename);
@@ -190,6 +209,7 @@ const Database = struct {
         try sstable.connect(file);
         try self.sstables.append(sstable);
         try self.mtable.flush(sstable);
+        try self.freeze();
     }
 };
 
