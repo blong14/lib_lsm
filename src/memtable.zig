@@ -1,22 +1,25 @@
 const std = @import("std");
 
-const log = @import("wal.zig");
+const file_utils = @import("file.zig");
 const options = @import("opts.zig");
 const sst = @import("sstable.zig");
 const tbm = @import("tablemap.zig");
 
 const Allocator = std.mem.Allocator;
-const Entry = tbm.MapEntry;
+const ArenaAllocator = std.heap.ArenaAllocator;
+
 const Opts = options.Opts;
 const SSTable = sst.SSTable;
 const TableMap = tbm.TableMap;
 
 pub fn Memtable(comptime K: type, comptime V: type) type {
     return struct {
-        alloc: Allocator,
+        alloc: ArenaAllocator,
         hash_map: *TableMap(V),
-        id: K,
-        wal: *log.WAL,
+        id: u64,
+        opts: Opts,
+        mutable: bool,
+        sstable: SSTable,
 
         const Self = @This();
 
@@ -24,35 +27,37 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             Full,
         };
 
-        pub fn init(alloc: Allocator, id: K, opts: Opts) !*Self {
-            const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ opts.data_dir, "wal.dat" });
-            defer alloc.free(filename);
-            const wal = try log.WAL.init(alloc, filename, opts.wal_capacity);
+        pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
+            const arena = ArenaAllocator.init(alloc);
             const map = try TableMap(V).init(alloc);
-            const mtable = try alloc.create(Self);
+
+            const allocator = arena.allocator();
+            const mtable = try allocator.create(Self);
             mtable.* = .{
-                .alloc = alloc,
+                .alloc = arena,
                 .hash_map = map,
                 .id = id,
-                .wal = wal,
+                .mutable = true,
+                .opts = opts,
+                .sstable = undefined,
             };
             return mtable;
         }
 
         pub fn deinit(self: *Self) void {
             self.hash_map.deinit();
-            self.alloc.destroy(self.hash_map);
-            self.wal.deinit();
-            self.alloc.destroy(self.wal);
+            self.alloc.denit();
             self.* = undefined;
         }
 
-        pub fn getId(self: Self) K {
+        pub fn getId(self: Self) u64 {
             return self.id;
         }
 
         pub fn put(self: *Self, key: K, value: V) !void {
-            try self.wal.write(key, value);
+            if (!self.mutable) {
+                return error.Full;
+            }
             try self.hash_map.put(key, value);
         }
 
@@ -64,7 +69,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             return self.hash_map.count();
         }
 
-        pub fn scan(self: *Self, start: u64, end: u64, out: *std.ArrayList(tbm.MapEntry)) !void {
+        pub fn scan(self: *Self, start: u64, end: u64, out: *std.ArrayList(V)) !void {
             var scnr = try self.hash_map.scanner(start, end);
             while (scnr.hasNext()) {
                 const entry = try scnr.next();
@@ -107,11 +112,29 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             return iter;
         }
 
-        pub fn flush(self: *Self, sstable: *SSTable) !void {
+        pub fn flush(self: *Self) !void {
+            if (!self.mutable or self.count() == 0) {
+                return;
+            }
+
+            std.debug.print("flushing memtable...\n", .{});
+
+            // TODO: Use a fixed buffer allocator here
+            const allocator = self.alloc.allocator();
+            const filename = try std.fmt.allocPrint(allocator, "{s}/{d}.dat", .{ self.opts.data_dir, self.getId() });
+            defer allocator.free(filename);
+
+            const file = try file_utils.openWithCapacity(filename, self.opts.sst_capacity);
+            var sstable = try SSTable.init(allocator, self.getId(), self.opts);
+            try sstable.connect(file);
+
             var iter = try self.iterator();
             while (iter.next()) {
                 try sstable.write(iter.key(), iter.value());
             }
+
+            self.sstable = sstable;
+            self.mutable = false;
         }
     };
 }
