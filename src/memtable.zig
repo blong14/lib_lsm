@@ -19,7 +19,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         id: u64,
         opts: Opts,
         mutable: bool,
-        sstable: SSTable,
+        sstable: *SSTable,
 
         const Self = @This();
 
@@ -28,7 +28,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
         };
 
         pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
-            const arena = ArenaAllocator.init(alloc);
+            var arena = ArenaAllocator.init(alloc);
             const map = try TableMap(V).init(alloc);
 
             const allocator = arena.allocator();
@@ -46,7 +46,7 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
 
         pub fn deinit(self: *Self) void {
             self.hash_map.deinit();
-            self.alloc.denit();
+            self.alloc.deinit();
             self.* = undefined;
         }
 
@@ -54,11 +54,11 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             return self.id;
         }
 
-        pub fn put(self: *Self, key: K, value: V) !void {
+        pub fn put(self: *Self, key: K, value: *V) !void {
             if (!self.mutable) {
                 return error.Full;
             }
-            try self.hash_map.put(key, value);
+            try self.hash_map.put(key, value.*);
         }
 
         pub fn get(self: Self, key: K) ?V {
@@ -105,9 +105,9 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
             }
         };
 
-        pub fn iterator(self: Self) !*Iterator {
+        pub fn iterator(self: *Self) !*Iterator {
             const hiter = self.hash_map.iterator(0);
-            const iter = try self.alloc.create(Iterator);
+            const iter = try self.alloc.allocator().create(Iterator);
             iter.* = .{ .hash_iter = hiter, .k = 0, .v = undefined };
             return iter;
         }
@@ -130,7 +130,10 @@ pub fn Memtable(comptime K: type, comptime V: type) type {
 
             var iter = try self.iterator();
             while (iter.next()) {
-                try sstable.write(iter.key(), iter.value());
+                _ = sstable.write(iter.value()) catch {
+                    std.debug.print("sstable write error\n", .{});
+                    // return err;
+                };
             }
 
             self.sstable = sstable;
