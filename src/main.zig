@@ -6,6 +6,7 @@ const mtbl = @import("memtable.zig");
 const options = @import("opts.zig");
 const sst = @import("sstable.zig");
 const tm = @import("tablemap.zig");
+const KV = @import("kv.zig").KV;
 
 const io = std.io;
 const testing = std.testing;
@@ -26,14 +27,9 @@ pub const CSV = CsvTokenizer(std.fs.File.Reader);
 pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
 pub const SSTableList = std.ArrayList(*SSTable);
 
-const KV = struct {
-    k: u64,
-    v: []const u8,
-};
-
 fn lessThan(context: void, a: KV, b: KV) Order {
     _ = context;
-    return std.math.order(a.k, b.k);
+    return std.math.order(a.hash, b.hash);
 }
 
 const Database = struct {
@@ -41,13 +37,13 @@ const Database = struct {
     capacity: usize,
     mtable: *Memtable(u64, KV),
     opts: Opts,
-    mtables: TableMap(*Memtable(u64, KV)),
+    mtables: *TableMap(*Memtable(u64, KV)),
 
     const Self = @This();
     const Error = error{};
 
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
-        const arena = ArenaAllocator.init(alloc);
+        var arena = ArenaAllocator.init(alloc);
         const mtable = try Memtable(u64, KV).init(alloc, 0, opts);
         const mtables = try TableMap(*Memtable(u64, KV)).init(alloc);
         const capacity = opts.sst_capacity / @sizeOf(Row);
@@ -110,7 +106,7 @@ const Database = struct {
         v: KV,
 
         pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
-            const arena = ArenaAllocator.init(alloc);
+            var arena = ArenaAllocator.init(alloc);
             var iters = std.ArrayList(*Memtable(u64, KV).Iterator).init(alloc);
             const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
 
@@ -122,11 +118,13 @@ const Database = struct {
 
             std.debug.print("MergeIterator init with {d} memtables\n", .{iters.items.len});
 
-            const mi = try arena.create(MergeIterator);
+            const mi = try arena.allocator().create(MergeIterator);
             mi.* = .{
                 .alloc = arena,
                 .mtbls = iters,
                 .queue = queue,
+                .k = 0,
+                .v = undefined,
             };
             return mi;
         }
@@ -157,8 +155,8 @@ const Database = struct {
                 return false;
             }
             const nxt = mi.queue.remove();
-            mi.*.k = nxt.k;
-            mi.*.v = nxt.v;
+            mi.*.k = nxt.hash;
+            mi.*.v = nxt;
             return true;
         }
     };
@@ -172,10 +170,22 @@ const Database = struct {
             return error.WriteError;
         }
         if (self.mtable.count() >= self.capacity) {
-            try self.mtable.flush();
+            try self.flush();
+            try self.freeze();
         }
         const k: u64 = hasher.hash(key);
-        try self.mtable.put(k, value);
+
+        const kv = try self.alloc.allocator().create(KV);
+        kv.* = .{
+            .hash = k,
+            .key = key,
+            .value = value,
+        };
+        try self.mtable.put(k, kv);
+    }
+
+    pub fn flush(self: *Self) !void {
+        try self.mtable.flush();
     }
 
     fn freeze(self: *Self) !void {
