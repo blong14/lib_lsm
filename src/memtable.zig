@@ -14,43 +14,45 @@ const SSTable = sst.SSTable;
 const TableMap = tbm.TableMap;
 
 pub const Memtable = struct {
-    alloc: Allocator,
-    cap: usize,
-    hash_map: *TableMap(KV),
-    id: u64,
-    opts: Opts,
-    mutable: bool,
-    sstable: *SSTable,
-
+    
     const Self = @This();
+    
+    const KVTableMap = TableMap([]const u8, KV, KV.order);
 
     const Error = error{
         Full,
     };
 
+    alloc: Allocator,
+    cap: usize,
+    data: KVTableMap,
+    id: u64,
+    opts: Opts,
+    mutable: bool,
+    sstable: ?*SSTable,
+
     pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
         const cap = opts.sst_capacity / @sizeOf(KV);
-        const map = try TableMap(KV).init(alloc);
+        const map = try KVTableMap.init(alloc, cap);
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
             .alloc = alloc,
             .cap = cap,
-            .hash_map = map,
+            .data = map,
             .id = id,
             .mutable = true,
             .opts = opts,
-            .sstable = undefined,
+            .sstable = null,
         };
         return mtable;
     }
 
     pub fn deinit(self: *Self) void {
-        self.hash_map.deinit();
-        self.alloc.destroy(self.hash_map);
-        if (self.sstable != undefined) {
-            self.sstable.deinit();
-            self.alloc.destroy(self.sstable);
+        self.data.deinit();
+        if (self.sstable) |sstbl| {
+            sstbl.deinit();
+            self.alloc.destroy(sstbl);
         }
         self.* = undefined;
     }
@@ -59,63 +61,77 @@ pub const Memtable = struct {
         return self.id;
     }
 
-    pub fn put(self: *Self, key: u64, value: *const KV) !void {
+    pub fn put(self: *Self, item: *const KV) !void {
         if (!self.mutable) {
             return error.Full;
         }
-        try self.hash_map.put(key, value.*);
+        try self.data.put(item.key, item.*);
     }
 
-    pub fn get(self: Self, key: u64) ?KV {
-        return self.hash_map.get(key) catch return null;
+    pub fn get(self: Self, key: []const u8) ?KV {
+        return self.data.get(key) catch return null;
     }
 
     pub fn count(self: Self) usize {
-        return self.hash_map.count();
-    }
-
-    pub fn scan(self: *Self, start: u64, end: u64, out: *std.ArrayList(KV)) !void {
-        var scnr = try self.hash_map.scanner(start, end);
-        while (scnr.hasNext()) {
-            const entry = try scnr.next();
-            try out.append(entry.?);
-        }
+        return self.data.count();
     }
 
     pub const Iterator = struct {
-        hash_iter: TableMap(KV).Iterator,
-        k: u64,
+        data: KVTableMap,
+        idx: usize,
+        start_idx: usize,
         v: KV,
-
-        pub fn key(it: Iterator) u64 {
-            return it.k;
-        }
 
         pub fn value(it: Iterator) KV {
             return it.v;
         }
 
-        pub fn next(it: *Iterator) bool {
-            if (it.hash_iter.next()) {
-                it.*.k = it.hash_iter.key();
-                it.*.v = it.hash_iter.value();
-                return true;
+        pub fn prev(it: *Iterator) bool {
+            if (it.data.count() == 0) {
+                return false;
             }
-            return false;
+            const entry = it.data.getEntryByIdx(it.*.idx) catch |err| {
+                std.debug.print(
+                    "memtable iter error: {s}\n",
+                    .{@errorName(err)},
+                );
+                return false;
+            };
+            it.*.v = entry;
+            if (it.*.idx == 0) {
+                return false;
+            }
+            it.*.idx -= 1;
+            return true;
         }
 
-        /// Reset the iterator to the initial index
+        pub fn next(it: *Iterator) bool {
+            if (it.*.idx >= it.data.count()) {
+                return false;
+            }
+            const entry = it.data.getEntryByIdx(it.*.idx) catch |err| {
+                std.debug.print(
+                    "memtable iter error: {s}\n",
+                    .{@errorName(err)},
+                );
+                return false;
+            };
+            it.*.v = entry;
+            it.*.idx += 1;
+            return true;
+        }
+
         pub fn reset(it: *Iterator) void {
-            it.hash_iter.reset();
+            it.*.idx = it.start_idx;
         }
     };
 
-    pub fn iterator(self: *Self, alloc: Allocator) !*Iterator {
-        const hiter = self.hash_map.iterator(0);
-        const iter = try alloc.create(Iterator);
+    pub fn iterator(self: *Self, start: usize) !*Iterator {
+        const iter = try self.alloc.create(Iterator);
         iter.* = .{
-            .hash_iter = hiter,
-            .k = 0,
+            .data = self.data,
+            .idx = start,
+            .start_idx = start,
             .v = undefined,
         };
         return iter;
@@ -134,10 +150,11 @@ pub const Memtable = struct {
         var sstable = try SSTable.init(self.alloc, self.getId(), self.opts);
         try sstable.connect(file);
 
-        var iter = try self.iterator(self.alloc);
+        var iter = try self.iterator(0);
         defer self.alloc.destroy(iter);
+        
         while (iter.next()) {
-            _ = sstable.write(iter.value()) catch continue;
+            _ = try sstable.write(iter.value());
         }
 
         sstable.flush() catch {};
@@ -155,28 +172,20 @@ test Memtable {
     var mtable = try Memtable.init(alloc, 0, options.defaultOpts());
     defer alloc.destroy(mtable);
     defer mtable.deinit();
-    defer mtable.flush() catch {};
+    defer mtable.flush() catch |err| {
+        std.debug.print("{s}\n", .{ @errorName(err) });
+    };
 
     // when
-    var kv: KV = .{
+    const kv: KV = .{
         .key = "__key__",
         .value = "__value__",
         .hash = 1,
     };
-    try mtable.put(1, &kv);
-    const actual = mtable.get(1);
+
+    try mtable.put(&kv);
+    const actual = mtable.get(kv.key);
 
     // then
-    try testing.expectEqualStrings("__value__", actual.?.value);
-
-    // when
-    var next_actual: KV = undefined;
-    var iter = try mtable.iterator(alloc);
-    defer alloc.destroy(iter);
-    if (iter.next()) {
-        next_actual = iter.value();
-    }
-
-    // then
-    try testing.expectEqualStrings("__value__", next_actual.value);
+    try testing.expectEqualStrings(kv.value, actual.?.value);
 }
