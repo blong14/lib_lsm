@@ -1,108 +1,85 @@
 const std = @import("std");
 
-const AppendOnlyMMap = @import("mmap.zig").AppendOnlyMMap;
 const KV = @import("kv.zig").KV;
-const MMap = @import("mmap.zig").MMap;
-const TableMap = @import("tablemap.zig").TableMap;
 const options = @import("opts.zig");
 
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
 const FixedBuffer = std.io.FixedBufferStream;
 const Opts = options.Opts;
 
 pub const Block = struct {
-    capacity: usize,
-    data: FixedBuffer([]align(std.mem.page_size) u8),
-    offset: FixedBuffer([]align(std.mem.page_size) u8),
+    alloc: Allocator,
+    data: ArrayList(u8),
+    offset: ArrayList(u8),
     count: u16,
+    errs: u16,
 
     const Self = @This();
 
     const Error = error{
-        ReadError,
-        WriteError,
+        BlockReadError,
+        BlockWriteError,
     };
 
-    pub fn init(alloc: Allocator) !*Self {
-        const capacity = std.mem.page_size;
-        const data = try alloc.alloc(u8, capacity);
-        const offset = try alloc.alloc(u8, capacity);
+    pub fn init(allocator: Allocator, opts: Opts) !*Self {
+        const data = try ArrayList(u8).initCapacity(allocator, opts.sst_capacity);
+        const offset = try ArrayList(u8).initCapacity(allocator, opts.sst_capacity);
 
-        const block = try alloc.create(Self);
+        const block = try allocator.create(Self);
         block.* = .{
-            .capacity = capacity,
-            .data = std.io.fixedBufferStream(@as([]align(std.mem.page_size) u8, @alignCast(data))),
-            .offset = std.io.fixedBufferStream(@as([]align(std.mem.page_size) u8, @alignCast(offset))),
+            .alloc = allocator,
+            .data = data,
+            .offset = offset,
             .count = 0,
+            .errs = 0,
         };
         return block;
     }
 
     pub fn deinit(self: *Self) void {
+        self.data.deinit();
+        self.offset.deinit();
         self.* = undefined;
     }
 
-    pub fn read(self: Self, offset: u16, kv: *KV) !void {
-        try self.data.seekTo(offset);
-
-        const data_reader = self.data.reader();
-        kv.*.hash = try data_reader.readInt(u64, std.builtin.Endian.little);
-
-        const key_len = try data_reader.readInt(u16, std.builtin.Endian.little);
-        const key = try self.alloc.alloc(u8, key_len);
-        try data_reader.readAtLeast(key, key_len);
-        kv.*.key = key;
-
-        const value_len = try data_reader.readInt(u16, std.builtin.Endian.little);
-        const value = try self.alloc.alloc(u8, value_len);
-        try data_reader.readAtLeast(value, value_len);
-        kv.*.value = value;
+    pub fn read(self: *Self, offset: usize, kv: *KV) !void {
+        try kv.decode(self.data.items[offset..]);
     }
 
-    pub fn write(self: *Self, kv: KV) !usize {
-        const offset = try self.data.getPos();
-        const end = try self.data.getEndPos();
-        const size = @sizeOf(u64) + @sizeOf(u16) + kv.key.len + @sizeOf(u16) + kv.value.len;
-        const remaining = end - offset;
-        if (size > remaining) {
-            std.debug.print("ooops {d} {d}\n", .{ size, remaining });
-            return error.WriteError;
-        }
-
-        const data_writer = self.data.writer();
-        try data_writer.writeInt(u64, kv.hash, std.builtin.Endian.little);
-        try data_writer.writeInt(usize, kv.key.len, std.builtin.Endian.little);
-        _ = try data_writer.write(kv.key);
-        try data_writer.writeInt(usize, kv.value.len, std.builtin.Endian.little);
-        _ = try data_writer.write(kv.value);
-
+    pub fn write(self: *Self, kv: *const KV) !usize {
+        // [1 1 1 1 _ _ _ _]
+        const offset = self.data.items.len;
         const offset_writer = self.offset.writer();
         try offset_writer.writeInt(usize, offset, std.builtin.Endian.little);
+
+        var buf: [std.mem.page_size]u8 = undefined;
+        const encoded_kv = try kv.encode(&buf);
+
+        const data_writer = self.data.writer();
+        const byte_count = try data_writer.write(encoded_kv);
+        assert(byte_count == encoded_kv.len);
 
         self.count += 1;
         return offset;
     }
 
     /// [count, offset1, offset2, kv[hash, keylen, key, valuelen, value], kv[hash, keylen, key, valuelen, value]]
-    pub fn flush(self: Self, outFile: std.io.File) !void {
+    pub fn flush(self: Self, outFile: std.fs.File) !void {
         var count: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
         std.mem.writeInt(std.math.ByteAlignedInt(u64), &count, self.count, std.builtin.Endian.little);
 
         const buf = outFile.writer();
-        try buf.write(count);
-        try buf.write(self.offset.getWritten());
-        try buf.write(self.data.getWritten());
+        _ = try buf.write(&count);
+        _ = try buf.write(self.offset.items);
+        _ = try buf.write(self.data.items);
     }
 };
 
-pub const SSTableRow = extern struct {
-    key: u64,
-    value: [*c]const u8,
-};
-
 pub const SSTable = struct {
+    alloc: Allocator,
     block: *Block,
-    capacity: usize,
     connected: bool,
     file: std.fs.File,
     id: u64,
@@ -118,26 +95,18 @@ pub const SSTable = struct {
         version: u16,
     };
 
-    const TableData = struct {
-        count: u64,
-        klen: u16,
-        key: []const u8,
-        vlen: u16,
-        value: []const u8,
-    };
-
     const Error = error{
         NotFound,
-    } || AppendOnlyMMap.Error;
+        ReadError,
+        WriteError,
+    };
 
     pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
-        const cap = opts.sst_capacity / @sizeOf(SSTableRow);
-        const block = try Block.init(alloc);
-
+        const block = try Block.init(alloc, opts);
         const st = try alloc.create(Self);
         st.* = .{
+            .alloc = alloc,
             .block = block,
-            .capacity = cap,
             .connected = false,
             .file = undefined,
             .id = id,
@@ -148,6 +117,7 @@ pub const SSTable = struct {
 
     pub fn deinit(self: *Self) void {
         self.block.deinit();
+        self.alloc.destroy(self.block);
         if (self.connected) {
             self.file.close();
         }
@@ -156,23 +126,35 @@ pub const SSTable = struct {
 
     pub fn connect(self: *Self, file: std.fs.File) !void {
         self.file = file;
-        self.connected = true;
-        self.mutable = true;
+        self.*.connected = true;
+        self.*.mutable = true;
     }
 
-    pub fn read(self: Self, offset: u16, kv: *KV) !void {
+    pub fn read(self: Self, offset: usize, kv: *KV) !void {
         if (!self.connected) {
             return error.NotConnected;
         }
         if (self.block.count == 0) {
             return Error.NotFound;
         }
-        try self.block.read(offset, kv);
+        self.block.read(offset, kv) catch |err| {
+            std.debug.print(
+                "sstable not able to read from block @ offset {d}: {s}\n",
+                .{ offset, @errorName(err) },
+            );
+            return err;
+        };
     }
 
-    pub fn write(self: *Self, value: KV) !usize {
+    pub fn write(self: *Self, value: *const KV) !usize {
         if (self.mutable and self.connected) {
-            return try self.block.write(value);
+            return self.block.write(value) catch |err| {
+                std.debug.print(
+                    "sstable not able to write to block for key {s}: {s}\n",
+                    .{ value.key, @errorName(err) },
+                );
+                return err;
+            };
         }
         return Error.WriteError;
     }
@@ -180,9 +162,14 @@ pub const SSTable = struct {
     pub fn flush(self: *Self) !void {
         if (self.mutable and self.connected) {
             self.block.flush(self.file) catch |err| {
-                std.debug.print("sstable flush err: {s}\n", .{@errorName(err)});
+                std.debug.print(
+                    "sstable not able to flush block: {s}\n",
+                    .{@errorName(err)},
+                );
                 return err;
             };
+            self.mutable = false;
+            return;
         }
         return Error.WriteError;
     }
@@ -198,8 +185,10 @@ test "SSTable" {
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
     defer testDir.dir.deleteTree(pathname) catch {};
+
     const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "sstable.dat" });
     defer alloc.free(filename);
+
     const dopts = options.defaultOpts();
     const file = try FileUtils.openWithCapacity(filename, dopts.sst_capacity);
 
@@ -207,33 +196,20 @@ test "SSTable" {
     var st = try SSTable.init(alloc, 1, dopts);
     defer alloc.destroy(st);
     defer st.deinit();
+
     try st.connect(file);
 
     // when
-    var key: u64 = std.hash.Murmur2_64.hash("__key__");
-    var expected: []const u8 = "__value__";
-    var kv: KV = .{
-        .hash = key,
-        .key = "__key__",
-        .value = expected,
-    };
+    const expected = "__value__";
+    const kv = try KV.init(alloc, "__key__", expected);
+    defer alloc.destroy(kv);
 
-    var offset = try st.write(kv);
+    const offset = try st.write(kv);
+    try st.flush();
 
-    var actual: KV = .{};
-    try st.read(offset, &actual);
+    const actual = try KV.init(alloc, undefined, undefined);
+    defer alloc.destroy(actual);
 
-    // then
-    try testing.expect(std.mem.eql(u8, expected, actual.value));
-
-    // when
-    key = std.hash.Murmur2_64.hash("__key_a__");
-    expected = "__value_a__";
-    kv.hash = key;
-    kv.key = "__key_a__";
-    kv.value = "__value_a__";
-
-    offset = try st.write(kv);
     try st.read(offset, actual);
 
     // then

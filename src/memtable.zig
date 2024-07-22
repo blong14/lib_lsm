@@ -153,7 +153,7 @@ pub const Memtable = struct {
         defer self.alloc.destroy(iter);
 
         while (iter.next()) {
-            _ = try sstable.write(iter.value());
+            _ = try sstable.write(&iter.value());
         }
 
         sstable.flush() catch {};
@@ -176,13 +176,10 @@ test Memtable {
     };
 
     // when
-    const kv: KV = .{
-        .key = "__key__",
-        .value = "__value__",
-        .hash = 1,
-    };
+    const kv = try KV.init(alloc, "__key__", "__value__");
+    defer alloc.destroy(kv);
 
-    try mtable.put(&kv);
+    try mtable.put(kv);
     const actual = mtable.get(kv.key);
 
     // then

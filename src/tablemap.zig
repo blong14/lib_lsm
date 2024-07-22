@@ -1,12 +1,13 @@
 const std = @import("std");
 
-const kv = @import("kv.zig");
-
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
-const KV = kv.KV;
 
-pub fn TableMap(comptime K: type, comptime V: type, comptime compareFn: fn (a: K, b: V) Order) type {
+pub fn TableMap(
+    comptime K: type,
+    comptime V: type,
+    comptime compareFn: fn (a: K, b: V) Order,
+) type {
     return struct {
         const Self = @This();
 
@@ -22,8 +23,7 @@ pub fn TableMap(comptime K: type, comptime V: type, comptime compareFn: fn (a: K
         impl: MapEntryTable,
 
         pub fn init(alloc: Allocator, capacity: usize) !Self {
-            var impl = MapEntryTable.init(alloc);
-            try impl.ensureTotalCapacity(capacity);
+            const impl = try MapEntryTable.initCapacity(alloc, capacity);
             return .{
                 .cap = capacity,
                 .impl = impl,
@@ -105,19 +105,20 @@ pub fn TableMap(comptime K: type, comptime V: type, comptime compareFn: fn (a: K
 }
 
 test TableMap {
-    const testing = std.testing;
+    const keyvalue = @import("kv.zig");
 
-    var tm = try TableMap([]const u8, KV, KV.order).init(testing.allocator, std.mem.page_size);
+    const KV = keyvalue.KV;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tm = try TableMap([]const u8, KV, KV.order).init(alloc, std.mem.page_size);
     defer tm.deinit();
 
     const key = "__key__";
-    const item = KV{
-        .hash = 0,
-        .key = key,
-        .value = "__value__",
-    };
+    const item = try KV.init(alloc, key, "__value__");
+    defer alloc.destroy(item);
 
-    try tm.put(key, item);
+    try tm.put(key, item.*);
 
     const actual = try tm.get(key);
 
@@ -130,10 +131,11 @@ fn order(a: u16, b: u16) Order {
 
 test "TableMap getEntryByIdx" {
     const testing = std.testing;
+    const alloc = testing.allocator;
 
     const cap = 4;
 
-    var tm = try TableMap(u16, u16, order).init(testing.allocator, cap);
+    var tm = try TableMap(u16, u16, order).init(alloc, cap);
     defer tm.deinit();
 
     const keys = [4]u16{ 4, 3, 2, 1 };
