@@ -2,175 +2,157 @@ const std = @import("std");
 
 const csv = @import("csv_reader.zig");
 const log = @import("wal.zig");
-const file_utils = @import("file.zig");
 const mtbl = @import("memtable.zig");
 const options = @import("opts.zig");
 const sst = @import("sstable.zig");
 const tm = @import("tablemap.zig");
+const KV = @import("kv.zig").KV;
 
 const io = std.io;
 const testing = std.testing;
 const hasher = std.hash.Murmur2_64;
 const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 const CsvTokenizer = csv.CsvTokenizer;
 const Memtable = mtbl.Memtable;
-const MemtableOpts = mtbl.MemtableOpts;
 const Opts = options.Opts;
 const Order = std.math.Order;
-const Row = sst.SSTableRow;
 const SSTable = sst.SSTable;
-const SSTableOpts = sst.SSTableOpts;
 const TableMap = tm.TableMap;
 const WAL = log.WAL;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
 pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
-pub const MemtableList = TableMap(*Memtable(u64, []const u8));
-pub const SSTableList = std.ArrayList(*SSTable);
-
-const KV = struct {
-    k: u64,
-    v: []const u8,
-};
 
 fn lessThan(context: void, a: KV, b: KV) Order {
     _ = context;
-    return std.math.order(a.k, b.k);
+    return std.mem.order(u8, a.key, b.key);
 }
 
 const Database = struct {
     alloc: Allocator,
+    arena: ArenaAllocator,
     capacity: usize,
-    mtable: *Memtable(u64, []const u8),
+    mtable: *Memtable,
     opts: Opts,
-    mtables: *MemtableList,
-    sstables: SSTableList,
+    mtables: std.ArrayList(*Memtable),
 
     const Self = @This();
     const Error = error{};
 
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
-        const mtables = try MemtableList.init(alloc);
-        const sstables = SSTableList.init(alloc);
-        const mtable = try Memtable(u64, []const u8).init(alloc, 0, opts);
-        const capacity = opts.sst_capacity / @sizeOf(Row);
-
-        std.debug.print("init memtable cap {d} sstable opts {d} sizeof Row {d}\n", .{ capacity, opts.sst_capacity, @sizeOf(Row) });
+        const mtable = try Memtable.init(alloc, 0, opts);
+        const mtables = std.ArrayList(*Memtable).init(alloc);
+        const capacity = opts.sst_capacity / @sizeOf(KV);
 
         const db = try alloc.create(Self);
         db.* = .{
             .alloc = alloc,
+            .arena = ArenaAllocator.init(alloc),
             .capacity = capacity,
             .mtable = mtable,
-            .opts = opts,
             .mtables = mtables,
-            .sstables = sstables,
+            .opts = opts,
         };
         return db;
     }
 
     pub fn deinit(self: *Self) void {
         self.flush() catch |err| {
-            std.debug.print("db flush error {s}\n", .{@errorName(err)});
+            std.debug.print(
+                "db flush error {s}\n",
+                .{@errorName(err)},
+            );
         };
+        for (self.mtables.items) |mtable| {
+            mtable.deinit();
+            self.alloc.destroy(mtable);
+        }
         self.mtable.deinit();
         self.alloc.destroy(self.mtable);
-        var mtable_iter = self.mtables.iterator(0);
-        while (mtable_iter.next()) {
-            var table = mtable_iter.value();
-            table.deinit();
-            self.alloc.destroy(table);
-        }
         self.mtables.deinit();
-        self.alloc.destroy(self.mtables);
-        for (self.sstables.items) |table| {
-            table.deinit();
-            self.alloc.destroy(table);
-        }
-        self.sstables.deinit();
+        self.arena.deinit();
         self.* = undefined;
     }
 
-    fn lookup(self: Self, key: u64) ?[]const u8 {
+    fn lookup(self: Self, key: []const u8) !KV {
         if (self.mtable.get(key)) |value| {
             return value;
         }
-
-        var newest_to_oldest_iter = self.mtables.iterator(self.mtables.count() - 1);
-        while (newest_to_oldest_iter.prev()) {
-            const table = newest_to_oldest_iter.value();
+        var idx: usize = self.mtables.items.len;
+        while (idx > 0) {
+            var table = self.mtables.items[idx - 1];
             if (table.get(key)) |value| {
                 return value;
             }
+            idx -= 1;
         }
-
-        for (self.sstables.items) |table| {
-            const value = table.read(key) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return null,
-            };
-            return value;
-        }
-        return null;
+        return error.NotFound;
     }
 
-    pub fn read(self: Self, key: []const u8) ?[]const u8 {
-        const k: u64 = hasher.hash(key);
-        return self.lookup(k);
+    pub fn read(self: Self, key: []const u8) !KV {
+        return self.lookup(key);
     }
 
     const MergeIterator = struct {
-        mtbls: std.ArrayList(*Memtable(u64, []const u8).Iterator),
+        alloc: Allocator,
+        mtbls: std.ArrayList(*Memtable.Iterator),
         queue: std.PriorityQueue(KV, void, lessThan),
-        k: u64,
-        v: []const u8,
+        v: KV,
 
         pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
-            var iters = std.ArrayList(*Memtable(u64, []const u8).Iterator).init(alloc);
-            var table_iter = m.mtables.iterator(0);
-            while (table_iter.next()) {
-                const iter = try table_iter.value().iterator();
+            const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
+
+            var iters = std.ArrayList(*Memtable.Iterator).init(alloc);
+            for (m.mtables.items) |mtable| {
+                const iter = try mtable.iterator(0);
                 try iters.append(iter);
             }
 
-            const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
-            std.debug.print("MergeIterator init with {d} memtables & 1 priority queue\n", .{iters.items.len});
+            const iter = try m.mtable.iterator(0);
+            try iters.append(iter);
 
             const mi = try alloc.create(MergeIterator);
-            mi.*.mtbls = iters;
-            mi.*.queue = queue;
+            mi.* = .{
+                .alloc = alloc,
+                .mtbls = iters,
+                .queue = queue,
+                .v = undefined,
+            };
             return mi;
         }
 
-        pub fn deinit(self: *MergeIterator) void {
-            self.mtbls.deinit();
-            self.queue.deinit();
-            self.* = undefined;
+        pub fn deinit(mi: *MergeIterator) void {
+            for (mi.mtbls.items) |iter| {
+                mi.alloc.destroy(iter);
+            }
+            mi.mtbls.deinit();
+            mi.queue.deinit();
+            mi.* = undefined;
         }
 
-        pub fn key(mi: MergeIterator) u64 {
-            return mi.k;
-        }
-
-        pub fn value(mi: MergeIterator) []const u8 {
+        pub fn value(mi: MergeIterator) KV {
             return mi.v;
         }
 
         pub fn next(mi: *MergeIterator) !bool {
             for (mi.mtbls.items) |table_iter| {
                 if (table_iter.next()) {
-                    const tkey = table_iter.key();
-                    const tvalue = table_iter.value();
-                    const row: KV = .{ .k = tkey, .v = tvalue };
-                    try mi.queue.add(row);
+                    const kv = table_iter.value();
+                    mi.queue.add(kv) catch |err| {
+                        std.debug.print(
+                            "merge iter next failure: {s}\n",
+                            .{@errorName(err)},
+                        );
+                        return false;
+                    };
                 }
             }
             if (mi.queue.count() == 0) {
                 return false;
             }
             const nxt = mi.queue.remove();
-            mi.*.k = nxt.k;
-            mi.*.v = nxt.v;
+            mi.*.v = nxt;
             return true;
         }
     };
@@ -185,31 +167,20 @@ const Database = struct {
         }
         if (self.mtable.count() >= self.capacity) {
             try self.flush();
+            try self.freeze();
         }
-        const k: u64 = hasher.hash(key);
-        try self.mtable.put(k, value);
+        const kv = try KV.init(self.arena.allocator(), key, value);
+        try self.mtable.put(kv);
+    }
+
+    pub fn flush(self: *Self) !void {
+        try self.mtable.flush();
     }
 
     fn freeze(self: *Self) !void {
         const current_id = self.mtable.getId();
-        try self.mtables.put(current_id, self.mtable);
-        self.mtable = try Memtable(u64, []const u8).init(self.alloc, current_id + 1, self.opts);
-    }
-
-    pub fn flush(self: *Self) !void {
-        if (self.mtable.count() == 0) {
-            return;
-        }
-        std.debug.print("flushing memtable...\n", .{});
-        const current_id = self.mtable.getId();
-        const filename = try std.fmt.allocPrint(self.alloc, "{s}/{d}.dat", .{ self.opts.data_dir, current_id });
-        defer self.alloc.free(filename);
-        const file = try file_utils.openWithCapacity(filename, self.opts.sst_capacity);
-        const sstable = try SSTable.init(self.alloc, current_id, self.opts);
-        try sstable.connect(file);
-        try self.sstables.append(sstable);
-        try self.mtable.flush(sstable);
-        try self.freeze();
+        try self.mtables.append(self.mtable);
+        self.mtable = try Memtable.init(self.alloc, current_id + 1, self.opts);
     }
 };
 
@@ -236,6 +207,46 @@ test "basic functionality" {
     try db.write(key, value);
 
     // then
-    const actual = db.read(key);
-    try testing.expectEqualStrings(value, actual.?);
+    const actual = try db.read(key);
+    try testing.expectEqualStrings(value, actual.value);
+}
+
+test "basic functionality with many items" {
+    var alloc = testing.allocator;
+
+    var db = try defaultDatabase(alloc);
+    defer alloc.destroy(db);
+    defer db.deinit();
+
+    // given
+    var kvs: [3]*KV = undefined;
+    kvs[0] = try KV.init(alloc, "__key_c__", "__value_c__");
+    kvs[1] = try KV.init(alloc, "__key_b__", "__value_b__");
+    kvs[2] = try KV.init(alloc, "__key_a__", "__value_a__");
+
+    // when
+    for (kvs) |kv| {
+        try db.write(kv.key, kv.value);
+    }
+
+    // then
+    for (kvs) |kv| {
+        const actual = try db.read(kv.key);
+        try testing.expectEqualStrings(kv.value, actual.value);
+    }
+
+    // then
+    var iter = try db.iterator();
+    defer alloc.destroy(iter);
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (iter.next() catch false) {
+        count += 1;
+    }
+    try testing.expectEqual(kvs.len, count);
+
+    for (kvs) |kv| {
+        alloc.destroy(kv);
+    }
 }

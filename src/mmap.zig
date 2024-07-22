@@ -121,7 +121,7 @@ pub fn MMap(comptime T: type) type {
     };
 }
 
-const AppendOnlyMMap = struct {
+pub const AppendOnlyMMap = struct {
     buf: FixedBuffer([]align(std.mem.page_size) u8),
     connected: bool,
     count: usize,
