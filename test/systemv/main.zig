@@ -10,11 +10,12 @@ pub fn main() !void {
     var mainTimer = try std.time.Timer.start();
     const mainStart = mainTimer.read();
 
-    var garena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer garena.deinit();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
 
-    const galloc = garena.allocator();
+    const galloc = gpa.allocator();
     var mailbox = try lsm.MessageQueue([]msg).init(galloc, ".");
+    defer galloc.destroy(mailbox);
     defer mailbox.deinit();
 
     const reader = try std.Thread.spawn(.{}, struct {
@@ -24,23 +25,20 @@ pub fn main() !void {
                 return;
             };
 
-            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-            defer arena.deinit();
-
-            const alloc = arena.allocator();
+            const alloc = std.heap.c_allocator;
             var db = lsm.defaultDatabase(alloc) catch |err| {
                 std.debug.print("consume error {s}\n", .{@errorName(err)});
                 return;
             };
+            defer alloc.destroy(db);
             defer db.deinit();
 
             const start = timer.read();
             var count: usize = 0;
             while (inbox.next()) |row| {
-                std.debug.print("count {d}\n", .{count});
                 for (row) |item| {
                     db.write(item.key, item.value) catch |err| {
-                        std.debug.print("count {d} {s}\n", .{ count, @errorName(err) });
+                        std.debug.print("count {d} key {s} {s}\n", .{ count, item.key, @errorName(err) });
                         return;
                     };
                     count += 1;
@@ -59,6 +57,7 @@ pub fn main() !void {
                 std.debug.print("db iter error {s}\n", .{@errorName(err)});
                 return;
             };
+            defer iter.deinit();
 
             const readStart = timer.read();
             var readCount: usize = 0;
@@ -71,7 +70,7 @@ pub fn main() !void {
     }.consume, .{mailbox.subscribe()});
     const writer = mailbox.publisher();
 
-    const file = std.fs.cwd().openFile("data/input.csv", .{}) catch |err| {
+    const file = std.fs.cwd().openFile("data/trips.txt", .{}) catch |err| {
         std.debug.print("publish error {s}\n", .{@errorName(err)});
         return;
     };
@@ -115,7 +114,6 @@ pub fn main() !void {
         }
     }
     if (out.items.len > 0) {
-        std.debug.print("final publish\n", .{});
         writer.publish(out.items) catch |err| {
             std.debug.print("error publishing row {s}\n", .{@errorName(err)});
             return;

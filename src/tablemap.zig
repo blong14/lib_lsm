@@ -136,15 +136,15 @@ test "TableMap getEntryByIdx" {
     var tm = try TableMap(u16, u16, order).init(testing.allocator, cap);
     defer tm.deinit();
 
-    const keys = [4]u16{4,3,2,1};
+    const keys = [4]u16{ 4, 3, 2, 1 };
     for (keys) |key| {
         try tm.put(key, key);
     }
 
-    var actual = [4]u16{0,0,0,0};
+    var actual = [4]u16{ 0, 0, 0, 0 };
     for (keys, 0..) |_, i| {
         actual[i] = try tm.getEntryByIdx(i);
     }
 
-    try testing.expectEqualSlices(u16, &[4]u16{1,2,3,4}, &actual);
+    try testing.expectEqualSlices(u16, &[4]u16{ 1, 2, 3, 4 }, &actual);
 }

@@ -14,9 +14,8 @@ const SSTable = sst.SSTable;
 const TableMap = tbm.TableMap;
 
 pub const Memtable = struct {
-    
     const Self = @This();
-    
+
     const KVTableMap = TableMap([]const u8, KV, KV.order);
 
     const Error = error{
@@ -152,7 +151,7 @@ pub const Memtable = struct {
 
         var iter = try self.iterator(0);
         defer self.alloc.destroy(iter);
-        
+
         while (iter.next()) {
             _ = try sstable.write(iter.value());
         }
@@ -173,7 +172,7 @@ test Memtable {
     defer alloc.destroy(mtable);
     defer mtable.deinit();
     defer mtable.flush() catch |err| {
-        std.debug.print("{s}\n", .{ @errorName(err) });
+        std.debug.print("{s}\n", .{@errorName(err)});
     };
 
     // when
