@@ -20,6 +20,9 @@ build: $(SOURCES)
 	@zig fmt .
 	@zig build $(BUILD_OPTS)
 
+run: clean build
+	$(EXEC)
+
 clean:
 	rm -f $(BIN)/* callgrind.o massif.o data/*.dat
 
