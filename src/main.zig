@@ -23,6 +23,7 @@ const WAL = log.WAL;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
 pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
+pub const withDataDirOpts = options.withDataDirOpts;
 
 fn lessThan(context: void, a: KV, b: KV) Order {
     _ = context;

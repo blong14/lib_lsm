@@ -15,9 +15,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .zzmq = .{
-            .url = "https://github.com/nine-lives-later/zzmq/archive/refs/tags/v0.2.2-zig0.13.tar.gz",
-            .hash = "12204e64356f0588ded157216663f4c384fcc7acb76447faec3ec4aaccb868b287f9",
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.9.1.tar.gz",
+            .hash = "122062d301a203d003547b414237229b09a7980095061697349f8bef41be9c30266b",
         },
     },
     .paths = .{

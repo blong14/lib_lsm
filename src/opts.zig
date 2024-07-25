@@ -16,3 +16,9 @@ pub fn defaultOpts() Opts {
         .wal_capacity = PageSize * PageSize,
     };
 }
+
+pub fn withDataDirOpts(data_dir: []const u8) Opts {
+    var opts = defaultOpts();
+    opts.data_dir = data_dir;
+    return opts;
+}

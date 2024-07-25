@@ -53,24 +53,24 @@ pub fn build(b: *std.Build) void {
     }
 
     // Integration tests
+    //
+    // TODO: combine into single executable
 
-    // IPC based concurrency with SystemV
+    // no concurrency
     {
-        const exe = cmds.buildSystemV(b, target, optimize);
+        const exe = cmds.buildLsm(b, target, optimize);
+        const clap = b.dependency("clap", .{});
+        exe.root_module.addImport("clap", clap.module("clap"));
         exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();
     }
 
-    // ZeroMQ based concurrency
+    // IPC based concurrency with SystemV
     {
-        const zzmq = b.dependency("zzmq", .{
-            .target = target,
-            .optimize = optimize,
-        });
-        const exe = cmds.buildZmq(b, target, optimize);
+        const exe = cmds.buildSystemV(b, target, optimize);
+        const clap = b.dependency("clap", .{});
+        exe.root_module.addImport("clap", clap.module("clap"));
         exe.root_module.addImport("lsm", lsm);
-        exe.root_module.addImport("zzmq", zzmq.module("zzmq"));
-        exe.linkSystemLibrary("zmq");
         exe.linkLibC();
     }
 }

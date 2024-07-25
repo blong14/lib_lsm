@@ -1,12 +1,17 @@
 const std = @import("std");
+
+const clap = @import("clap");
 const lsm = @import("lsm");
+
+const debug = std.debug;
+const io = std.io;
 
 const msg = struct {
     key: []const u8,
     value: []const u8,
 };
 
-pub fn main() !void {
+pub fn xmain(data_dir: []const u8, input: []const u8) !void {
     var mainTimer = try std.time.Timer.start();
     const mainStart = mainTimer.read();
 
@@ -19,14 +24,15 @@ pub fn main() !void {
     defer mailbox.deinit();
 
     const reader = try std.Thread.spawn(.{}, struct {
-        pub fn consume(inbox: lsm.MessageQueue([]msg).ReadIter) void {
+        pub fn consume(dir: []const u8, inbox: lsm.MessageQueue([]msg).ReadIter) void {
             var timer = std.time.Timer.start() catch |err| {
                 std.debug.print("consume error {s}\n", .{@errorName(err)});
                 return;
             };
 
             const alloc = std.heap.c_allocator;
-            var db = lsm.defaultDatabase(alloc) catch |err| {
+            const opts = lsm.withDataDirOpts(dir);
+            const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
                 std.debug.print("consume error {s}\n", .{@errorName(err)});
                 return;
             };
@@ -67,10 +73,10 @@ pub fn main() !void {
             const readEnd = timer.read();
             std.debug.print("total rows read {d} in {}ms\n", .{ readCount, (readEnd - readStart) / 1_000_000 });
         }
-    }.consume, .{mailbox.subscribe()});
+    }.consume, .{ data_dir, mailbox.subscribe() });
     const writer = mailbox.publisher();
 
-    const file = std.fs.cwd().openFile("data/trips.txt", .{}) catch |err| {
+    const file = std.fs.cwd().openFile(input, .{}) catch |err| {
         std.debug.print("publish error {s}\n", .{@errorName(err)});
         return;
     };
@@ -131,4 +137,43 @@ pub fn main() !void {
 
     const mainEnd = mainTimer.read();
     std.debug.print("reading data finished in {}ms\n", .{(mainEnd - mainStart) / 1_000_000});
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    // First we specify what parameters our program can take.
+    // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help             Display this help and exit.
+        \\-d, --data_dir <str>   The data directory to save files on disk.
+        \\-i, --input    <str>   An input file to import. Only supports csv.
+        \\--sst_capacity <usize> Max capacity for a SST block.
+        \\
+    );
+
+    // Initialize our diagnostics, which can be used for reporting useful errors.
+    // This is optional. You can also pass `.{}` to `clap.parse` if you don't
+    // care about the extra information `Diagnostics` provides.
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+        .diagnostic = &diag,
+        .allocator = gpa.allocator(),
+    }) catch |err| {
+        // Report useful error and exit
+        diag.report(io.getStdErr().writer(), err) catch {};
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0) {
+        debug.print("--help\n", .{});
+        return;
+    }
+
+    const data_dir = res.args.data_dir orelse "data";
+    const input = res.args.input orelse "data/trips.txt";
+
+    try xmain(data_dir, input);
 }
