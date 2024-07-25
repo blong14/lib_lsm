@@ -94,8 +94,10 @@ pub fn main() !void {
     while (csv_file.next() catch null) |token| {
         switch (token) {
             .field => |val| {
-                row[idx] = val;
-                idx += 1;
+                if (idx < row.len) {
+                    row[idx] = val;
+                    idx += 1;
+                }
             },
             .row_end => {
                 const r: msg = .{ .key = row[0], .value = row[1] };
