@@ -169,6 +169,13 @@ pub const SSTable = struct {
                 return err;
             };
             self.mutable = false;
+            self.file.sync() catch |err| {
+                const meta = try self.file.metadata();
+                std.debug.print(
+                    "sstable fsync faild: {s} : meta: kind {} size {d} perms {}",
+                    .{ @errorName(err), meta.kind(), meta.size(), meta.permissions() },
+                );
+            };
             return;
         }
         return Error.WriteError;
