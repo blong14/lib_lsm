@@ -4,92 +4,19 @@ const clap = @import("clap");
 const lsm = @import("lsm");
 
 const debug = std.debug;
+const fs = std.fs;
+const heap = std.heap;
 const io = std.io;
+const mem = std.mem;
 
-pub fn xmain(data_dir: []const u8, input: []const u8) !void {
-    var mainTimer = try std.time.Timer.start();
-    const mainStart = mainTimer.read();
+const Allocator = mem.Allocator;
 
-    const alloc = std.heap.c_allocator;
-
-    const file = std.fs.cwd().openFile(input, .{}) catch |err| {
-        std.debug.print("publish error {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer file.close();
-
-    // TODO: Figure out an appropriate buffer size
-    var buffer = [_]u8{0} ** (std.mem.page_size * 2000);
-    const fileReader = file.reader();
-    var csv_file = lsm.CSV.init(fileReader, &buffer, .{}) catch |err| {
-        std.debug.print("publish error {s}\n", .{@errorName(err)});
-        return;
-    };
-
-    const opts = lsm.withDataDirOpts(data_dir);
-    const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
-        std.debug.print("consume error {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer alloc.destroy(db);
-    defer db.deinit();
-
-    const writeStart = mainTimer.read();
-    var count: usize = 0;
-    var idx: usize = 0;
-    var row = [2][]const u8{ undefined, undefined };
-    while (csv_file.next() catch null) |token| {
-        switch (token) {
-            .field => |val| {
-                if (idx < row.len) {
-                    row[idx] = val;
-                    idx += 1;
-                }
-            },
-            .row_end => {
-                db.write(row[0], row[1]) catch |err| {
-                    std.debug.print("count {d} key {s} {s}\n", .{ count, row[0], @errorName(err) });
-                    return;
-                };
-                count += 1;
-                row = [2][]const u8{ undefined, undefined };
-                idx = 0;
-            },
-        }
-    }
-
-    const writeEnd = mainTimer.read();
-    std.debug.print("total rows written {d} in {}ms\n", .{ count, (writeEnd - writeStart) / 1_000_000 });
-
-    db.flush() catch |err| {
-        std.debug.print("error flushing db {s}\n", .{@errorName(err)});
-        return;
-    };
-
-    const consumeEnd = mainTimer.read();
-    std.debug.print("total rows consumed {d} in {}ms\n", .{ count, (consumeEnd - writeStart) / 1_000_000 });
-
-    std.debug.print("iterating keys...\n", .{});
-    var iter = db.iterator() catch |err| {
-        std.debug.print("db iter error {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer iter.deinit();
-
-    const readStart = mainTimer.read();
-    var readCount: usize = 0;
-    while (iter.next() catch false) {
-        readCount += 1;
-    }
-    const readEnd = mainTimer.read();
-    std.debug.print("total rows read {d} in {}ms\n", .{ readCount, (readEnd - readStart) / 1_000_000 });
-
-    const mainEnd = mainTimer.read();
-    std.debug.print("reading data finished in {}ms\n", .{(mainEnd - mainStart) / 1_000_000});
-}
+var parseTimer: lsm.BlockProfiler = undefined;
+var readTimer: lsm.BlockProfiler = undefined;
+var writeTimer: lsm.BlockProfiler = undefined;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
     // First we specify what parameters our program can take.
@@ -123,6 +50,119 @@ pub fn main() !void {
 
     const data_dir = res.args.data_dir orelse "data";
     const input = res.args.input orelse "data/trips.txt";
+    const sst_capacity = res.args.sst_capacity orelse mem.page_size;
+    const wal_capacity = mem.page_size * mem.page_size;
+    const alloc = heap.c_allocator;
 
-    try xmain(data_dir, input);
+    lsm.BeginProfile(alloc);
+    defer lsm.EndProfile();
+
+    const opts: lsm.Opts = .{
+        .data_dir = data_dir,
+        .sst_capacity = sst_capacity,
+        .wal_capacity = wal_capacity,
+    };
+
+    const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
+        debug.print("database init error {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer alloc.destroy(db);
+    defer db.deinit();
+
+    parseTimer = lsm.BlockProfiler.init();
+    readTimer = lsm.BlockProfiler.init();
+    writeTimer = lsm.BlockProfiler.init();
+
+    const rows = try parse(alloc, input);
+    defer rows.deinit();
+
+    write(db, rows);
+
+    read(db);
+}
+
+pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) {
+    parseTimer.start("parse");
+    defer parseTimer.end();
+
+    const file = fs.cwd().openFile(input, .{}) catch |err| {
+        debug.print("open file error {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer file.close();
+
+    // TODO: Figure out an appropriate buffer size
+    var buffer = [_]u8{0} ** (mem.page_size * 2000);
+    const fileReader = file.reader();
+    var csv_file = lsm.CSV.init(fileReader, &buffer, .{}) catch |err| {
+        debug.print("csv file error {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    var count: usize = 0;
+    var idx: usize = 0;
+    var row = [2][]const u8{ undefined, undefined };
+
+    var out = try std.ArrayList([2][]const u8).initCapacity(alloc, 500_000);
+
+    while (csv_file.next() catch |err| {
+        debug.print(
+            "not able to read next token {s}\n",
+            .{@errorName(err)},
+        );
+        return err;
+    }) |token| {
+        switch (token) {
+            .field => |val| {
+                if (idx < row.len) {
+                    row[idx] = val;
+                    idx += 1;
+                }
+            },
+            .row_end => {
+                try out.append(row);
+                count += 1;
+                row = [2][]const u8{ undefined, undefined };
+                idx = 0;
+            },
+        }
+    }
+    return out;
+}
+
+pub fn write(db: *lsm.Database, input: std.ArrayList([2][]const u8)) void {
+    writeTimer.start("write");
+    defer writeTimer.end();
+
+    var count: usize = 0;
+    for (input.items) |row| {
+        db.write(row[0], row[1]) catch |err| {
+            debug.print(
+                "database write error: count {d} key {s} error {s}\n",
+                .{ count, row[0], @errorName(err) },
+            );
+            return;
+        };
+        count += 1;
+    }
+}
+
+pub fn read(db: *lsm.Database) void {
+    readTimer.start("read");
+    defer readTimer.end();
+
+    var iter = db.iterator() catch |err| {
+        debug.print(
+            "database iter err: {s}\n",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (iter.next() catch null) {
+        count += 1;
+    }
 }
