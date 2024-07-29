@@ -15,7 +15,6 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const CsvTokenizer = csv.CsvTokenizer;
 const Memtable = mtbl.Memtable;
-const Opts = options.Opts;
 const Order = std.math.Order;
 const SSTable = sst.SSTable;
 const TableMap = tm.TableMap;
@@ -23,19 +22,28 @@ const WAL = log.WAL;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
 pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
+pub const Opts = options.Opts;
+pub const withDataDirOpts = options.withDataDirOpts;
+
+const Profiler = @import("profile.zig");
+pub const BeginProfile = Profiler.BeginProfile;
+pub const EndProfile = Profiler.EndProfile;
+pub const BlockProfiler = Profiler.BlockProfiler;
 
 fn lessThan(context: void, a: KV, b: KV) Order {
     _ = context;
     return std.mem.order(u8, a.key, b.key);
 }
 
-const Database = struct {
+pub const Database = struct {
     alloc: Allocator,
     arena: ArenaAllocator,
     capacity: usize,
     mtable: *Memtable,
     opts: Opts,
     mtables: std.ArrayList(*Memtable),
+
+    write_timer: BlockProfiler,
 
     const Self = @This();
     const Error = error{};
@@ -45,6 +53,8 @@ const Database = struct {
         const mtables = std.ArrayList(*Memtable).init(alloc);
         const capacity = opts.sst_capacity / @sizeOf(KV);
 
+        const write_timer = BlockProfiler.init();
+
         const db = try alloc.create(Self);
         db.* = .{
             .alloc = alloc,
@@ -53,6 +63,8 @@ const Database = struct {
             .mtable = mtable,
             .mtables = mtables,
             .opts = opts,
+
+            .write_timer = write_timer,
         };
         return db;
     }
@@ -100,6 +112,8 @@ const Database = struct {
         queue: std.PriorityQueue(KV, void, lessThan),
         v: KV,
 
+        timer: BlockProfiler,
+
         pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
             const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
 
@@ -118,6 +132,8 @@ const Database = struct {
                 .mtbls = iters,
                 .queue = queue,
                 .v = undefined,
+
+                .timer = BlockProfiler.init(),
             };
             return mi;
         }
@@ -136,6 +152,8 @@ const Database = struct {
         }
 
         pub fn next(mi: *MergeIterator) !bool {
+            mi.timer.start("iter next");
+            defer mi.timer.end();
             for (mi.mtbls.items) |table_iter| {
                 if (table_iter.next()) {
                     const kv = table_iter.value();
@@ -162,6 +180,9 @@ const Database = struct {
     }
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
+        self.write_timer.start("db write");
+        defer self.write_timer.end();
+
         if (key.len == 0) {
             return error.WriteError;
         }
@@ -195,6 +216,9 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 test "basic functionality" {
     var alloc = testing.allocator;
 
+    BeginProfile(alloc);
+    defer EndProfile();
+
     var db = try defaultDatabase(alloc);
     defer alloc.destroy(db);
     defer db.deinit();
@@ -212,10 +236,15 @@ test "basic functionality" {
 }
 
 test "basic functionality with many items" {
-    var alloc = testing.allocator;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    BeginProfile(alloc);
+    defer EndProfile();
 
     var db = try defaultDatabase(alloc);
-    defer alloc.destroy(db);
     defer db.deinit();
 
     // given
@@ -237,7 +266,6 @@ test "basic functionality with many items" {
 
     // then
     var iter = try db.iterator();
-    defer alloc.destroy(iter);
     defer iter.deinit();
 
     var count: usize = 0;
@@ -245,8 +273,4 @@ test "basic functionality with many items" {
         count += 1;
     }
     try testing.expectEqual(kvs.len, count);
-
-    for (kvs) |kv| {
-        alloc.destroy(kv);
-    }
 }

@@ -7,6 +7,7 @@ SOURCES := $(wildcard ./src/*.zig)
 # 3rd party deps
 # sudo apt install libzmq5-dev
 # zig fetch --global-cache-dir zig-cache --save=zzmq 'https://github.com/nine-lives-later/zzmq/archive/refs/tags/v0.2.2-zig0.12.tar.gz'
+# zig fetch --global-cache-dir zig-cache --save 'https://github.com/Hejsil/zig-clap/archive/refs/tags/0.9.1.tar.gz'
 
 .PHONY: clean test
 
@@ -21,13 +22,18 @@ build: $(SOURCES)
 	@zig build $(BUILD_OPTS)
 
 run: clean build
-	$(EXEC)
+	$(EXEC) --data_dir data --input data/trips.txt --sst_capacity 100_000 
 
 clean:
 	rm -f $(BIN)/* callgrind.o massif.o data/*.dat
 
 test: $(SOURCES)
 	@zig build test --summary all
+
+poop: $(EXEC)
+	./bin/poop './$(EXEC) --input data/trips.txt --sst_capacity 100_000' \
+		'./$(EXEC) --input data/trips.txt --sst_capacity 300_000' \
+		'./$(EXEC) --input data/trips.txt --sst_capacity 500_000'
 
 callgrind.o: $(EXEC)
 	# kcachegrind
