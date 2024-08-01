@@ -13,6 +13,7 @@ const testing = std.testing;
 const hasher = std.hash.Murmur2_64;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const MemoryPool = std.heap.MemoryPool;
 const CsvTokenizer = csv.CsvTokenizer;
 const Memtable = mtbl.Memtable;
 const Order = std.math.Order;
@@ -37,8 +38,8 @@ fn lessThan(context: void, a: KV, b: KV) Order {
 
 pub const Database = struct {
     alloc: Allocator,
-    arena: ArenaAllocator,
     capacity: usize,
+    kv_pool: MemoryPool(KV),
     mtable: *Memtable,
     opts: Opts,
     mtables: std.ArrayList(*Memtable),
@@ -50,11 +51,12 @@ pub const Database = struct {
         const mtable = try Memtable.init(alloc, 0, opts);
         const mtables = std.ArrayList(*Memtable).init(alloc);
         const capacity = opts.sst_capacity / @sizeOf(KV);
+        const pool = try MemoryPool(KV).initPreheated(alloc, opts.sst_capacity);
 
         const db = try alloc.create(Self);
         db.* = .{
             .alloc = alloc,
-            .arena = ArenaAllocator.init(alloc),
+            .kv_pool = pool,
             .capacity = capacity,
             .mtable = mtable,
             .mtables = mtables,
@@ -77,7 +79,7 @@ pub const Database = struct {
         self.mtable.deinit();
         self.alloc.destroy(self.mtable);
         self.mtables.deinit();
-        self.arena.deinit();
+        self.kv_pool.deinit();
         self.* = undefined;
     }
 
@@ -168,9 +170,6 @@ pub const Database = struct {
     }
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
-        //var timer = BlockProfiler.start("db.write");
-        //defer timer.end();
-
         if (key.len == 0) {
             return error.WriteError;
         }
@@ -178,7 +177,16 @@ pub const Database = struct {
             try self.flush();
             try self.freeze();
         }
-        const kv = try KV.init(self.arena.allocator(), key, value);
+
+        const kv = try self.kv_pool.create();
+        defer self.kv_pool.destroy(kv);
+
+        const len = @sizeOf(u64) + @sizeOf(usize) + key.len + @sizeOf(usize) + value.len;
+        kv.*.key = key;
+        kv.*.value = value;
+        kv.*.len = len;
+        kv.*.hash = 0;
+
         try self.mtable.put(kv);
     }
 
