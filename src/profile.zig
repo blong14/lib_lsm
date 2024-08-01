@@ -50,18 +50,22 @@ pub fn estimateCPUFrequency() u64 {
 
 pub const ProfileAnchor = struct {
     label: []const u8,
-    elapsed: u64,
+    parent_anchor: []const u8,
     hit_count: u64,
+    elapsed_inclusive: u64, // does include children
+    elapsed_exclusive: u64, // does NOT include children
 };
 
 pub const Profiler = struct {
-    anchors: std.ArrayList(ProfileAnchor),
+    anchors: std.StringHashMap(ProfileAnchor),
+    active_anchor: []const u8,
     start: u64,
     end: u64,
 
     pub fn init(alloc: Allocator) Profiler {
         return .{
-            .anchors = std.ArrayList(ProfileAnchor).init(alloc),
+            .active_anchor = undefined,
+            .anchors = std.StringHashMap(ProfileAnchor).init(alloc),
             .start = 0,
             .end = 0,
         };
@@ -76,38 +80,53 @@ pub const Profiler = struct {
 pub const BlockProfiler = struct {
     label: []const u8,
     start_time: u64,
-    idx: usize,
+    elapsed_inclusive: u64,
 
     const Self = @This();
 
-    pub fn init() Self {
-        const current_idx = GlobalProfiler.anchors.items.len;
-        GlobalProfiler.anchors.append(
-            ProfileAnchor{
-                .label = undefined,
-                .elapsed = 0,
-                .hit_count = 0,
-            },
-        ) catch |err| {
+    pub fn start(label: []const u8) Self {
+        const result = GlobalProfiler.anchors.getOrPut(label) catch |err| {
             @panic(@errorName(err));
         };
+        if (!result.found_existing) {
+            result.value_ptr.* = ProfileAnchor{
+                .label = label,
+                .parent_anchor = GlobalProfiler.active_anchor,
+                .elapsed_inclusive = 0,
+                .elapsed_exclusive = 0,
+                .hit_count = 0,
+            };
+        }
+        const anchor = result.value_ptr.*;
+        GlobalProfiler.active_anchor = anchor.label;
         return .{
-            .idx = current_idx,
-            .label = undefined,
-            .start_time = 0,
+            .label = label,
+            .elapsed_inclusive = anchor.elapsed_inclusive,
+            .start_time = readCPUTimer(),
         };
-    }
-
-    pub fn start(self: *Self, label: []const u8) void {
-        self.start_time = readCPUTimer();
-        self.label = label;
     }
 
     pub fn end(self: Self) void {
         const elapsed: u64 = readCPUTimer() - self.start_time;
-        GlobalProfiler.anchors.items[self.idx].elapsed += elapsed;
-        GlobalProfiler.anchors.items[self.idx].hit_count += 1;
-        GlobalProfiler.anchors.items[self.idx].label = self.label;
+
+        var anchor = GlobalProfiler.anchors.get(self.label).?;
+
+        if (GlobalProfiler.anchors.get(anchor.parent_anchor)) |parent| {
+            var parent_anchor = parent;
+            parent_anchor.elapsed_exclusive -= elapsed;
+            GlobalProfiler.anchors.put(parent_anchor.label, parent_anchor) catch |err| {
+                @panic(@errorName(err));
+            };
+        }
+
+        anchor.elapsed_exclusive += elapsed;
+        anchor.elapsed_inclusive = self.elapsed_inclusive + elapsed;
+        anchor.hit_count += 1;
+
+        GlobalProfiler.anchors.put(self.label, anchor) catch |err| {
+            @panic(@errorName(err));
+        };
+        GlobalProfiler.active_anchor = anchor.parent_anchor;
     }
 };
 
@@ -123,22 +142,43 @@ pub inline fn EndProfile() void {
 
     GlobalProfiler.end = readCPUTimer();
 
-    const total_time: u64 = GlobalProfiler.end - GlobalProfiler.start;
     const cpu_freq: u64 = estimateCPUFrequency();
+    const total_time: u64 = GlobalProfiler.end - GlobalProfiler.start;
 
     std.debug.print(
-        "\nTotal time {}ms\n",
-        .{1000 * total_time / cpu_freq},
+        "\nTotal time {}ms (timer frequency: {})\n",
+        .{ 1000 * total_time / cpu_freq, cpu_freq },
     );
 
-    for (GlobalProfiler.anchors.items) |anchor| {
-        if (anchor.elapsed > 0) {
-            const anchor_time = 1000 * anchor.elapsed / cpu_freq;
-            const percent = 100 * anchor.elapsed / total_time;
+    var iter = GlobalProfiler.anchors.iterator();
+    while (iter.next()) |entry| {
+        const anchor = entry.value_ptr;
+        if (anchor.elapsed_inclusive > 0) {
+            const anchor_time = 1000 * anchor.elapsed_exclusive / cpu_freq;
+            const anchor_percent = 100 * anchor.elapsed_exclusive / total_time;
+
             std.debug.print(
-                "\t[{s}]: hit count {d} total time {}ms ({}%)\n",
-                .{ anchor.label, anchor.hit_count, anchor_time, percent },
+                "\t[{s}::{s}]: hits {d} {}ms {}% of total time",
+                .{
+                    anchor.parent_anchor,
+                    anchor.label,
+                    anchor.hit_count,
+                    anchor_time,
+                    anchor_percent,
+                },
             );
+
+            if (anchor.elapsed_inclusive != anchor.elapsed_exclusive) {
+                const anchor_time_w_children = 1000 * anchor.elapsed_inclusive / cpu_freq;
+                const anchor_percent_w_children = 100 * anchor.elapsed_inclusive / total_time;
+
+                std.debug.print(
+                    " ({}ms w/ children {}% of total time)",
+                    .{ anchor_time_w_children, anchor_percent_w_children },
+                );
+            }
+
+            std.debug.print("\n", .{});
         }
     }
 }

@@ -22,7 +22,7 @@ build: $(SOURCES)
 	@zig build $(BUILD_OPTS)
 
 run: clean build
-	$(EXEC) --data_dir data --input data/trips.txt --sst_capacity 100_000 
+	$(EXEC) --data_dir data --input data/trips.txt --sst_capacity 300_000 
 
 clean:
 	rm -f $(BIN)/* callgrind.o massif.o data/*.dat

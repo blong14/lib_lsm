@@ -43,8 +43,6 @@ pub const Database = struct {
     opts: Opts,
     mtables: std.ArrayList(*Memtable),
 
-    write_timer: BlockProfiler,
-
     const Self = @This();
     const Error = error{};
 
@@ -52,8 +50,6 @@ pub const Database = struct {
         const mtable = try Memtable.init(alloc, 0, opts);
         const mtables = std.ArrayList(*Memtable).init(alloc);
         const capacity = opts.sst_capacity / @sizeOf(KV);
-
-        const write_timer = BlockProfiler.init();
 
         const db = try alloc.create(Self);
         db.* = .{
@@ -63,8 +59,6 @@ pub const Database = struct {
             .mtable = mtable,
             .mtables = mtables,
             .opts = opts,
-
-            .write_timer = write_timer,
         };
         return db;
     }
@@ -112,8 +106,6 @@ pub const Database = struct {
         queue: std.PriorityQueue(KV, void, lessThan),
         v: KV,
 
-        timer: BlockProfiler,
-
         pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
             const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
 
@@ -132,8 +124,6 @@ pub const Database = struct {
                 .mtbls = iters,
                 .queue = queue,
                 .v = undefined,
-
-                .timer = BlockProfiler.init(),
             };
             return mi;
         }
@@ -152,8 +142,6 @@ pub const Database = struct {
         }
 
         pub fn next(mi: *MergeIterator) !bool {
-            mi.timer.start("iter next");
-            defer mi.timer.end();
             for (mi.mtbls.items) |table_iter| {
                 if (table_iter.next()) {
                     const kv = table_iter.value();
@@ -180,8 +168,8 @@ pub const Database = struct {
     }
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
-        self.write_timer.start("db write");
-        defer self.write_timer.end();
+        //var timer = BlockProfiler.start("db.write");
+        //defer timer.end();
 
         if (key.len == 0) {
             return error.WriteError;

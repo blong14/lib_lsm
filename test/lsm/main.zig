@@ -11,10 +11,6 @@ const mem = std.mem;
 
 const Allocator = mem.Allocator;
 
-var parseTimer: lsm.BlockProfiler = undefined;
-var readTimer: lsm.BlockProfiler = undefined;
-var writeTimer: lsm.BlockProfiler = undefined;
-
 pub fn main() !void {
     var gpa = heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -50,31 +46,25 @@ pub fn main() !void {
 
     const data_dir = res.args.data_dir orelse "data";
     const input = res.args.input orelse "data/trips.txt";
-    const sst_capacity = res.args.sst_capacity orelse mem.page_size;
+    const sst_capacity = res.args.sst_capacity orelse 300_000;
     const wal_capacity = mem.page_size * mem.page_size;
     const alloc = heap.c_allocator;
 
-    lsm.BeginProfile(alloc);
-    defer lsm.EndProfile();
-
-    const opts: lsm.Opts = .{
+    const db = lsm.databaseFromOpts(alloc, .{
         .data_dir = data_dir,
         .sst_capacity = sst_capacity,
         .wal_capacity = wal_capacity,
-    };
-
-    const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
+    }) catch |err| {
         debug.print("database init error {s}\n", .{@errorName(err)});
         return err;
     };
     defer alloc.destroy(db);
     defer db.deinit();
 
-    parseTimer = lsm.BlockProfiler.init();
-    readTimer = lsm.BlockProfiler.init();
-    writeTimer = lsm.BlockProfiler.init();
+    lsm.BeginProfile(gpa.allocator());
+    defer lsm.EndProfile();
 
-    const rows = try parse(alloc, input);
+    const rows = try parse(gpa.allocator(), input);
     defer rows.deinit();
 
     write(db, rows);
@@ -83,8 +73,8 @@ pub fn main() !void {
 }
 
 pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) {
-    parseTimer.start("parse");
-    defer parseTimer.end();
+    var timer = lsm.BlockProfiler.start("parse");
+    defer timer.end();
 
     const file = fs.cwd().openFile(input, .{}) catch |err| {
         debug.print("open file error {s}\n", .{@errorName(err)});
@@ -132,8 +122,8 @@ pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) 
 }
 
 pub fn write(db: *lsm.Database, input: std.ArrayList([2][]const u8)) void {
-    writeTimer.start("write");
-    defer writeTimer.end();
+    var timer = lsm.BlockProfiler.start("write");
+    defer timer.end();
 
     var count: usize = 0;
     for (input.items) |row| {
@@ -149,8 +139,8 @@ pub fn write(db: *lsm.Database, input: std.ArrayList([2][]const u8)) void {
 }
 
 pub fn read(db: *lsm.Database) void {
-    readTimer.start("read");
-    defer readTimer.end();
+    var timer = lsm.BlockProfiler.start("read");
+    defer timer.end();
 
     var iter = db.iterator() catch |err| {
         debug.print(
