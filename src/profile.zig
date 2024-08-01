@@ -54,6 +54,7 @@ pub const ProfileAnchor = struct {
     hit_count: u64,
     elapsed_inclusive: u64, // does include children
     elapsed_exclusive: u64, // does NOT include children
+    processed_bytes: u64,
 };
 
 pub const Profiler = struct {
@@ -81,6 +82,7 @@ pub const BlockProfiler = struct {
     label: []const u8,
     start_time: u64,
     elapsed_inclusive: u64,
+    bytes: u64,
 
     const Self = @This();
 
@@ -95,6 +97,7 @@ pub const BlockProfiler = struct {
                 .elapsed_inclusive = 0,
                 .elapsed_exclusive = 0,
                 .hit_count = 0,
+                .processed_bytes = 0,
             };
         }
         const anchor = result.value_ptr.*;
@@ -103,7 +106,12 @@ pub const BlockProfiler = struct {
             .label = label,
             .elapsed_inclusive = anchor.elapsed_inclusive,
             .start_time = readCPUTimer(),
+            .bytes = 0,
         };
+    }
+
+    pub fn withBytes(self: *Self, byts: u64) void {
+        self.bytes = byts;
     }
 
     pub fn end(self: Self) void {
@@ -122,6 +130,7 @@ pub const BlockProfiler = struct {
         anchor.elapsed_exclusive += elapsed;
         anchor.elapsed_inclusive = self.elapsed_inclusive + elapsed;
         anchor.hit_count += 1;
+        anchor.processed_bytes += self.bytes;
 
         GlobalProfiler.anchors.put(self.label, anchor) catch |err| {
             @panic(@errorName(err));
@@ -175,6 +184,21 @@ pub inline fn EndProfile() void {
                 std.debug.print(
                     " ({}ms w/ children {}% of total time)",
                     .{ anchor_time_w_children, anchor_percent_w_children },
+                );
+            }
+
+            if (anchor.processed_bytes > 0) {
+                const mega_byte = 1024 * 1024;
+                const giga_byte = mega_byte * 1024;
+
+                const seconds: f64 = @as(f64, @floatFromInt(1000 * anchor.elapsed_inclusive / cpu_freq)) / 1000.0;
+                const bytes_per_second: f64 = @as(f64, @floatFromInt(anchor.processed_bytes)) / seconds;
+                const mega_bytes: f64 = @as(f64, @floatFromInt(anchor.processed_bytes)) / mega_byte;
+                const giga_bytes_per_second: f64 = bytes_per_second / giga_byte;
+
+                std.debug.print(
+                    " {d:.2}mb @ {d:.2}gb/s",
+                    .{ mega_bytes, giga_bytes_per_second },
                 );
             }
 

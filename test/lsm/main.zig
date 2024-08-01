@@ -122,17 +122,19 @@ pub fn write(db: *lsm.Database, input: std.ArrayList([2][]const u8)) void {
     var timer = lsm.BlockProfiler.start("write");
     defer timer.end();
 
-    var count: usize = 0;
+    var bytes: u64 = 0;
     for (input.items) |row| {
         db.write(row[0], row[1]) catch |err| {
             debug.print(
-                "database write error: count {d} key {s} error {s}\n",
-                .{ count, row[0], @errorName(err) },
+                "database write error: key {s} error {s}\n",
+                .{ row[0], @errorName(err) },
             );
             return;
         };
-        count += 1;
+        bytes += row[0].len + row[1].len;
     }
+
+    timer.withBytes(bytes);
 }
 
 pub fn read(db: *lsm.Database) void {
