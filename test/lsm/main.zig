@@ -73,11 +73,17 @@ pub fn main() !void {
 }
 
 pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) {
+    var timer = lsm.BlockProfiler.start("parse");
+    defer timer.end();
+
     const file = fs.cwd().openFile(input, .{}) catch |err| {
         debug.print("open file error {s}\n", .{@errorName(err)});
         return err;
     };
     defer file.close();
+
+    const stat = try file.stat();
+    timer.withBytes(stat.size);
 
     // TODO: Figure out an appropriate buffer size
     var buffer = [_]u8{0} ** (mem.page_size * 2000);
@@ -138,6 +144,9 @@ pub fn write(db: *lsm.Database, input: std.ArrayList([2][]const u8)) void {
 }
 
 pub fn read(db: *lsm.Database) void {
+    var timer = lsm.BlockProfiler.start("read");
+    defer timer.end();
+
     var iter = db.iterator() catch |err| {
         debug.print(
             "database iter err: {s}\n",
