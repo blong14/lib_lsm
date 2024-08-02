@@ -181,6 +181,7 @@ pub const Database = struct {
         const kv = try self.kv_pool.create();
         defer self.kv_pool.destroy(kv);
 
+        // TODO: Refactor to a len method on KV
         const len = @sizeOf(u64) + @sizeOf(usize) + key.len + @sizeOf(usize) + value.len;
         kv.*.key = key;
         kv.*.value = value;
