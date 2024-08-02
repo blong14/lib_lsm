@@ -65,7 +65,7 @@ pub const Profiler = struct {
 
     pub fn init(alloc: Allocator) Profiler {
         return .{
-            .active_anchor = undefined,
+            .active_anchor = "",
             .anchors = std.StringHashMap(ProfileAnchor).init(alloc),
             .start = 0,
             .end = 0,
@@ -121,7 +121,10 @@ pub const BlockProfiler = struct {
 
         if (GlobalProfiler.anchors.get(anchor.parent_anchor)) |parent| {
             var parent_anchor = parent;
-            parent_anchor.elapsed_exclusive -= elapsed;
+            const result = @subWithOverflow(parent_anchor.elapsed_exclusive, elapsed);
+            if (result[1] == 0) {
+                parent_anchor.elapsed_exclusive = result[0];
+            }
             GlobalProfiler.anchors.put(parent_anchor.label, parent_anchor) catch |err| {
                 @panic(@errorName(err));
             };
