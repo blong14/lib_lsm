@@ -8,3 +8,5 @@ data
 
 callgrind.o
 massif.o
+*.csv
+*.txt
