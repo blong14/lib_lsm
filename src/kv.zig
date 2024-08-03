@@ -17,15 +17,19 @@ pub const KV = struct {
     };
 
     pub fn init(alloc: Allocator, key: []const u8, value: []const u8) !*Self {
-        const len = @sizeOf(u64) + @sizeOf(usize) + key.len + @sizeOf(usize) + value.len;
         const kv = try alloc.create(Self);
+        Self.initFields(kv, key, value);
+        return kv;
+    }
+
+    pub fn initFields(kv: *KV, key: []const u8, value: []const u8) void {
+        const len = @sizeOf(u64) + @sizeOf(usize) + key.len + @sizeOf(usize) + value.len;
         kv.* = .{
             .hash = 0,
-            .len = len,
             .key = key,
             .value = value,
+            .len = len,
         };
-        return kv;
     }
 
     pub fn order(a: []const u8, b: KV) Order {

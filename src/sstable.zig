@@ -70,10 +70,13 @@ pub const Block = struct {
         var count: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
         std.mem.writeInt(std.math.ByteAlignedInt(u64), &count, self.count, std.builtin.Endian.little);
 
-        const buf = outFile.writer();
+        var buf = std.io.bufferedWriter(outFile.writer());
+
         var bytes = try buf.write(&count);
         bytes += try buf.write(self.offset.items);
         bytes += try buf.write(self.data.items);
+
+        try buf.flush();
 
         return bytes;
     }
