@@ -45,7 +45,7 @@ pub fn main() !void {
     }
 
     const data_dir = res.args.data_dir orelse "data";
-    const input = res.args.input orelse "data/trips.txt";
+    const input = res.args.input orelse "trips.txt";
     const sst_capacity = res.args.sst_capacity orelse 300_000;
     const wal_capacity = mem.page_size * mem.page_size;
     const alloc = heap.c_allocator;
@@ -85,8 +85,7 @@ pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) 
     const stat = try file.stat();
     timer.withBytes(stat.size);
 
-    // TODO: Figure out an appropriate buffer size
-    var buffer = [_]u8{0} ** (mem.page_size * 2000);
+    var buffer = [_]u8{0} ** mem.page_size;
     const fileReader = file.reader();
     var csv_file = lsm.CSV.init(fileReader, &buffer, .{}) catch |err| {
         debug.print("csv file error {s}\n", .{@errorName(err)});

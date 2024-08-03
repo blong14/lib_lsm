@@ -11,89 +11,83 @@ const msg = struct {
     value: []const u8,
 };
 
-pub fn xmain(data_dir: []const u8, input: []const u8) !void {
-    var mainTimer = try std.time.Timer.start();
-    const mainStart = mainTimer.read();
-
+pub fn run(data_dir: []const u8, input: []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-
     const galloc = gpa.allocator();
+
     var mailbox = try lsm.MessageQueue([]msg).init(galloc, ".");
     defer galloc.destroy(mailbox);
     defer mailbox.deinit();
 
     const reader = try std.Thread.spawn(.{}, struct {
         pub fn consume(dir: []const u8, inbox: lsm.MessageQueue([]msg).ReadIter) void {
-            var timer = std.time.Timer.start() catch |err| {
-                std.debug.print("consume error {s}\n", .{@errorName(err)});
-                return;
-            };
-
             const alloc = std.heap.c_allocator;
-            const opts = lsm.withDataDirOpts(dir);
-            const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
-                std.debug.print("consume error {s}\n", .{@errorName(err)});
+
+            lsm.BeginProfile(alloc);
+            defer lsm.EndProfile();
+
+            const db = lsm.databaseFromOpts(alloc, .{
+                .data_dir = dir,
+                .sst_capacity = 100_000,
+                .wal_capacity = std.mem.page_size * std.mem.page_size,
+            }) catch |err| {
+                debug.print(
+                    "database init error {s}\n",
+                    .{@errorName(err)},
+                );
                 return;
             };
             defer alloc.destroy(db);
             defer db.deinit();
 
-            const start = timer.read();
+            var timer = lsm.BlockProfiler.start("reader");
             var count: usize = 0;
             while (inbox.next()) |row| {
                 for (row) |item| {
                     db.write(item.key, item.value) catch |err| {
-                        std.debug.print("count {d} key {s} {s}\n", .{ count, item.key, @errorName(err) });
+                        std.debug.print(
+                            "db write error count {d} key {s} {s}\n",
+                            .{ count, item.key, @errorName(err) },
+                        );
                         return;
                     };
                     count += 1;
                 }
             }
-            const end = timer.read();
-            std.debug.print("total rows consumed {d} in {}ms\n", .{ count, (end - start) / 1_000_000 });
+            timer.end();
 
             db.flush() catch |err| {
-                std.debug.print("error flushing db {s}\n", .{@errorName(err)});
+                std.debug.print(
+                    "error flushing db {s}\n",
+                    .{@errorName(err)},
+                );
                 return;
             };
-
-            std.debug.print("iterating keys...\n", .{});
-            var iter = db.iterator() catch |err| {
-                std.debug.print("db iter error {s}\n", .{@errorName(err)});
-                return;
-            };
-            defer iter.deinit();
-
-            const readStart = timer.read();
-            var readCount: usize = 0;
-            while (iter.next() catch false) {
-                readCount += 1;
-            }
-            const readEnd = timer.read();
-            std.debug.print("total rows read {d} in {}ms\n", .{ readCount, (readEnd - readStart) / 1_000_000 });
         }
     }.consume, .{ data_dir, mailbox.subscribe() });
+
     const writer = mailbox.publisher();
 
     const file = std.fs.cwd().openFile(input, .{}) catch |err| {
-        std.debug.print("publish error {s}\n", .{@errorName(err)});
+        std.debug.print(
+            "not able to open file {s}\n",
+            .{@errorName(err)},
+        );
         return;
     };
     defer file.close();
 
-    // TODO: Figure out an appropriate buffer size
-    var buffer = [_]u8{0} ** (std.mem.page_size * 2000);
     const fileReader = file.reader();
+    var buffer = [_]u8{0} ** std.mem.page_size;
     var csv_file = lsm.CSV.init(fileReader, &buffer, .{}) catch |err| {
         std.debug.print("publish error {s}\n", .{@errorName(err)});
         return;
     };
 
-    var out = std.ArrayList(msg).init(galloc);
+    var out = try std.ArrayList(msg).initCapacity(galloc, std.mem.page_size);
     defer out.deinit();
 
-    const writeStart = mainTimer.read();
     var count: usize = 0;
     var idx: usize = 0;
     var row = [2][]const u8{ undefined, undefined };
@@ -110,7 +104,10 @@ pub fn xmain(data_dir: []const u8, input: []const u8) !void {
                 try out.append(r);
                 if (out.items.len >= std.mem.page_size) {
                     writer.publish(out.items) catch |err| {
-                        std.debug.print("error publishing row {s}\n", .{@errorName(err)});
+                        std.debug.print(
+                            "error publishing row {s}\n",
+                            .{@errorName(err)},
+                        );
                         return;
                     };
                     out.clearRetainingCapacity();
@@ -121,22 +118,19 @@ pub fn xmain(data_dir: []const u8, input: []const u8) !void {
             },
         }
     }
+
     if (out.items.len > 0) {
         writer.publish(out.items) catch |err| {
-            std.debug.print("error publishing row {s}\n", .{@errorName(err)});
+            std.debug.print(
+                "error publishing row {s}\n",
+                .{@errorName(err)},
+            );
             return;
         };
     }
-    const writeEnd = mainTimer.read();
-    std.debug.print("total rows writen {d} in {}ms\n", .{ count, (writeEnd - writeStart) / 1_000_000 });
-    writer.done() catch |err| {
-        std.debug.print("publish error {s}\n", .{@errorName(err)});
-    };
 
+    try writer.done();
     reader.join();
-
-    const mainEnd = mainTimer.read();
-    std.debug.print("reading data finished in {}ms\n", .{(mainEnd - mainStart) / 1_000_000});
 }
 
 pub fn main() !void {
@@ -173,7 +167,7 @@ pub fn main() !void {
     }
 
     const data_dir = res.args.data_dir orelse "data";
-    const input = res.args.input orelse "data/trips.txt";
+    const input = res.args.input orelse "trips.txt";
 
-    try xmain(data_dir, input);
+    try run(data_dir, input);
 }
