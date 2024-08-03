@@ -54,8 +54,8 @@ pub const Block = struct {
         const offset_writer = self.offset.writer();
         try offset_writer.writeInt(usize, offset, std.builtin.Endian.little);
 
-        var buf: [std.mem.page_size]u8 = undefined;
-        const encoded_kv = try kv.encode(&buf);
+        const encoded_kv = try kv.encodeAlloc(self.alloc);
+        defer self.alloc.free(encoded_kv);
 
         const data_writer = self.data.writer();
         const byte_count = try data_writer.write(encoded_kv);
@@ -66,14 +66,16 @@ pub const Block = struct {
     }
 
     /// [count, offset1, offset2, kv[hash, keylen, key, valuelen, value], kv[hash, keylen, key, valuelen, value]]
-    pub fn flush(self: Self, outFile: std.fs.File) !void {
+    pub fn flush(self: Self, outFile: std.fs.File) !usize {
         var count: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
         std.mem.writeInt(std.math.ByteAlignedInt(u64), &count, self.count, std.builtin.Endian.little);
 
         const buf = outFile.writer();
-        _ = try buf.write(&count);
-        _ = try buf.write(self.offset.items);
-        _ = try buf.write(self.data.items);
+        var bytes = try buf.write(&count);
+        bytes += try buf.write(self.offset.items);
+        bytes += try buf.write(self.data.items);
+
+        return bytes;
     }
 };
 
@@ -161,14 +163,14 @@ pub const SSTable = struct {
 
     pub fn flush(self: *Self) !void {
         if (self.mutable and self.connected) {
-            self.block.flush(self.file) catch |err| {
+            self.mutable = false;
+            _ = self.block.flush(self.file) catch |err| {
                 std.debug.print(
                     "sstable not able to flush block: {s}\n",
                     .{@errorName(err)},
                 );
                 return err;
             };
-            self.mutable = false;
             self.file.sync() catch |err| {
                 const meta = try self.file.metadata();
                 std.debug.print(
@@ -212,7 +214,7 @@ test "SSTable" {
     defer alloc.destroy(kv);
 
     const offset = try st.write(kv);
-    try st.flush();
+    _ = try st.flush();
 
     const actual = try KV.init(alloc, undefined, undefined);
     defer alloc.destroy(actual);
