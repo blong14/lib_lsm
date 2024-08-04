@@ -23,6 +23,7 @@ pub const Memtable = struct {
     };
 
     alloc: Allocator,
+    byte_count: usize,
     cap: usize,
     data: KVTableMap,
     id: u64,
@@ -31,12 +32,13 @@ pub const Memtable = struct {
     sstable: ?*SSTable,
 
     pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
-        const cap = opts.sst_capacity / @sizeOf(KV);
+        const cap = opts.sst_capacity;
         const map = try KVTableMap.init(alloc, cap);
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
             .alloc = alloc,
+            .byte_count = 0,
             .cap = cap,
             .data = map,
             .id = id,
@@ -65,6 +67,7 @@ pub const Memtable = struct {
             return error.Full;
         }
         try self.data.put(item.key, item.*);
+        self.byte_count += item.len;
     }
 
     pub fn get(self: Self, key: []const u8) ?KV {
@@ -73,6 +76,10 @@ pub const Memtable = struct {
 
     pub fn count(self: Self) usize {
         return self.data.count();
+    }
+
+    pub fn size(self: Self) usize {
+        return self.byte_count;
     }
 
     pub const Iterator = struct {

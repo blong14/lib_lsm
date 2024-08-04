@@ -13,16 +13,21 @@ SOURCES := $(wildcard ./src/*.zig)
 
 all: build callgrind.o massif.o
 
+fmt: $(SOURCES)
+	@zig fmt .
+
 # gdb --tui zig-out/bin/lsm
 # b src/tablemap.zig:76
 # r
 # ipcrm -q <tab>
-build: $(SOURCES)
-	@zig fmt .
+build: fmt
 	@zig build $(BUILD_OPTS)
 
-run: clean build
-	$(EXEC) --data_dir data --input trips.txt --sst_capacity 300_000 
+run: fmt
+	@zig build run-lsm -- --input small.csv 
+
+profile: clean build
+	$(EXEC) --data_dir data --input trips.txt --sst_capacity 256_000 
 
 clean:
 	rm -f $(BIN)/* callgrind.o massif.o data/*.dat
@@ -31,9 +36,10 @@ test: $(SOURCES)
 	@zig build test --summary all
 
 poop: $(EXEC)
-	./bin/poop './$(EXEC) --input ./trips.txt --sst_capacity 100_000' \
-		'./$(EXEC) --input ./trips.txt --sst_capacity 300_000' \
-		'./$(EXEC) --input ./trips.txt --sst_capacity 500_000'
+	./bin/poop './$(EXEC) --input ./trips.txt --sst_capacity 128_000' \
+		'./$(EXEC) --input ./trips.txt --sst_capacity 256_000' \
+		'./$(EXEC) --input ./trips.txt --sst_capacity 512_000' \
+		'./$(EXEC) --input ./trips.txt --sst_capacity 1_024_000'
 
 callgrind.o: $(EXEC)
 	# kcachegrind

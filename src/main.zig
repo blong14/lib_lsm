@@ -24,6 +24,7 @@ const WAL = log.WAL;
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
 pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
 pub const Opts = options.Opts;
+pub const defaultOpts = options.defaultOpts;
 pub const withDataDirOpts = options.withDataDirOpts;
 
 const Profiler = @import("profile.zig");
@@ -50,7 +51,7 @@ pub const Database = struct {
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
         const mtable = try Memtable.init(alloc, 0, opts);
         const mtables = std.ArrayList(*Memtable).init(alloc);
-        const capacity = opts.sst_capacity / @sizeOf(KV);
+        const capacity = opts.sst_capacity;
         const pool = try MemoryPool(KV).initPreheated(alloc, opts.sst_capacity);
 
         const db = try alloc.create(Self);
@@ -87,9 +88,9 @@ pub const Database = struct {
         if (self.mtable.get(key)) |value| {
             return value;
         }
-        var idx: usize = self.mtables.items.len;
+        var idx: usize = self.mtables.items.len - 1;
         while (idx > 0) {
-            var table = self.mtables.items[idx - 1];
+            var table = self.mtables.items[idx];
             if (table.get(key)) |value| {
                 return value;
             }
@@ -173,10 +174,6 @@ pub const Database = struct {
         if (key.len == 0) {
             return error.WriteError;
         }
-        if (self.mtable.count() >= self.capacity) {
-            try self.flush();
-            try self.freeze();
-        }
 
         const kv = try self.kv_pool.create();
         defer self.kv_pool.destroy(kv);
@@ -184,13 +181,17 @@ pub const Database = struct {
         KV.initFields(kv, key, value);
 
         try self.mtable.put(kv);
+        if (self.mtable.size() >= self.capacity) {
+            // try self.flush();
+            try self.freeze();
+        }
     }
 
     pub fn flush(self: *Self) !void {
         try self.mtable.flush();
     }
 
-    fn freeze(self: *Self) !void {
+    inline fn freeze(self: *Self) !void {
         const current_id = self.mtable.getId();
         try self.mtables.append(self.mtable);
         self.mtable = try Memtable.init(self.alloc, current_id + 1, self.opts);
@@ -207,9 +208,6 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 
 test "basic functionality" {
     var alloc = testing.allocator;
-
-    BeginProfile(alloc);
-    defer EndProfile();
 
     var db = try defaultDatabase(alloc);
     defer alloc.destroy(db);
@@ -232,9 +230,6 @@ test "basic functionality with many items" {
     defer arena.deinit();
 
     const alloc = arena.allocator();
-
-    BeginProfile(alloc);
-    defer EndProfile();
 
     var db = try defaultDatabase(alloc);
     defer db.deinit();
