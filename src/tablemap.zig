@@ -49,12 +49,12 @@ pub fn TableMap(
             return start;
         }
 
-        fn equalto(self: Self, key: K, idx: usize) bool {
+        inline fn equalto(self: Self, key: K, idx: usize) bool {
             const entry = self.impl.items[idx];
             return compareFn(key, entry) == .eq;
         }
 
-        fn greaterthan(self: Self, key: K, idx: usize) bool {
+        inline fn greaterthan(self: Self, key: K, idx: usize) bool {
             const entry = self.impl.items[idx];
             return compareFn(key, entry) == .gt;
         }
@@ -89,25 +89,17 @@ pub fn TableMap(
                 return TableMapError.OutOfMemory;
             }
             if ((cnt == 0) or (self.greaterthan(key, cnt - 1))) {
-                return try self.append(value);
+                return self.impl.appendAssumeCapacity(value);
             }
             const idx = self.findIndex(key, 0, cnt - 1);
-            try self.impl.insert(idx, value);
-        }
-
-        pub fn append(self: *Self, value: V) !void {
-            if (self.count() == self.cap) {
-                return TableMapError.OutOfMemory;
-            }
-            try self.impl.append(value);
+            self.impl.insertAssumeCapacity(idx, value);
         }
     };
 }
 
 test TableMap {
-    const keyvalue = @import("kv.zig");
+    const KV = @import("kv.zig").KV;
 
-    const KV = keyvalue.KV;
     const testing = std.testing;
     const alloc = testing.allocator;
 
