@@ -158,14 +158,14 @@ pub const AppendOnlyMMap = struct {
         return mmap;
     }
 
-    pub fn connect(self: *Self, file: std.fs.File) !void {
+    pub fn connect(self: *Self, file: std.fs.File, offset: u64) !void {
         const data = try std.posix.mmap(
             null,
             self.len,
             std.posix.PROT.READ | std.posix.PROT.WRITE,
             .{ .TYPE = .SHARED, .ANONYMOUS = false },
             file.handle,
-            0,
+            offset,
         );
         self.buf = std.io.fixedBufferStream(data);
         self.file = file;
@@ -233,7 +233,7 @@ test "AppendOnlyMMap write" {
     defer alloc.destroy(map);
     defer map.deinit();
 
-    try map.connect(file);
+    try map.connect(file, 0);
 
     // when
     const rslt = try map.write(expected);
