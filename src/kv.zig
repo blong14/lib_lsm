@@ -40,21 +40,21 @@ pub const KV = struct {
         var stream = std.io.fixedBufferStream(data);
 
         var data_reader = stream.reader();
-        self.*.hash = try data_reader.readInt(u64, std.builtin.Endian.little);
+        _ = try data_reader.readInt(u64, std.builtin.Endian.little);
 
         const key_len = try data_reader.readInt(u64, std.builtin.Endian.little);
         assert(key_len > 0);
 
-        self.*.key = stream.buffer[stream.pos..][0..key_len];
+        const key = stream.buffer[stream.pos..][0..key_len];
 
         stream.pos += key_len;
 
         const value_len = try data_reader.readInt(u64, std.builtin.Endian.little);
         assert(value_len > 0);
 
-        self.*.value = stream.buffer[stream.pos..][0..value_len];
+        const value = stream.buffer[stream.pos..][0..value_len];
 
-        self.*.len = data.len;
+        Self.initFields(self, key, value);
     }
 
     pub fn encodeAlloc(self: Self, alloc: Allocator) ![]const u8 {
