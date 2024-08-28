@@ -11,7 +11,7 @@ const mem = std.mem;
 
 const Allocator = mem.Allocator;
 
-const help =
+const usage =
     \\-h, --help             Display this help and exit.
     \\-d, --data_dir <str>   The data directory to save files on disk.
     \\-i, --input    <str>   An input file to import. Only supports csv.
@@ -25,7 +25,7 @@ pub fn main() !void {
 
     // First we specify what parameters our program can take.
     // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`
-    const params = comptime clap.parseParamsComptime(help);
+    const params = comptime clap.parseParamsComptime(usage);
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
     // This is optional. You can also pass `.{}` to `clap.parse` if you don't
@@ -42,7 +42,7 @@ pub fn main() !void {
     defer res.deinit();
 
     if (res.args.help != 0) {
-        debug.print("{s}\n", .{help});
+        debug.print("{s}\n", .{usage});
         return;
     }
 
@@ -65,8 +65,8 @@ pub fn main() !void {
     defer alloc.destroy(db);
     defer db.deinit();
 
-    //lsm.BeginProfile(gpa.allocator());
-    //defer lsm.EndProfile();
+    lsm.BeginProfile(gpa.allocator());
+    defer lsm.EndProfile();
 
     const rows = try parse(gpa.allocator(), input);
     defer rows.deinit();
@@ -77,8 +77,8 @@ pub fn main() !void {
 }
 
 pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) {
-    //var timer = lsm.BlockProfiler.start("parse");
-    //defer timer.end();
+    var timer = lsm.BlockProfiler.start("parse");
+    defer timer.end();
 
     const file = fs.cwd().openFile(input, .{}) catch |err| {
         debug.print("open file error {s}\n", .{@errorName(err)});
@@ -86,8 +86,8 @@ pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) 
     };
     defer file.close();
 
-    //const stat = try file.stat();
-    //timer.withBytes(stat.size);
+    const stat = try file.stat();
+    timer.withBytes(stat.size);
 
     var buffer = [_]u8{0} ** mem.page_size;
     const fileReader = file.reader();
@@ -117,7 +117,7 @@ pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) 
                 }
             },
             .row_end => {
-                try out.append(row);
+                out.appendAssumeCapacity(row);
                 count += 1;
                 row = [2][]const u8{ undefined, undefined };
                 idx = 0;
@@ -128,8 +128,8 @@ pub fn parse(alloc: Allocator, input: []const u8) !std.ArrayList([2][]const u8) 
 }
 
 pub fn write(db: *lsm.Database, input: std.ArrayList([2][]const u8)) void {
-    //var timer = lsm.BlockProfiler.start("write");
-    //defer timer.end();
+    var timer = lsm.BlockProfiler.start("write");
+    defer timer.end();
 
     var bytes: u64 = 0;
     for (input.items) |row| {
@@ -143,12 +143,12 @@ pub fn write(db: *lsm.Database, input: std.ArrayList([2][]const u8)) void {
         bytes += row[0].len + row[1].len;
     }
 
-    //timer.withBytes(bytes);
+    timer.withBytes(bytes);
 }
 
 pub fn read(db: *lsm.Database) void {
-    //var timer = lsm.BlockProfiler.start("read");
-    //defer timer.end();
+    var timer = lsm.BlockProfiler.start("read");
+    defer timer.end();
 
     var iter = db.iterator() catch |err| {
         debug.print(
