@@ -5,10 +5,8 @@ const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
 
 pub const KV = struct {
-    hash: u64,
     key: []const u8,
     value: []const u8,
-    len: u64,
 
     const Self = @This();
 
@@ -18,18 +16,15 @@ pub const KV = struct {
 
     pub fn init(alloc: Allocator, key: []const u8, value: []const u8) !*Self {
         const kv = try alloc.create(Self);
-        Self.initFields(kv, key, value);
+        kv.* = .{
+            .key = key,
+            .value = value,
+        };
         return kv;
     }
 
-    pub fn initFields(kv: *KV, key: []const u8, value: []const u8) void {
-        const len = @sizeOf(u64) + @sizeOf(u64) + key.len + @sizeOf(u64) + value.len;
-        kv.* = .{
-            .hash = 0,
-            .key = key,
-            .value = value,
-            .len = len,
-        };
+    pub fn len(self: Self) u64 {
+        return @sizeOf(u64) + self.key.len + @sizeOf(u64) + self.value.len;
     }
 
     pub fn order(a: []const u8, b: KV) Order {
@@ -38,9 +33,7 @@ pub const KV = struct {
 
     pub fn decode(self: *Self, data: []const u8) !void {
         var stream = std.io.fixedBufferStream(data);
-
         var data_reader = stream.reader();
-        _ = try data_reader.readInt(u64, std.builtin.Endian.little);
 
         const key_len = try data_reader.readInt(u64, std.builtin.Endian.little);
         assert(key_len > 0);
@@ -54,26 +47,28 @@ pub const KV = struct {
 
         const value = stream.buffer[stream.pos..][0..value_len];
 
-        Self.initFields(self, key, value);
+        self.*.key = key;
+        self.*.value = value;
     }
 
     pub fn encodeAlloc(self: Self, alloc: Allocator) ![]const u8 {
-        const buf = try alloc.alloc(u8, self.len);
+        const buf = try alloc.alloc(u8, self.len());
         return try self.encode(buf);
     }
 
     pub fn encode(self: Self, buf: []u8) ![]u8 {
-        assert(self.len <= buf.len);
-        var stream = std.io.fixedBufferStream(buf);
+        const len_ = self.len();
+        assert(len_ <= buf.len);
 
+        var stream = std.io.fixedBufferStream(buf);
         var data_writer = stream.writer();
-        try data_writer.writeInt(u64, self.hash, std.builtin.Endian.little);
+
         try data_writer.writeInt(u64, self.key.len, std.builtin.Endian.little);
         _ = try data_writer.write(self.key);
         try data_writer.writeInt(u64, self.value.len, std.builtin.Endian.little);
         _ = try data_writer.write(self.value);
 
-        return buf[0..self.len];
+        return buf[0..len_];
     }
 };
 
@@ -91,7 +86,7 @@ test "KV encode alloc" {
     // then
     try std.testing.expectEqualSlices(
         u8,
-        "\x00\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__",
+        "\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__",
         str,
     );
 }
@@ -110,7 +105,7 @@ test "KV encode" {
     // then
     try std.testing.expectEqualSlices(
         u8,
-        "\x00\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__",
+        "\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__",
         str,
     );
 }
@@ -122,7 +117,7 @@ test "KV decode" {
     const expected = try KV.init(alloc, "__key__", "__value__");
     defer alloc.destroy(expected);
 
-    const byts = "\x00\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__";
+    const byts = "\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__";
 
     // when
     var actual: KV = undefined;
@@ -131,5 +126,5 @@ test "KV decode" {
     // then
     try std.testing.expectEqualStrings(expected.key, actual.key);
     try std.testing.expectEqualStrings(expected.value, actual.value);
-    try std.testing.expectEqual(expected.len, actual.len);
+    try std.testing.expectEqual(expected.len(), actual.len());
 }

@@ -7,11 +7,14 @@ const sst = @import("sstable.zig");
 const tbm = @import("tablemap.zig");
 
 const Allocator = std.mem.Allocator;
+const File = std.fs.File;
 
 const KV = keyvalue.KV;
 const Opts = options.Opts;
 const SSTable = sst.SSTable;
 const TableMap = tbm.TableMap;
+
+const print = std.debug.print;
 
 pub const Memtable = struct {
     const Self = @This();
@@ -67,7 +70,7 @@ pub const Memtable = struct {
             return error.Full;
         }
         try self.data.put(item.key, item.*);
-        self.byte_count += item.len;
+        self.byte_count += item.len();
     }
 
     pub fn get(self: Self, key: []const u8) ?KV {
@@ -97,7 +100,7 @@ pub const Memtable = struct {
                 return false;
             }
             const entry = it.data.getEntryByIdx(it.*.idx) catch |err| {
-                std.debug.print(
+                print(
                     "memtable iter error: {s}\n",
                     .{@errorName(err)},
                 );
@@ -116,7 +119,7 @@ pub const Memtable = struct {
                 return false;
             }
             const entry = it.data.getEntryByIdx(it.*.idx) catch |err| {
-                std.debug.print(
+                print(
                     "memtable iter error: {s}\n",
                     .{@errorName(err)},
                 );
@@ -148,22 +151,22 @@ pub const Memtable = struct {
             return;
         }
 
-        // TODO: Use a fixed buffer allocator here
-        const filename = try std.fmt.allocPrint(self.alloc, "{s}/{d}.dat", .{ self.opts.data_dir, self.getId() });
-        defer self.alloc.free(filename);
-
-        const file = try file_utils.openWithCapacity(filename, self.opts.sst_capacity);
-        var sstable = try SSTable.init(self.alloc, self.getId(), self.opts);
-        try sstable.connect(file);
-
         var iter = try self.iterator(0);
         defer self.alloc.destroy(iter);
 
+        var sstable = try SSTable.init(self.alloc, self.getId(), self.opts);
         while (iter.next()) {
-            _ = try sstable.write(&iter.value());
+            const kv = iter.value();
+            _ = sstable.write(&kv) catch |err| {
+                print(
+                    "memtable not able to write to sstable for key {s}: {s}\n",
+                    .{ kv.key, @errorName(err) },
+                );
+                return err;
+            };
         }
 
-        sstable.flush() catch {};
+        try sstable.flush();
 
         self.sstable = sstable;
         self.mutable = false;

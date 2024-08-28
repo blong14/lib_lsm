@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const csv = @import("csv_reader.zig");
+const fio = @import("file.zig");
 const log = @import("wal.zig");
 const mtbl = @import("memtable.zig");
 const options = @import("opts.zig");
@@ -175,16 +176,18 @@ pub const Database = struct {
             return error.WriteError;
         }
 
-        const kv = try self.kv_pool.create();
-        defer self.kv_pool.destroy(kv);
+        const item = try self.kv_pool.create();
+        defer self.kv_pool.destroy(item);
 
-        KV.initFields(kv, key, value);
+        item.*.key = key;
+        item.*.value = value;
 
-        try self.mtable.put(kv);
-        if (self.mtable.size() >= self.capacity) {
-            // try self.flush();
+        if ((self.mtable.size() + item.len()) >= self.capacity) {
+            try self.flush();
             try self.freeze();
         }
+
+        try self.mtable.put(item);
     }
 
     pub fn flush(self: *Self) !void {
@@ -207,10 +210,16 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 }
 
 test "basic functionality" {
-    var alloc = testing.allocator;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
-    var db = try defaultDatabase(alloc);
-    defer alloc.destroy(db);
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try databaseFromOpts(alloc, withDataDirOpts(dir_name));
     defer db.deinit();
 
     // given
@@ -230,8 +239,12 @@ test "basic functionality with many items" {
     defer arena.deinit();
 
     const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
 
-    var db = try defaultDatabase(alloc);
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try databaseFromOpts(alloc, withDataDirOpts(dir_name));
     defer db.deinit();
 
     // given
