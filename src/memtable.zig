@@ -19,7 +19,7 @@ const print = std.debug.print;
 pub const Memtable = struct {
     const Self = @This();
 
-    const KVTableMap = TableMap([]const u8, KV, KV.order);
+    const KVTableMap = TableMap([]const u8, *const KV, KV.order);
 
     const Error = error{
         Full,
@@ -54,7 +54,7 @@ pub const Memtable = struct {
 
     pub fn deinit(self: *Self) void {
         self.data.deinit();
-        if (self.sstable) |sstbl| {
+        if (self.*.sstable) |sstbl| {
             sstbl.deinit();
             self.alloc.destroy(sstbl);
         }
@@ -69,11 +69,11 @@ pub const Memtable = struct {
         if (!self.mutable) {
             return error.Full;
         }
-        try self.data.put(item.key, item.*);
+        try self.data.put(item.key, item);
         self.byte_count += item.len();
     }
 
-    pub fn get(self: Self, key: []const u8) ?KV {
+    pub fn get(self: Self, key: []const u8) ?*const KV {
         return self.data.get(key) catch return null;
     }
 
@@ -89,9 +89,9 @@ pub const Memtable = struct {
         data: KVTableMap,
         idx: usize,
         start_idx: usize,
-        v: KV,
+        v: *const KV,
 
-        pub fn value(it: Iterator) KV {
+        pub fn value(it: Iterator) *const KV {
             return it.v;
         }
 
@@ -155,9 +155,12 @@ pub const Memtable = struct {
         defer self.alloc.destroy(iter);
 
         var sstable = try SSTable.init(self.alloc, self.getId(), self.opts);
+        errdefer self.alloc.destroy(sstable);
+        errdefer sstable.deinit();
+
         while (iter.next()) {
             const kv = iter.value();
-            _ = sstable.write(&kv) catch |err| {
+            _ = sstable.write(kv) catch |err| {
                 print(
                     "memtable not able to write to sstable for key {s}: {s}\n",
                     .{ kv.key, @errorName(err) },
@@ -168,8 +171,8 @@ pub const Memtable = struct {
 
         try sstable.flush();
 
-        self.sstable = sstable;
-        self.mutable = false;
+        self.*.sstable = sstable;
+        self.*.mutable = false;
     }
 };
 
@@ -181,17 +184,17 @@ test Memtable {
     var mtable = try Memtable.init(alloc, 0, options.defaultOpts());
     defer alloc.destroy(mtable);
     defer mtable.deinit();
-    defer mtable.flush() catch |err| {
-        std.debug.print("{s}\n", .{@errorName(err)});
-    };
 
     // when
-    const kv = try KV.init(alloc, "__key__", "__value__");
-    defer alloc.destroy(kv);
+    const kv = KV.init("__key__", "__value__");
 
-    try mtable.put(kv);
+    try mtable.put(&kv);
     const actual = mtable.get(kv.key);
 
     // then
     try testing.expectEqualStrings(kv.value, actual.?.value);
+
+    mtable.flush() catch |err| {
+        std.debug.print("{s}\n", .{@errorName(err)});
+    };
 }

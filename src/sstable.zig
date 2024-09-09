@@ -117,6 +117,14 @@ pub const SSTable = struct {
 
     pub fn write(self: *Self, value: *const KV) !usize {
         if (self.mutable) {
+            if (self.index.getKey(value.key)) |key| {
+                print(
+                    "not able to write to sstable for key {s}\n",
+                    .{key},
+                );
+                return Error.WriteError;
+            }
+
             const idx = self.block.write(value) catch |err| {
                 print(
                     "sstable not able to write to block for key {s}: {s}\n",
@@ -125,16 +133,13 @@ pub const SSTable = struct {
                 return err;
             };
 
-            const result = self.index.getOrPut(value.key) catch |err| {
+            self.index.put(value.key, idx) catch |err| {
                 print(
                     "sstable not able to write to index for key {s}: {s}\n",
                     .{ value.key, @errorName(err) },
                 );
                 return err;
             };
-            if (!result.found_existing) {
-                result.value_ptr.* = idx;
-            }
 
             return idx;
         }
@@ -206,10 +211,9 @@ test SSTable {
 
     // when
     const expected = "__value__";
-    const kv = try KV.init(alloc, "__key__", expected);
-    defer alloc.destroy(kv);
+    const kv = KV.init("__key__", expected);
 
-    _ = try st.write(kv);
+    _ = try st.write(&kv);
     _ = try st.flush();
 
     var actual: KV = undefined;

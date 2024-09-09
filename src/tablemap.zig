@@ -87,38 +87,43 @@ pub fn TableMap(
             const cnt: usize = self.count();
             if (cnt == self.cap) {
                 return TableMapError.OutOfMemory;
+            } else if (cnt == 0) {
+                self.impl.appendAssumeCapacity(value);
+                return;
             }
-            if ((cnt == 0) or (self.greaterthan(key, cnt - 1))) {
-                return self.impl.appendAssumeCapacity(value);
-            }
+
             const idx = self.findIndex(key, 0, cnt - 1);
-            self.impl.insertAssumeCapacity(idx, value);
+            if (self.equalto(key, idx)) {
+                self.impl.items[idx] = value;
+            } else if (self.greaterthan(key, cnt - 1)) {
+                self.impl.appendAssumeCapacity(value);
+            } else {
+                self.impl.insertAssumeCapacity(idx, value);
+            }
+
+            return;
         }
     };
 }
 
-test TableMap {
-    const KV = @import("kv.zig").KV;
+fn order(a: u16, b: u16) Order {
+    return std.math.order(a, b);
+}
 
+test TableMap {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var tm = try TableMap([]const u8, KV, KV.order).init(alloc, std.mem.page_size);
+    var tm = try TableMap(u16, u16, order).init(alloc, std.mem.page_size);
     defer tm.deinit();
 
-    const key = "__key__";
-    const item = try KV.init(alloc, key, "__value__");
-    defer alloc.destroy(item);
+    const key = 4;
 
-    try tm.put(key, item.*);
+    try tm.put(key, key);
 
     const actual = try tm.get(key);
 
-    try testing.expectEqualStrings(actual.value, item.value);
-}
-
-fn order(a: u16, b: u16) Order {
-    return std.math.order(a, b);
+    try testing.expectEqual(actual, key);
 }
 
 test "TableMap getEntryByIdx" {

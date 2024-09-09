@@ -238,8 +238,7 @@ test Block {
     const alloc = testing.allocator;
 
     {
-        const expected = try KV.init(alloc, "__key__", "__value__");
-        defer alloc.destroy(expected);
+        const expected = KV.init("__key__", "__value__");
 
         // given
         var block = try Block.init(alloc, PageSize);
@@ -247,7 +246,7 @@ test Block {
         defer block.deinit();
 
         // when
-        const idx = try block.write(expected);
+        const idx = try block.write(&expected);
         const item = try block.read(idx);
 
         // then
@@ -262,15 +261,12 @@ test Block {
         defer alloc.destroy(block);
         defer block.deinit();
 
-        const first_kv = try KV.init(alloc, "__key__", "__value__");
-        defer alloc.destroy(first_kv);
-
-        const last_kv = try KV.init(alloc, "__key_2__", "__value_2__");
-        defer alloc.destroy(last_kv);
+        const first_kv = KV.init("__key__", "__value__");
+        const last_kv = KV.init("__key_2__", "__value_2__");
 
         // when
-        _ = try block.write(first_kv);
-        _ = try block.write(last_kv);
+        _ = try block.write(&first_kv);
+        _ = try block.write(&last_kv);
 
         try block.freeze();
 

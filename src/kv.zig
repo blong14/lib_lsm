@@ -1,8 +1,13 @@
 const std = @import("std");
+const msgpack = @import("msgpack");
 
-const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
+const Payload = msgpack.Payload;
+
+const Endian = std.builtin.Endian.little;
+
+const assert = std.debug.assert;
 
 pub const KV = struct {
     key: []const u8,
@@ -14,20 +19,22 @@ pub const KV = struct {
         OutOfMemory,
     };
 
-    pub fn init(alloc: Allocator, key: []const u8, value: []const u8) !*Self {
-        const kv = try alloc.create(Self);
-        kv.* = .{
+    pub fn init(key: []const u8, value: []const u8) Self {
+        return .{
             .key = key,
             .value = value,
         };
-        return kv;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.* = undefined;
     }
 
     pub fn len(self: Self) u64 {
         return @sizeOf(u64) + self.key.len + @sizeOf(u64) + self.value.len;
     }
 
-    pub fn order(a: []const u8, b: KV) Order {
+    pub fn order(a: []const u8, b: *const KV) Order {
         return std.mem.order(u8, a, b.key);
     }
 
@@ -35,14 +42,14 @@ pub const KV = struct {
         var stream = std.io.fixedBufferStream(data);
         var data_reader = stream.reader();
 
-        const key_len = try data_reader.readInt(u64, std.builtin.Endian.little);
+        const key_len = try data_reader.readInt(u64, Endian);
         assert(key_len > 0);
 
         const key = stream.buffer[stream.pos..][0..key_len];
 
         stream.pos += key_len;
 
-        const value_len = try data_reader.readInt(u64, std.builtin.Endian.little);
+        const value_len = try data_reader.readInt(u64, Endian);
         assert(value_len > 0);
 
         const value = stream.buffer[stream.pos..][0..value_len];
@@ -63,12 +70,19 @@ pub const KV = struct {
         var stream = std.io.fixedBufferStream(buf);
         var data_writer = stream.writer();
 
-        try data_writer.writeInt(u64, self.key.len, std.builtin.Endian.little);
+        try data_writer.writeInt(u64, self.key.len, Endian);
         _ = try data_writer.write(self.key);
-        try data_writer.writeInt(u64, self.value.len, std.builtin.Endian.little);
+        try data_writer.writeInt(u64, self.value.len, Endian);
         _ = try data_writer.write(self.value);
 
         return buf[0..len_];
+    }
+
+    pub fn toPayload(self: Self, alloc: Allocator) !Payload {
+        var out = Payload.mapPayload(alloc);
+        try out.mapPut(self.key, try Payload.strToPayload(self.value, alloc));
+
+        return out;
     }
 };
 
@@ -76,8 +90,7 @@ test "KV encode alloc" {
     const alloc = std.testing.allocator;
 
     // given
-    const kv = try KV.init(alloc, "__key__", "__value__");
-    defer alloc.destroy(kv);
+    const kv = KV.init("__key__", "__value__");
 
     // when
     const str = try kv.encodeAlloc(alloc);
@@ -92,11 +105,8 @@ test "KV encode alloc" {
 }
 
 test "KV encode" {
-    const alloc = std.testing.allocator;
-
     // given
-    const kv = try KV.init(alloc, "__key__", "__value__");
-    defer alloc.destroy(kv);
+    const kv = KV.init("__key__", "__value__");
 
     // when
     var buf: [std.mem.page_size]u8 = undefined;
@@ -111,11 +121,8 @@ test "KV encode" {
 }
 
 test "KV decode" {
-    const alloc = std.testing.allocator;
-
     // given
-    const expected = try KV.init(alloc, "__key__", "__value__");
-    defer alloc.destroy(expected);
+    const expected = KV.init("__key__", "__value__");
 
     const byts = "\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__";
 

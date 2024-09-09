@@ -158,6 +158,20 @@ pub const AppendOnlyMMap = struct {
         return mmap;
     }
 
+    pub fn xconnect(self: *Self, file: std.fs.File, len: u64, offset: u64) !void {
+        const data = try std.posix.mmap(
+            null,
+            len,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .SHARED, .ANONYMOUS = false },
+            file.handle,
+            offset,
+        );
+        self.buf = std.io.fixedBufferStream(data);
+        self.file = file;
+        self.connected = true;
+    }
+
     pub fn connect(self: *Self, file: std.fs.File, offset: u64) !void {
         const data = try std.posix.mmap(
             null,

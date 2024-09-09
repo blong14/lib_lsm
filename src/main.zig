@@ -7,7 +7,7 @@ const mtbl = @import("memtable.zig");
 const options = @import("opts.zig");
 const sst = @import("sstable.zig");
 const tm = @import("tablemap.zig");
-const KV = @import("kv.zig").KV;
+pub const KV = @import("kv.zig").KV;
 
 const io = std.io;
 const testing = std.testing;
@@ -33,7 +33,7 @@ pub const BeginProfile = Profiler.BeginProfile;
 pub const EndProfile = Profiler.EndProfile;
 pub const BlockProfiler = Profiler.BlockProfiler;
 
-fn lessThan(context: void, a: KV, b: KV) Order {
+fn lessThan(context: void, a: *const KV, b: *const KV) Order {
     _ = context;
     return std.mem.order(u8, a.key, b.key);
 }
@@ -85,7 +85,7 @@ pub const Database = struct {
         self.* = undefined;
     }
 
-    fn lookup(self: Self, key: []const u8) !KV {
+    fn lookup(self: Self, key: []const u8) !*const KV {
         if (self.mtable.get(key)) |value| {
             return value;
         }
@@ -100,18 +100,18 @@ pub const Database = struct {
         return error.NotFound;
     }
 
-    pub fn read(self: Self, key: []const u8) !KV {
+    pub fn read(self: Self, key: []const u8) !*const KV {
         return self.lookup(key);
     }
 
     const MergeIterator = struct {
         alloc: Allocator,
         mtbls: std.ArrayList(*Memtable.Iterator),
-        queue: std.PriorityQueue(KV, void, lessThan),
-        v: KV,
+        queue: std.PriorityQueue(*const KV, void, lessThan),
+        v: *const KV,
 
         pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
-            const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
+            const queue = std.PriorityQueue(*const KV, void, lessThan).init(alloc, {});
 
             var iters = std.ArrayList(*Memtable.Iterator).init(alloc);
             for (m.mtables.items) |mtable| {
@@ -138,10 +138,11 @@ pub const Database = struct {
             }
             mi.mtbls.deinit();
             mi.queue.deinit();
-            mi.* = undefined;
+            mi.alloc.destroy(mi);
+            // mi.* = undefined;
         }
 
-        pub fn value(mi: MergeIterator) KV {
+        pub fn value(mi: MergeIterator) *const KV {
             return mi.v;
         }
 
@@ -177,8 +178,6 @@ pub const Database = struct {
         }
 
         const item = try self.kv_pool.create();
-        defer self.kv_pool.destroy(item);
-
         item.*.key = key;
         item.*.value = value;
 
@@ -248,10 +247,11 @@ test "basic functionality with many items" {
     defer db.deinit();
 
     // given
-    var kvs: [3]*KV = undefined;
-    kvs[0] = try KV.init(alloc, "__key_c__", "__value_c__");
-    kvs[1] = try KV.init(alloc, "__key_b__", "__value_b__");
-    kvs[2] = try KV.init(alloc, "__key_a__", "__value_a__");
+    const kvs = [3]KV{
+        KV.init("__key_c__", "__value_c__"),
+        KV.init("__key_b__", "__value_b__"),
+        KV.init("__key_a__", "__value_a__"),
+    };
 
     // when
     for (kvs) |kv| {
