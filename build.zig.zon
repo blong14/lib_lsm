@@ -19,6 +19,10 @@
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.9.1.tar.gz",
             .hash = "122062d301a203d003547b414237229b09a7980095061697349f8bef41be9c30266b",
         },
+        .@"zig-msgpack" = .{
+            .url = "https://github.com/zigcc/zig-msgpack/archive/refs/tags/0.0.5.tar.gz",
+            .hash = "12207ec1296852c17c0424b5e650003bd9a3c4f35e9d0ab586d39ea0ab812c2d9f2c",
+        },
     },
     .paths = .{
         // This makes *all* files, recursively, included in this package. It is generally

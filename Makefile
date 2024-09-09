@@ -1,6 +1,7 @@
 # Executable
 BIN := zig-out/bin
 BUILD_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
+DATA_DIR := .tmp/data
 EXEC := zig-out/bin/lsm
 SOURCES := $(wildcard ./src/*.zig)
 
@@ -8,6 +9,7 @@ SOURCES := $(wildcard ./src/*.zig)
 # sudo apt install libzmq5-dev
 # zig fetch --global-cache-dir zig-cache --save=zzmq 'https://github.com/nine-lives-later/zzmq/archive/refs/tags/v0.2.2-zig0.12.tar.gz'
 # zig fetch --global-cache-dir zig-cache --save 'https://github.com/Hejsil/zig-clap/archive/refs/tags/0.9.1.tar.gz'
+# zig fetch --global-cache-dir zig-cache --save 'https://github.com/zigcc/zig-msgpack/archive/refs/tags/0.0.5.tar.gz'
 
 .PHONY: clean test
 
@@ -23,28 +25,27 @@ fmt: $(SOURCES)
 build: fmt
 	@zig build $(BUILD_OPTS)
 
-run: fmt
-	@zig build run-lsm -- --input small.csv 
+run: clean fmt
+	@zig build run-lsm -- --data_dir $(DATA_DIR) --input small.csv 
 
 profile: clean build
-	$(EXEC) --data_dir data --input trips.txt --sst_capacity 256_000 
+	$(EXEC) --data_dir $(DATA_DIR) --input trips.txt --sst_capacity 256_000 
 
 clean:
-	rm -f $(BIN)/* callgrind.o massif.o data/*.dat
+	rm -rf $(BIN)/* callgrind.o massif.o $(DATA_DIR)/*.dat $(DATA_DIR)/data*/* 
 
 test: $(SOURCES)
 	@zig build test --summary all
 
 poop: $(EXEC)
-	./bin/poop './$(EXEC) --input ./trips.txt --sst_capacity 128_000' \
-		'./$(EXEC) --input ./trips.txt --sst_capacity 256_000' \
-		'./$(EXEC) --input ./trips.txt --sst_capacity 512_000' \
-		'./$(EXEC) --input ./trips.txt --sst_capacity 1_024_000'
+	./bin/poop \
+		'./$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./trips.txt --sst_capacity 256_000' \
+		'./$(EXEC) --data_dir ./.tmp/data/data2 --mode multithreaded --input ./trips.txt --sst_capacity 256_000'
 
 callgrind.o: $(EXEC)
 	# kcachegrind
-	valgrind --tool=callgrind --callgrind-out-file=$@ ./$(EXEC)
+	valgrind --tool=callgrind --callgrind-out-file=$@ ./$(EXEC) --data_dir $(DATA_DIR)
 
 massif.o: $(EXEC)
 	# ms_print
-	valgrind --tool=massif --time-unit=B --massif-out-file=$@ ./$(EXEC)
+	valgrind --tool=massif --time-unit=B --massif-out-file=$@ ./$(EXEC) --data_dir $(DATA_DIR)
