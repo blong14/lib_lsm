@@ -34,8 +34,8 @@ pub const KV = struct {
         return @sizeOf(u64) + self.key.len + @sizeOf(u64) + self.value.len;
     }
 
-    pub fn order(a: []const u8, b: *const KV) Order {
-        return std.mem.order(u8, a, b.key);
+    pub fn order(a: []const u8, b: []const u8) Order {
+        return std.mem.order(u8, a, b);
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {

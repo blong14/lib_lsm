@@ -19,7 +19,7 @@ const print = std.debug.print;
 pub const Memtable = struct {
     const Self = @This();
 
-    const KVTableMap = TableMap([]const u8, *const KV, KV.order);
+    const KVTableMap = TableMap([]const u8, KV, KV.order);
 
     const Error = error{
         Full,
@@ -53,7 +53,7 @@ pub const Memtable = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.data.deinit();
+        self.data.deinit(self.alloc);
         if (self.*.sstable) |sstbl| {
             sstbl.deinit();
             self.alloc.destroy(sstbl);
@@ -65,7 +65,7 @@ pub const Memtable = struct {
         return self.id;
     }
 
-    pub fn put(self: *Self, item: *const KV) !void {
+    pub fn put(self: *Self, item: KV) !void {
         if (!self.mutable) {
             return error.Full;
         }
@@ -73,7 +73,7 @@ pub const Memtable = struct {
         self.byte_count += item.len();
     }
 
-    pub fn get(self: Self, key: []const u8) ?*const KV {
+    pub fn get(self: Self, key: []const u8) ?KV {
         return self.data.get(key) catch return null;
     }
 
@@ -89,9 +89,9 @@ pub const Memtable = struct {
         data: KVTableMap,
         idx: usize,
         start_idx: usize,
-        v: *const KV,
+        v: KV,
 
-        pub fn value(it: Iterator) *const KV {
+        pub fn value(it: Iterator) KV {
             return it.v;
         }
 
@@ -188,7 +188,7 @@ test Memtable {
     // when
     const kv = KV.init("__key__", "__value__");
 
-    try mtable.put(&kv);
+    try mtable.put(kv);
     const actual = mtable.get(kv.key);
 
     // then

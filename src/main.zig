@@ -33,7 +33,7 @@ pub const BeginProfile = Profiler.BeginProfile;
 pub const EndProfile = Profiler.EndProfile;
 pub const BlockProfiler = Profiler.BlockProfiler;
 
-fn lessThan(context: void, a: *const KV, b: *const KV) Order {
+fn lessThan(context: void, a: KV, b: KV) Order {
     _ = context;
     return std.mem.order(u8, a.key, b.key);
 }
@@ -85,7 +85,7 @@ pub const Database = struct {
         self.* = undefined;
     }
 
-    fn lookup(self: Self, key: []const u8) !*const KV {
+    fn lookup(self: Self, key: []const u8) !KV {
         if (self.mtable.get(key)) |value| {
             return value;
         }
@@ -100,18 +100,18 @@ pub const Database = struct {
         return error.NotFound;
     }
 
-    pub fn read(self: Self, key: []const u8) !*const KV {
+    pub fn read(self: Self, key: []const u8) !KV {
         return self.lookup(key);
     }
 
     const MergeIterator = struct {
         alloc: Allocator,
         mtbls: std.ArrayList(*Memtable.Iterator),
-        queue: std.PriorityQueue(*const KV, void, lessThan),
-        v: *const KV,
+        queue: std.PriorityQueue(KV, void, lessThan),
+        v: KV,
 
         pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
-            const queue = std.PriorityQueue(*const KV, void, lessThan).init(alloc, {});
+            const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
 
             var iters = std.ArrayList(*Memtable.Iterator).init(alloc);
             for (m.mtables.items) |mtable| {
@@ -142,7 +142,7 @@ pub const Database = struct {
             // mi.* = undefined;
         }
 
-        pub fn value(mi: MergeIterator) *const KV {
+        pub fn value(mi: MergeIterator) KV {
             return mi.v;
         }
 
@@ -177,9 +177,10 @@ pub const Database = struct {
             return error.WriteError;
         }
 
-        const item = try self.kv_pool.create();
-        item.*.key = key;
-        item.*.value = value;
+        const item = KV.init(key, value);
+        //const item = try self.kv_pool.create();
+        //item.*.key = key;
+        //item.*.value = value;
 
         if ((self.mtable.size() + item.len()) >= self.capacity) {
             try self.flush();

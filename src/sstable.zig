@@ -48,6 +48,11 @@ pub const SSTable = struct {
         WriteError,
     };
 
+    const State = enum {
+        immutable,
+        mutable,
+    };
+
     pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
         const block = try Block.init(alloc, opts.sst_capacity);
         const st = try alloc.create(Self);
@@ -115,7 +120,7 @@ pub const SSTable = struct {
         };
     }
 
-    pub fn write(self: *Self, value: *const KV) !usize {
+    pub fn write(self: *Self, value: KV) !usize {
         if (self.mutable) {
             if (self.index.getKey(value.key)) |key| {
                 print(
@@ -213,7 +218,7 @@ test SSTable {
     const expected = "__value__";
     const kv = KV.init("__key__", expected);
 
-    _ = try st.write(&kv);
+    _ = try st.write(kv);
     _ = try st.flush();
 
     var actual: KV = undefined;

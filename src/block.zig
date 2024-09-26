@@ -133,7 +133,7 @@ pub const Block = struct {
         return kv;
     }
 
-    pub fn write(self: *Self, kv: *const KV) !usize {
+    pub fn write(self: *Self, kv: KV) !usize {
         var offset_data_writer = self.offset_data.writer();
 
         const offset = self.data.items.len;
@@ -246,7 +246,7 @@ test Block {
         defer block.deinit();
 
         // when
-        const idx = try block.write(&expected);
+        const idx = try block.write(expected);
         const item = try block.read(idx);
 
         // then
@@ -265,8 +265,8 @@ test Block {
         const last_kv = KV.init("__key_2__", "__value_2__");
 
         // when
-        _ = try block.write(&first_kv);
-        _ = try block.write(&last_kv);
+        _ = try block.write(first_kv);
+        _ = try block.write(last_kv);
 
         try block.freeze();
 
