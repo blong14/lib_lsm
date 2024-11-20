@@ -16,8 +16,15 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    // Add lib specific deps
+    const msgpack = b.dependency("zig-msgpack", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Add custom modules so they can be referenced from our test directory
     const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/main.zig") });
+    lsm.addImport("msgpack", msgpack.module("msgpack"));
 
     // Main library build definition
     {
@@ -29,6 +36,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+
+        lib.root_module.addImport("msgpack", msgpack.module("msgpack"));
 
         // This declares intent for the library to be installed into the standard
         // location when the user invokes the "install" step (the default step when
@@ -43,6 +52,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        main_tests.root_module.addImport("msgpack", msgpack.module("msgpack"));
+
         main_tests.linkLibC();
         const run_main_tests = b.addRunArtifact(main_tests);
 
@@ -54,23 +65,11 @@ pub fn build(b: *std.Build) void {
     }
 
     // Integration tests
-    //
-    // TODO: combine into single executable
-
-    // no concurrency
     {
         const exe = cmds.buildLsm(b, target, optimize);
         const clap = b.dependency("clap", .{});
         exe.root_module.addImport("clap", clap.module("clap"));
-        exe.root_module.addImport("lsm", lsm);
-        exe.linkLibC();
-    }
-
-    // IPC based concurrency with SystemV
-    {
-        const exe = cmds.buildSystemV(b, target, optimize);
-        const clap = b.dependency("clap", .{});
-        exe.root_module.addImport("clap", clap.module("clap"));
+        exe.root_module.addImport("msgpack", msgpack.module("msgpack"));
         exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();
     }

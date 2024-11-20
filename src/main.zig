@@ -7,7 +7,7 @@ const mtbl = @import("memtable.zig");
 const options = @import("opts.zig");
 const sst = @import("sstable.zig");
 const tm = @import("tablemap.zig");
-const KV = @import("kv.zig").KV;
+pub const KV = @import("kv.zig").KV;
 
 const io = std.io;
 const testing = std.testing;
@@ -24,6 +24,7 @@ const WAL = log.WAL;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
 pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
+pub const ThreadMessageQueue = @import("msgqueue.zig").ThreadMessageQueue;
 pub const Opts = options.Opts;
 pub const defaultOpts = options.defaultOpts;
 pub const withDataDirOpts = options.withDataDirOpts;
@@ -68,12 +69,6 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.flush() catch |err| {
-            std.debug.print(
-                "db flush error {s}\n",
-                .{@errorName(err)},
-            );
-        };
         for (self.mtables.items) |mtable| {
             mtable.deinit();
             self.alloc.destroy(mtable);
@@ -138,7 +133,8 @@ pub const Database = struct {
             }
             mi.mtbls.deinit();
             mi.queue.deinit();
-            mi.* = undefined;
+            mi.alloc.destroy(mi);
+            // mi.* = undefined;
         }
 
         pub fn value(mi: MergeIterator) KV {
@@ -176,11 +172,10 @@ pub const Database = struct {
             return error.WriteError;
         }
 
-        const item = try self.kv_pool.create();
-        defer self.kv_pool.destroy(item);
-
-        item.*.key = key;
-        item.*.value = value;
+        const item = KV.init(key, value);
+        //const item = try self.kv_pool.create();
+        //item.*.key = key;
+        //item.*.value = value;
 
         if ((self.mtable.size() + item.len()) >= self.capacity) {
             try self.flush();
@@ -248,10 +243,11 @@ test "basic functionality with many items" {
     defer db.deinit();
 
     // given
-    var kvs: [3]*KV = undefined;
-    kvs[0] = try KV.init(alloc, "__key_c__", "__value_c__");
-    kvs[1] = try KV.init(alloc, "__key_b__", "__value_b__");
-    kvs[2] = try KV.init(alloc, "__key_a__", "__value_a__");
+    const kvs = [3]KV{
+        KV.init("__key_c__", "__value_c__"),
+        KV.init("__key_b__", "__value_b__"),
+        KV.init("__key_a__", "__value_a__"),
+    };
 
     // when
     for (kvs) |kv| {

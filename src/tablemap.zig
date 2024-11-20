@@ -6,7 +6,7 @@ const Order = std.math.Order;
 pub fn TableMap(
     comptime K: type,
     comptime V: type,
-    comptime compareFn: fn (a: K, b: V) Order,
+    comptime compareFn: fn (a: K, b: K) Order,
 ) type {
     return struct {
         const Self = @This();
@@ -17,21 +17,25 @@ pub fn TableMap(
             OutOfMemory,
         };
 
-        const MapEntryTable = std.ArrayList(V);
+        const Entry = struct {
+            key: K,
+            value: V,
+        };
 
         cap: usize,
-        impl: MapEntryTable,
+        ximpl: std.MultiArrayList(Entry),
 
         pub fn init(alloc: Allocator, capacity: usize) !Self {
-            const impl = try MapEntryTable.initCapacity(alloc, capacity);
+            var ximpl = std.MultiArrayList(Entry){};
+            try ximpl.ensureTotalCapacity(alloc, capacity);
             return .{
                 .cap = capacity,
-                .impl = impl,
+                .ximpl = ximpl,
             };
         }
 
-        pub fn deinit(self: *Self) void {
-            self.impl.deinit();
+        pub fn deinit(self: *Self, alloc: Allocator) void {
+            self.ximpl.deinit(alloc);
         }
 
         pub fn findIndex(self: Self, key: K, low: usize, high: usize) usize {
@@ -39,7 +43,7 @@ pub fn TableMap(
             var end = high;
             while (start < end) {
                 const mid: usize = start + (end - start) / 2;
-                const current_item = self.impl.items[mid];
+                const current_item = self.ximpl.items(.key)[mid];
                 switch (compareFn(key, current_item)) {
                     .lt => end = mid,
                     .gt => start = mid + 1,
@@ -50,17 +54,17 @@ pub fn TableMap(
         }
 
         inline fn equalto(self: Self, key: K, idx: usize) bool {
-            const entry = self.impl.items[idx];
-            return compareFn(key, entry) == .eq;
+            const entry = self.ximpl.get(idx);
+            return compareFn(key, entry.key) == .eq;
         }
 
         inline fn greaterthan(self: Self, key: K, idx: usize) bool {
-            const entry = self.impl.items[idx];
-            return compareFn(key, entry) == .gt;
+            const entry = self.ximpl.get(idx);
+            return compareFn(key, entry.key) == .gt;
         }
 
         pub fn count(self: Self) usize {
-            return self.impl.items.len;
+            return self.ximpl.items(.key).len;
         }
 
         pub fn getEntryByIdx(self: Self, idx: usize) TableMapError!V {
@@ -68,7 +72,8 @@ pub fn TableMap(
             if (idx >= cnt) {
                 return TableMapError.NotFound;
             }
-            return self.impl.items[idx];
+
+            return self.ximpl.get(idx).value;
         }
 
         pub fn get(self: Self, key: K) TableMapError!V {
@@ -76,49 +81,67 @@ pub fn TableMap(
             if (cnt == 0) {
                 return TableMapError.NotFound;
             }
+
             const idx = self.findIndex(key, 0, cnt - 1);
             if ((idx == cnt) or !self.equalto(key, idx)) {
                 return TableMapError.NotFound;
             }
-            return self.impl.items[idx];
+
+            return self.ximpl.get(idx).value;
         }
 
         pub fn put(self: *Self, key: K, value: V) TableMapError!void {
             const cnt: usize = self.count();
             if (cnt == self.cap) {
                 return TableMapError.OutOfMemory;
+            } else if ((cnt == 0) or (self.greaterthan(key, cnt - 1))) {
+                self.ximpl.appendAssumeCapacity(Entry{ .key = key, .value = value });
+                return;
             }
-            if ((cnt == 0) or (self.greaterthan(key, cnt - 1))) {
-                return self.impl.appendAssumeCapacity(value);
-            }
+
             const idx = self.findIndex(key, 0, cnt - 1);
-            self.impl.insertAssumeCapacity(idx, value);
+            if (self.equalto(key, idx)) {
+                self.ximpl.set(idx, Entry{ .key = key, .value = value });
+            } else {
+                self.ximpl.insertAssumeCapacity(idx, Entry{ .key = key, .value = value });
+            }
+
+            return;
         }
     };
 }
 
-test TableMap {
-    const KV = @import("kv.zig").KV;
+fn order(a: u16, b: u16) Order {
+    return std.math.order(a, b);
+}
 
+test TableMap {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var tm = try TableMap([]const u8, KV, KV.order).init(alloc, std.mem.page_size);
-    defer tm.deinit();
+    var tm = try TableMap(u16, u16, order).init(alloc, std.mem.page_size);
+    defer tm.deinit(alloc);
 
-    const key = "__key__";
-    const item = try KV.init(alloc, key, "__value__");
-    defer alloc.destroy(item);
+    const key = 4;
 
-    try tm.put(key, item.*);
+    {
+        try tm.put(key, key);
 
-    const actual = try tm.get(key);
+        const actual = try tm.get(key);
 
-    try testing.expectEqualStrings(actual.value, item.value);
-}
+        try testing.expectEqual(actual, key);
+    }
 
-fn order(a: u16, b: u16) Order {
-    return std.math.order(a, b);
+    {
+        const expected = 5;
+
+        try tm.put(key, expected);
+
+        const actual = try tm.get(key);
+
+        try testing.expectEqual(tm.count(), 1);
+        try testing.expectEqual(actual, expected);
+    }
 }
 
 test "TableMap getEntryByIdx" {
@@ -128,7 +151,7 @@ test "TableMap getEntryByIdx" {
     const cap = 4;
 
     var tm = try TableMap(u16, u16, order).init(alloc, cap);
-    defer tm.deinit();
+    defer tm.deinit(alloc);
 
     const keys = [4]u16{ 4, 3, 2, 1 };
     for (keys) |key| {
