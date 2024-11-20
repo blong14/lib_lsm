@@ -24,6 +24,7 @@ const WAL = log.WAL;
 
 pub const CSV = CsvTokenizer(std.fs.File.Reader);
 pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
+pub const ThreadMessageQueue = @import("msgqueue.zig").ThreadMessageQueue;
 pub const Opts = options.Opts;
 pub const defaultOpts = options.defaultOpts;
 pub const withDataDirOpts = options.withDataDirOpts;
@@ -68,12 +69,6 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.flush() catch |err| {
-            std.debug.print(
-                "db flush error {s}\n",
-                .{@errorName(err)},
-            );
-        };
         for (self.mtables.items) |mtable| {
             mtable.deinit();
             self.alloc.destroy(mtable);

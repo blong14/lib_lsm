@@ -60,7 +60,8 @@ pub const KV = struct {
 
     pub fn encodeAlloc(self: Self, alloc: Allocator) ![]const u8 {
         const buf = try alloc.alloc(u8, self.len());
-        return try self.encode(buf);
+        const data = try self.encode(buf);
+        return data;
     }
 
     pub fn encode(self: Self, buf: []u8) ![]u8 {
