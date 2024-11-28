@@ -26,10 +26,10 @@ build: fmt
 	@zig build $(BUILD_OPTS)
 
 run: clean fmt
-	@zig build run-lsm -- --mode multithreaded --data_dir $(DATA_DIR) --input people-100.csv --sst_capacity 256_000 
+	zig build run-lsm -- --data_dir $(DATA_DIR) --mode singlethreaded --sst_capacity 256_000 
 
 profile: clean build
-	$(EXEC) --data_dir $(DATA_DIR) --mode singlethreaded --input trips.txt --sst_capacity 256_000 
+	$(EXEC) --data_dir $(DATA_DIR) --mode singlethreaded --input measurements.txt --sst_capacity 500_000 
 
 clean:
 	rm -rf $(BIN)/* callgrind.o massif.o $(DATA_DIR)/*.dat $(DATA_DIR)/data*/* 
@@ -37,10 +37,10 @@ clean:
 test: $(SOURCES)
 	@zig build test --summary all
 
-poop: $(EXEC)
-	./bin/poop './$(EXEC) --data_dir ./.tmp/data/data2 --mode multithreaded --input ./trips.txt --sst_capacity 256_000'
-		#'./$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./trips.txt --sst_capacity 256_000' \
-		#'./$(EXEC) --data_dir ./.tmp/data/data3 --mode multiprocess --input ./trips.txt --sst_capacity 256_000'
+poop: clean build 
+	./bin/poop './$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./measurements.txt --sst_capacity 500_000' \
+		'./$(EXEC) --data_dir ./.tmp/data/data2 --mode multithreaded --input ./measurements.txt --sst_capacity 500_000' \
+		'./$(EXEC) --data_dir ./.tmp/data/data3 --mode multiprocess --input ./measurements.txt --sst_capacity 500_000' \
 
 callgrind.o: $(EXEC)
 	# kcachegrind
