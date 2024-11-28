@@ -62,7 +62,7 @@ pub fn main() !void {
     const sst_capacity = res.args.sst_capacity orelse default_opts.sst_capacity;
     const wal_capacity = default_opts.wal_capacity;
 
-    const input = res.args.input orelse "trips.txt";
+    const input = res.args.input orelse "measurements.txt";
     const mode = res.args.mode orelse Mode.singlethreaded;
 
     const alloc = gpa.allocator();
@@ -119,35 +119,27 @@ const SingleThreadedImpl = struct {
     pub fn run(input: []const u8) anyerror!void {
         defer self.deinit();
 
-        lsm.BeginProfile(self.alloc);
+        var arena = heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+
+        const allocator = arena.allocator();
+
+        lsm.BeginProfile(allocator);
         defer lsm.EndProfile();
 
-        var rows = try std.ArrayList(KV).initCapacity(self.alloc, 500_000);
-        defer rows.deinit();
-
-        try parse(input, &rows);
-
-        write(&rows);
-
-        // read();
+        try parse(allocator, input);
     }
 
-    fn parse(input: []const u8, out: *std.ArrayList(KV)) !void {
-        // var timer = lsm.BlockProfiler.start("parse");
-        // defer timer.end();
-
+    fn parse(alloc: Allocator, input: []const u8) !void {
         const file = fs.cwd().openFile(input, .{}) catch |err| {
             debug.print("open file error {s}\n", .{@errorName(err)});
             return err;
         };
         defer file.close();
 
-        // const stat = try file.stat();
-        // timer.withBytes(stat.size);
-
         var buffer = [_]u8{0} ** mem.page_size;
         const fileReader = file.reader();
-        var csv_file = lsm.CSV.init(fileReader, &buffer, .{}) catch |err| {
+        var csv_file = lsm.CSV.init(fileReader, &buffer, .{ .col_sep = ';' }) catch |err| {
             debug.print("csv file error {s}\n", .{@errorName(err)});
             return err;
         };
@@ -169,37 +161,36 @@ const SingleThreadedImpl = struct {
                     idx += 1;
                 },
                 .row_end => {
+                    const key = try alloc.alloc(u8, row[0].len);
+                    mem.copyForwards(u8, key, row[0]);
+
+                    const value = try alloc.alloc(u8, row[1].len);
+                    mem.copyForwards(u8, value, row[1]);
+
+                    self.db.write(key, value) catch |err| {
+                        debug.print(
+                            "database write error: key {s} value {s} error {s}\n",
+                            .{ key, value, @errorName(err) },
+                        );
+                        return;
+                    };
+
                     idx = 0;
-                    out.appendAssumeCapacity(KV.init(row[0], row[1]));
                     row = [2][]const u8{ undefined, undefined };
                 },
             }
         }
-    }
 
-    fn write(input: *const std.ArrayList(KV)) void {
-        // var timer = lsm.BlockProfiler.start("write");
-        // defer timer.end();
-
-        var bytes: u64 = 0;
-        for (input.items) |row| {
-            self.db.write(row.key, row.value) catch |err| {
-                debug.print(
-                    "database write error: key {s} value {s} error {s}\n",
-                    .{ row.key, row.value, @errorName(err) },
-                );
-                return;
-            };
-            bytes += row.key.len + row.value.len;
-        }
-
-        // timer.withBytes(bytes);
+        self.db.flush() catch |err| {
+            debug.print(
+                "not able to flush database error {s}\n",
+                .{@errorName(err)},
+            );
+            return;
+        };
     }
 
     fn read() void {
-        // var timer = lsm.BlockProfiler.start("read");
-        // defer timer.end();
-
         var iter = self.db.iterator() catch |err| {
             debug.print(
                 "database iter err: {s}\n",
@@ -244,8 +235,12 @@ const MultiThreadedImpl = struct {
     }
 
     const Reader = struct {
-        pub fn publish(input: []const u8, outbox: *lsm.ThreadMessageQueue([]const u8).Writer) void {
-            const file = std.fs.cwd().openFile(input, .{}) catch |err| {
+        pub fn publish(
+            alloc: Allocator,
+            input: []const u8,
+            outbox: *lsm.ThreadMessageQueue([]const u8).Writer,
+        ) void {
+            const file = fs.cwd().openFile(input, .{}) catch |err| {
                 debug.print(
                     "not able to open file {s}\n",
                     .{@errorName(err)},
@@ -256,20 +251,12 @@ const MultiThreadedImpl = struct {
 
             const fileReader = file.reader();
             var buffer = [_]u8{0} ** mem.page_size;
-            var csv_file = lsm.CSV.init(fileReader, &buffer, .{}) catch |err| {
+            var csv_file = lsm.CSV.init(fileReader, &buffer, .{ .col_sep = ';' }) catch |err| {
                 debug.print("publish error {s}\n", .{@errorName(err)});
                 return;
             };
 
-            var gpa = heap.GeneralPurposeAllocator(.{}){};
-            const alloc = gpa.allocator();
-
-            var arena = heap.ArenaAllocator.init(alloc);
-            // defer arena.deinit();
-
-            const allocator = arena.allocator();
-
-            var kvs = std.ArrayList([]const u8).init(allocator);
+            var kvs = std.ArrayList([]const u8).init(alloc);
             defer kvs.deinit();
 
             var count: usize = 0;
@@ -286,14 +273,13 @@ const MultiThreadedImpl = struct {
                     .row_end => {
                         const item = KV.init(row[0], row[1]);
 
-                        const data = item.encodeAlloc(allocator) catch return;
-
+                        const data = item.encodeAlloc(alloc) catch return;
                         kvs.append(data) catch |e| {
-                            std.debug.print("{s}\n", .{@errorName(e)});
+                            debug.print("{s}\n", .{@errorName(e)});
                             return;
                         };
 
-                        if (kvs.items.len >= std.mem.page_size) {
+                        if (kvs.items.len >= mem.page_size) {
                             for (kvs.items) |d| {
                                 const msg = d;
                                 outbox.publish(msg) catch |err| {
@@ -372,17 +358,25 @@ const MultiThreadedImpl = struct {
     };
 
     pub fn run(input: []const u8) !void {
-        // defer self.alloc.destroy(self);
         defer self.deinit();
 
-        lsm.BeginProfile(self.alloc);
+        var arena = heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+
+        const allocator = arena.allocator();
+
+        lsm.BeginProfile(allocator);
         defer lsm.EndProfile();
 
         var mailbox = try lsm.ThreadMessageQueue([]const u8).init(self.alloc);
         defer self.alloc.destroy(mailbox);
         defer mailbox.deinit();
 
-        const publisher = try std.Thread.spawn(.{}, Reader.publish, .{ input, @constCast(&mailbox.publisher()) });
+        const publisher = try std.Thread.spawn(.{}, Reader.publish, .{
+            allocator,
+            input,
+            @constCast(&mailbox.publisher()),
+        });
 
         var reader = mailbox.subscribe();
         defer reader.deinit();
@@ -417,16 +411,16 @@ const MultiProcessImpl = struct {
     pub fn run(input: []const u8) !void {
         defer self.deinit();
 
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const galloc = gpa.allocator();
+        var arena = heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
 
-        var mailbox = try lsm.MessageQueue([]const u8).init(galloc, ".");
-        defer galloc.destroy(mailbox);
+        const allocator = arena.allocator();
+
+        var mailbox = try lsm.MessageQueue([]const u8).init(allocator, ".");
         defer mailbox.deinit();
 
         const reader = try std.Thread.spawn(.{}, struct {
-            pub fn consume(opts: lsm.Opts, inbox: lsm.MessageQueue([]const u8).ReadIter) void {
+            pub fn consume(opts: lsm.Opts, inbox: *const lsm.MessageQueue([]const u8).ReadIter) void {
                 const db = lsm.databaseFromOpts(heap.c_allocator, opts) catch |err| {
                     debug.print(
                         "database init error {s}\n",
@@ -465,12 +459,12 @@ const MultiProcessImpl = struct {
                     return;
                 };
             }
-        }.consume, .{ self.opts, mailbox.subscribe() });
+        }.consume, .{ self.opts, &mailbox.subscribe() });
 
         const writer = mailbox.publisher();
 
-        const file = std.fs.cwd().openFile(input, .{}) catch |err| {
-            std.debug.print(
+        const file = fs.cwd().openFile(input, .{}) catch |err| {
+            debug.print(
                 "not able to open file {s}\n",
                 .{@errorName(err)},
             );
@@ -479,13 +473,13 @@ const MultiProcessImpl = struct {
         defer file.close();
 
         const fileReader = file.reader();
-        var buffer = [_]u8{0} ** std.mem.page_size;
-        var csv_file = lsm.CSV.init(fileReader, &buffer, .{}) catch |err| {
-            std.debug.print("publish error {s}\n", .{@errorName(err)});
+        var buffer = [_]u8{0} ** mem.page_size;
+        var csv_file = lsm.CSV.init(fileReader, &buffer, .{ .col_sep = ';' }) catch |err| {
+            debug.print("publish error {s}\n", .{@errorName(err)});
             return;
         };
 
-        var out = try std.ArrayList([]const u8).initCapacity(galloc, std.mem.page_size);
+        var out = std.ArrayList([]const u8).init(allocator);
         defer out.deinit();
 
         var count: usize = 0;
@@ -502,24 +496,20 @@ const MultiProcessImpl = struct {
                 .row_end => {
                     const item = KV.init(row[0], row[1]);
 
-                    var buf: [std.mem.page_size]u8 = undefined;
-                    const data = item.encode(&buf) catch |err| {
-                        debug.print("{s}\n", .{@errorName(err)});
-                        return;
-                    };
-
+                    const data = item.encodeAlloc(allocator) catch return;
                     out.append(data) catch |err| {
-                        std.debug.print(
+                        debug.print(
                             "{s}\n",
                             .{@errorName(err)},
                         );
                         return;
                     };
 
-                    if (out.items.len >= std.mem.page_size) {
+                    if (out.items.len >= mem.page_size) {
                         for (out.items) |i| {
-                            writer.publish(i) catch |err| {
-                                std.debug.print(
+                            const msg = i;
+                            writer.publish(msg) catch |err| {
+                                debug.print(
                                     "error publishing row {s}\n",
                                     .{@errorName(err)},
                                 );
@@ -537,8 +527,9 @@ const MultiProcessImpl = struct {
 
         if (out.items.len > 0) {
             for (out.items) |i| {
-                writer.publish(i) catch |err| {
-                    std.debug.print(
+                const msg = i;
+                writer.publish(msg) catch |err| {
+                    debug.print(
                         "error publishing row {s}\n",
                         .{@errorName(err)},
                     );

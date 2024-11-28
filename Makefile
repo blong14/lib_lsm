@@ -29,7 +29,7 @@ run: clean fmt
 	zig build run-lsm -- --data_dir $(DATA_DIR) --mode singlethreaded --sst_capacity 256_000 
 
 profile: clean build
-	$(EXEC) --data_dir $(DATA_DIR) --mode singlethreaded --input measurements.txt --sst_capacity 500_000 
+	$(EXEC) --data_dir $(DATA_DIR) --mode multithreaded --input measurements.txt --sst_capacity 500_000 
 
 clean:
 	rm -rf $(BIN)/* callgrind.o massif.o $(DATA_DIR)/*.dat $(DATA_DIR)/data*/* 
