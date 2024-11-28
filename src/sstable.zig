@@ -122,13 +122,13 @@ pub const SSTable = struct {
 
     pub fn write(self: *Self, value: KV) !usize {
         if (self.mutable) {
-            if (self.index.getKey(value.key)) |key| {
-                print(
-                    "not able to write to sstable for key {s}\n",
-                    .{key},
-                );
-                return Error.WriteError;
-            }
+            //if (self.index.getKey(value.key)) |key| {
+            //    print(
+            //        "not able to write to sstable for key {s}\n",
+            //        .{key},
+            //    );
+            //    return Error.WriteError;
+            //}
 
             const idx = self.block.write(value) catch |err| {
                 print(
