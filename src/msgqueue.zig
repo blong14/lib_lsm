@@ -21,141 +21,137 @@ const EOQ = 2;
 /// `ProcessMessageQueue` is a System V message queue wrapper.
 /// The calling process must have write permission on the message queue
 /// in order to send a message, and read permission to receive a message.
-pub fn ProcessMessageQueue(comptime T: type) type {
-    return struct {
-        alloc: Allocator,
-        msgsize: usize,
+pub const ProcessMessageQueue = struct {
+    alloc: Allocator,
+    msqid: c_int,
+    msqproj: c_int,
+    msqtype: c_long,
+
+    const Self = @This();
+
+    const MessageQueueError = error{
+        EOQ, // queue has been closed
+        OutOfMemory,
+        ReadError,
+        WriteError,
+    };
+
+    const Message = struct {
+        mtype: c_long,
+        mdata: []const u8,
+    };
+
+    /// Creates a `ProcessMessageQueue` with msqid derived from the given file path.
+    pub fn init(alloc: Allocator, path: [*c]const u8) MessageQueueError!*Self {
+        const msqproj = 1;
+        const key = sys.ftok(path, msqproj);
+        if (key == -1) {
+            c.perror("unable to create msqid");
+            return MessageQueueError.ReadError;
+        }
+
+        const msqid = sys.msgget(key, 0o666 | sys.IPC_CREAT);
+        if (msqid == -1) {
+            c.perror("unable to get message queue");
+            return MessageQueueError.WriteError;
+        }
+
+        const msgq = try alloc.create(Self);
+        msgq.* = .{
+            .alloc = alloc,
+            .msqid = msqid,
+            .msqproj = msqproj,
+            .msqtype = 1,
+        };
+        return msgq;
+    }
+
+    /// Remove the message queue
+    pub fn deinit(self: *Self) void {
+        if (sys.msgctl(self.msqid, sys.IPC_RMID, null) == -1) {
+            c.perror("unable to destroy message queue");
+        }
+        self.* = undefined;
+    }
+
+    /// Reader consumes messages off the queue.
+    /// The reader is active until there is an error
+    /// or the `Done` message is consumed.
+    pub const ReadIter = struct {
         msqid: c_int,
-        msqproj: c_int,
-        msqtype: c_long,
+        msgsize: usize,
 
-        const Self = @This();
-
-        const MessageQueueError = error{
-            EOQ, // queue has been closed
-            OutOfMemory,
-            ReadError,
-            WriteError,
-        };
-
-        const Message = struct {
-            mtype: c_long,
-            mdata: T,
-        };
-
-        /// Creates a `ProcessMessageQueue` with msqid derived from the given file path.
-        pub fn init(alloc: Allocator, path: [*c]const u8) MessageQueueError!*Self {
-            const msqproj = 1;
-            const key = sys.ftok(path, msqproj);
-            if (key == -1) {
-                c.perror("unable to create msqid");
-                return MessageQueueError.ReadError;
-            }
-
-            const msqid = sys.msgget(key, 0o666 | sys.IPC_CREAT);
-            if (msqid == -1) {
-                c.perror("unable to get message queue");
-                return MessageQueueError.WriteError;
-            }
-
-            const msgq = try alloc.create(Self);
-            msgq.* = .{
-                .alloc = alloc,
-                .msgsize = @sizeOf(T),
-                .msqid = msqid,
-                .msqproj = msqproj,
-                .msqtype = 1,
-            };
-            return msgq;
-        }
-
-        /// Remove the message queue
-        pub fn deinit(self: *Self) void {
-            if (sys.msgctl(self.*.msqid, sys.IPC_RMID, null) == -1) {
-                c.perror("unable to destroy message queue");
-            }
-            self.* = undefined;
-        }
-
-        /// Reader consumes messages off the queue.
-        /// The reader is active until there is an error
-        /// or the `Done` message is consumed.
-        pub const ReadIter = struct {
-            msqid: c_int,
-            msgsize: usize,
-
-            /// Consumes the next element from the queue and returns it.
-            /// returns null when done reading.
-            pub fn next(self: ReadIter) ?T {
-                var buf: Message = undefined;
-                switch (errno(sys.msgrcv(self.msqid, &buf, self.msgsize, 0, 0))) {
-                    .SUCCESS => {
-                        if (buf.mtype == EOQ) {
-                            return null;
-                        }
-                        return buf.mdata;
-                    },
-                    else => {
-                        c.perror("unable to read message");
+        /// Consumes the next element from the queue and returns it.
+        /// returns null when done reading.
+        pub fn next(self: ReadIter) ?[]const u8 {
+            var buf: Message = undefined;
+            switch (errno(sys.msgrcv(self.msqid, &buf, self.msgsize, 0, 0))) {
+                .SUCCESS => {
+                    if (buf.mtype == EOQ) {
                         return null;
-                    },
-                }
+                    }
+                    return buf.mdata;
+                },
+                else => {
+                    c.perror("unable to read message");
+                    return null;
+                },
             }
-        };
-
-        /// Subscribe to receive messages from this message queue.
-        pub fn subscribe(self: Self) ReadIter {
-            return .{
-                .msqid = self.msqid,
-                .msgsize = std.mem.page_size,
-            };
-        }
-
-        /// Writer publishes messages to the queue.
-        /// The writer must call `done` to signal
-        /// that the subscriber should stop consuming messages.
-        pub const Writer = struct {
-            msqid: c_int,
-            msgsize: usize,
-            msqtype: c_long,
-
-            /// Publishes a new element to the back of the queue.
-            pub fn publish(self: Writer, v: T) MessageQueueError!void {
-                var mesg = Message{ .mtype = self.msqtype, .mdata = v };
-                switch (errno(sys.msgsnd(self.msqid, &mesg, 64, 0))) {
-                    .SUCCESS => return,
-                    .IDRM => return MessageQueueError.EOQ,
-                    else => {
-                        c.perror("unable to send message");
-                        return MessageQueueError.WriteError;
-                    },
-                }
-            }
-
-            /// Signals consumers that this writer is done sending messages.
-            pub fn done(self: Writer) MessageQueueError!void {
-                var end: Message = .{ .mtype = EOQ, .mdata = undefined };
-                switch (errno(sys.msgsnd(self.msqid, &end, self.msgsize, 0))) {
-                    .SUCCESS => return,
-                    .IDRM => return MessageQueueError.EOQ,
-                    else => {
-                        c.perror("unable to send message");
-                        return MessageQueueError.WriteError;
-                    },
-                }
-            }
-        };
-
-        /// Create a publisher to send messages on the queue.
-        pub fn publisher(self: Self) Writer {
-            return .{
-                .msqid = self.msqid,
-                .msgsize = std.mem.page_size,
-                .msqtype = self.msqtype,
-            };
         }
     };
-}
+
+    /// Subscribe to receive messages from this message queue.
+    pub fn subscribe(self: Self) ReadIter {
+        return .{
+            .msqid = self.msqid,
+            .msgsize = std.mem.page_size,
+        };
+    }
+
+    /// Writer publishes messages to the queue.
+    /// The writer must call `done` to signal
+    /// that the subscriber should stop consuming messages.
+    pub const Writer = struct {
+        msqid: c_int,
+        msgsize: usize,
+        msqtype: c_long,
+
+        /// Publishes a new element to the back of the queue.
+        pub fn publish(self: Writer, v: []const u8) MessageQueueError!void {
+            var mesg = Message{ .mtype = self.msqtype, .mdata = v };
+            switch (errno(sys.msgsnd(self.msqid, &mesg, v.len, 0))) {
+                .SUCCESS => return,
+                .IDRM => return MessageQueueError.EOQ,
+                else => {
+                    c.perror("unable to send message");
+                    return MessageQueueError.WriteError;
+                },
+            }
+        }
+
+        /// Signals consumers that this writer is done sending messages.
+        pub fn done(self: Writer) MessageQueueError!void {
+            var end: Message = .{ .mtype = EOQ, .mdata = undefined };
+            switch (errno(sys.msgsnd(self.msqid, &end, self.msgsize, 0))) {
+                .SUCCESS => return,
+                .IDRM => return MessageQueueError.EOQ,
+                else => {
+                    c.perror("unable to send message");
+                    return MessageQueueError.WriteError;
+                },
+            }
+        }
+    };
+
+    /// Create a publisher to send messages on the queue.
+    pub fn publisher(self: Self) Writer {
+        return .{
+            .msqid = self.msqid,
+            .msgsize = std.mem.page_size,
+            .msqtype = self.msqtype,
+        };
+    }
+};
 
 test ProcessMessageQueue {
     const testing = std.testing;
@@ -169,19 +165,21 @@ test ProcessMessageQueue {
     // Create a mailbox to read and write messages to.
     // The main thread will be in charge of cleaning up the mailbox
     var alloc = testing.allocator;
-    var mailbox = try ProcessMessageQueue(Elem).init(alloc, ".");
+    var mailbox = try ProcessMessageQueue.init(alloc, ".");
     defer alloc.destroy(mailbox);
     defer mailbox.deinit();
 
     const reader = mailbox.subscribe();
     const writer = try std.Thread.spawn(.{}, struct {
-        pub fn publish(outbox: ProcessMessageQueue(Elem).Writer, data: Elem) !void {
-            try outbox.publish(data);
+        pub fn publish(outbox: ProcessMessageQueue.Writer, data: Elem) !void {
+            try outbox.publish(std.mem.toBytes(data));
         }
     }.publish, .{ mailbox.publisher(), elem });
 
     const actual = reader.next();
-    try testing.expect(actual.?.data == elem.data);
+    const byts = actual.?;
+    const value = std.mem.bytesToValue(Elem, byts);
+    try testing.expect(value.data == elem.data);
     writer.join();
 }
 
@@ -197,19 +195,19 @@ test "Test count" {
     // Create a mailbox to read and write messages to.
     // The main thread will be in charge of cleaning up the mailbox
     var alloc = testing.allocator;
-    var mailbox = try ProcessMessageQueue(Elem).init(alloc, ".");
+    var mailbox = try ProcessMessageQueue.init(alloc, ".");
     defer alloc.destroy(mailbox);
     defer mailbox.deinit();
 
     // Count all messages
     const reader = mailbox.subscribe();
     const writer = try std.Thread.spawn(.{}, struct {
-        pub fn publish(outbox: ProcessMessageQueue(Elem).Writer, data: []Elem) !void {
+        pub fn publish(outbox: ProcessMessageQueue.Writer, data: []Elem) !void {
             defer outbox.done() catch |err| {
                 std.debug.print("Oops {s}\n", .{@errorName(err)});
             };
             for (data) |elem| {
-                try outbox.publish(elem);
+                try outbox.publish(std.mem.toBytes(elem));
             }
         }
     }.publish, .{ mailbox.publisher(), &elems });
