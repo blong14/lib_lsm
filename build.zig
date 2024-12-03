@@ -96,4 +96,34 @@ pub fn build(b: *std.Build) void {
 
         b.installArtifact(exe);
     }
+
+    // Main cli
+    {
+        const exe = b.addExecutable(.{
+            .name = "lsmx",
+            .root_source_file = b.path("src/cmd/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const clap = b.dependency("clap", .{});
+        exe.addCSourceFiles(.{
+            .root = fast_csv.path(""),
+            .files = &.{"csv.c"},
+        });
+        exe.installHeadersDirectory(fast_csv.path(""), "", .{
+            .include_extensions = &.{"csv.h"},
+        });
+        exe.root_module.addImport("clap", clap.module("clap"));
+        exe.root_module.addImport("msgpack", msgpack.module("msgpack"));
+        exe.root_module.addImport("lsm", lsm);
+        exe.linkLibC();
+        b.installArtifact(exe);
+        const run_cmd = b.addRunArtifact(exe);
+        run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+        const run_step = b.step("lsmx", "Run the lsm server");
+        run_step.dependOn(&run_cmd.step);
+    }
 }
