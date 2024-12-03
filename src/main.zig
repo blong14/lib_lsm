@@ -1,42 +1,51 @@
 const std = @import("std");
 
-const csv = @import("csv_reader.zig");
-const fio = @import("file.zig");
-const log = @import("wal.zig");
-const mtbl = @import("memtable.zig");
-const options = @import("opts.zig");
-const sst = @import("sstable.zig");
-const tm = @import("tablemap.zig");
-pub const KV = @import("kv.zig").KV;
-
+const debug = std.debug;
+const heap = std.heap;
 const io = std.io;
+const math = std.math;
+const mem = std.mem;
 const testing = std.testing;
 const hasher = std.hash.Murmur2_64;
-const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
-const MemoryPool = std.heap.MemoryPool;
-const CsvTokenizer = csv.CsvTokenizer;
-const Memtable = mtbl.Memtable;
-const Order = std.math.Order;
-const SSTable = sst.SSTable;
-const TableMap = tm.TableMap;
-const WAL = log.WAL;
 
-pub const CSV = CsvTokenizer(std.fs.File.Reader);
-pub const MessageQueue = @import("msgqueue.zig").ProcessMessageQueue;
-pub const ThreadMessageQueue = @import("msgqueue.zig").ThreadMessageQueue;
-pub const Opts = options.Opts;
-pub const defaultOpts = options.defaultOpts;
-pub const withDataDirOpts = options.withDataDirOpts;
+const Allocator = mem.Allocator;
+const ArenaAllocator = heap.ArenaAllocator;
+const MemoryPool = heap.MemoryPool;
+const Order = math.Order;
 
-const Profiler = @import("profile.zig");
-pub const BeginProfile = Profiler.BeginProfile;
-pub const EndProfile = Profiler.EndProfile;
-pub const BlockProfiler = Profiler.BlockProfiler;
+const csv = @cImport({
+    @cInclude("csv.h");
+});
+pub const CsvOpen2 = csv.CsvOpen2;
+pub const ReadNextRow = csv.CsvReadNextRow;
+pub const ReadNextCol = csv.CsvReadNextCol;
+
+pub const KV = @import("kv.zig").KV;
+
+const msgq = @import("msgqueue.zig");
+pub const ProcessMessageQueue = msgq.ProcessMessageQueue;
+pub const ThreadMessageQueue = msgq.ThreadMessageQueue;
+
+const mtbl = @import("memtable.zig");
+pub const Memtable = mtbl.Memtable;
+
+const opt = @import("opts.zig");
+pub const Opts = opt.Opts;
+pub const defaultOpts = opt.defaultOpts;
+pub const withDataDirOpts = opt.withDataDirOpts;
+
+const prof = @import("profile.zig");
+pub const BeginProfile = prof.BeginProfile;
+pub const EndProfile = prof.EndProfile;
+pub const BlockProfiler = prof.BlockProfiler;
+
+const SSTable = @import("sstable.zig").SSTable;
+const TableMap = @import("tablemap.zig").TableMap;
+const WAL = @import("wal.zig").WAL;
 
 fn lessThan(context: void, a: KV, b: KV) Order {
     _ = context;
-    return std.mem.order(u8, a.key, b.key);
+    return mem.order(u8, a.key, b.key);
 }
 
 pub const Database = struct {
@@ -146,7 +155,7 @@ pub const Database = struct {
                 if (table_iter.next()) {
                     const kv = table_iter.value();
                     mi.queue.add(kv) catch |err| {
-                        std.debug.print(
+                        debug.print(
                             "merge iter next failure: {s}\n",
                             .{@errorName(err)},
                         );
@@ -197,7 +206,7 @@ pub const Database = struct {
 };
 
 pub fn defaultDatabase(alloc: Allocator) !*Database {
-    return try databaseFromOpts(alloc, options.defaultOpts());
+    return try databaseFromOpts(alloc, defaultOpts());
 }
 
 pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {

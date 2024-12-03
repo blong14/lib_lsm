@@ -131,53 +131,32 @@ const SingleThreadedImpl = struct {
     }
 
     fn parse(alloc: Allocator, input: []const u8) !void {
-        const file = fs.cwd().openFile(input, .{}) catch |err| {
-            debug.print("open file error {s}\n", .{@errorName(err)});
-            return err;
-        };
-        defer file.close();
-
-        var buffer = [_]u8{0} ** mem.page_size;
-        const fileReader = file.reader();
-        var csv_file = lsm.CSV.init(fileReader, &buffer, .{ .col_sep = ';' }) catch |err| {
-            debug.print("csv file error {s}\n", .{@errorName(err)});
-            return err;
-        };
-
         var idx: usize = 0;
-        var row = [2][]const u8{ undefined, undefined };
-        while (csv_file.next() catch |err| {
-            debug.print(
-                "not able to read next token {s}\n",
-                .{@errorName(err)},
-            );
-            return err;
-        }) |token| {
-            switch (token) {
-                .field => |val| {
-                    if (idx < row.len) {
-                        row[idx] = val;
-                    }
-                    idx += 1;
-                },
-                .row_end => {
-                    const key = try alloc.alloc(u8, row[0].len);
-                    mem.copyForwards(u8, key, row[0]);
+        var data = [2][]const u8{ undefined, undefined };
 
-                    const value = try alloc.alloc(u8, row[1].len);
-                    mem.copyForwards(u8, value, row[1]);
+        const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
+        while (lsm.ReadNextRow(handle)) |row| {
+            while (lsm.ReadNextCol(row, handle)) |val| {
+                if (idx < data.len) {
+                    data[idx] = mem.span(val);
+                }
+                idx += 1;
+                if (idx == 2) {
+                    const key = try alloc.alloc(u8, data[0].len);
+                    mem.copyForwards(u8, key, data[0]);
+
+                    const value = try alloc.alloc(u8, data[1].len);
+                    mem.copyForwards(u8, value, data[1]);
 
                     self.db.write(key, value) catch |err| {
                         debug.print(
                             "database write error: key {s} value {s} error {s}\n",
-                            .{ key, value, @errorName(err) },
+                            .{ data[0], data[1], @errorName(err) },
                         );
                         return;
                     };
-
                     idx = 0;
-                    row = [2][]const u8{ undefined, undefined };
-                },
+                }
             }
         }
 
@@ -240,44 +219,32 @@ const MultiThreadedImpl = struct {
             input: []const u8,
             outbox: *lsm.ThreadMessageQueue([]const u8).Writer,
         ) void {
-            const file = fs.cwd().openFile(input, .{}) catch |err| {
-                debug.print(
-                    "not able to open file {s}\n",
-                    .{@errorName(err)},
-                );
-                return;
-            };
-            defer file.close();
-
-            const fileReader = file.reader();
-            var buffer = [_]u8{0} ** mem.page_size;
-            var csv_file = lsm.CSV.init(fileReader, &buffer, .{ .col_sep = ';' }) catch |err| {
-                debug.print("publish error {s}\n", .{@errorName(err)});
-                return;
-            };
-
             var kvs = std.ArrayList([]const u8).init(alloc);
             defer kvs.deinit();
 
-            var count: usize = 0;
             var idx: usize = 0;
-            var row = [2][]const u8{ undefined, undefined };
-            while (csv_file.next() catch null) |token| {
-                switch (token) {
-                    .field => |val| {
-                        if (idx < row.len) {
-                            row[idx] = val;
-                            idx += 1;
-                        }
-                    },
-                    .row_end => {
-                        const item = KV.init(row[0], row[1]);
+            var data_row = [2][]const u8{ undefined, undefined };
 
-                        const data = item.encodeAlloc(alloc) catch return;
-                        kvs.append(data) catch |e| {
-                            debug.print("{s}\n", .{@errorName(e)});
+            const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
+            while (lsm.ReadNextRow(handle)) |row| {
+                while (lsm.ReadNextCol(row, handle)) |val| {
+                    if (idx < data_row.len) {
+                        data_row[idx] = mem.span(val);
+                    }
+
+                    idx += 1;
+                    if (idx == 2) {
+                        const item = KV.init(data_row[0], data_row[1]);
+
+                        const data = item.encodeAlloc(alloc) catch |err| {
+                            debug.print(
+                                "not able to encode KV for key {s} error {s}\n",
+                                .{ item.key, @errorName(err) },
+                            );
                             return;
                         };
+
+                        kvs.append(data) catch return;
 
                         if (kvs.items.len >= mem.page_size) {
                             for (kvs.items) |d| {
@@ -292,10 +259,8 @@ const MultiThreadedImpl = struct {
                             kvs.clearRetainingCapacity();
                         }
 
-                        count += 1;
-                        row = [2][]const u8{ undefined, undefined };
                         idx = 0;
-                    },
+                    }
                 }
             }
 
@@ -416,11 +381,11 @@ const MultiProcessImpl = struct {
 
         const allocator = arena.allocator();
 
-        var mailbox = try lsm.MessageQueue([]const u8).init(allocator, ".");
+        var mailbox = try lsm.ProcessMessageQueue.init(allocator, ".");
         defer mailbox.deinit();
 
         const reader = try std.Thread.spawn(.{}, struct {
-            pub fn consume(opts: lsm.Opts, inbox: *const lsm.MessageQueue([]const u8).ReadIter) void {
+            pub fn consume(opts: lsm.Opts, inbox: *const lsm.ProcessMessageQueue.ReadIter) void {
                 const db = lsm.databaseFromOpts(heap.c_allocator, opts) catch |err| {
                     debug.print(
                         "database init error {s}\n",
@@ -463,77 +428,59 @@ const MultiProcessImpl = struct {
 
         const writer = mailbox.publisher();
 
-        const file = fs.cwd().openFile(input, .{}) catch |err| {
-            debug.print(
-                "not able to open file {s}\n",
-                .{@errorName(err)},
-            );
-            return;
-        };
-        defer file.close();
+        var kvs = std.ArrayList([]const u8).init(allocator);
+        defer kvs.deinit();
 
-        const fileReader = file.reader();
-        var buffer = [_]u8{0} ** mem.page_size;
-        var csv_file = lsm.CSV.init(fileReader, &buffer, .{ .col_sep = ';' }) catch |err| {
-            debug.print("publish error {s}\n", .{@errorName(err)});
-            return;
-        };
-
-        var out = std.ArrayList([]const u8).init(allocator);
-        defer out.deinit();
-
-        var count: usize = 0;
         var idx: usize = 0;
-        var row = [2][]const u8{ undefined, undefined };
-        while (csv_file.next() catch null) |token| {
-            switch (token) {
-                .field => |val| {
-                    if (idx < row.len) {
-                        row[idx] = val;
-                        idx += 1;
-                    }
-                },
-                .row_end => {
-                    const item = KV.init(row[0], row[1]);
+        var data_row = [2][]const u8{ undefined, undefined };
 
-                    const data = item.encodeAlloc(allocator) catch return;
-                    out.append(data) catch |err| {
+        const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
+        while (lsm.ReadNextRow(handle)) |row| {
+            while (lsm.ReadNextCol(row, handle)) |val| {
+                if (idx < data_row.len) {
+                    data_row[idx] = mem.span(val);
+                }
+
+                idx += 1;
+                if (idx == 2) {
+                    const item = KV.init(data_row[0], data_row[1]);
+
+                    const data = item.encodeAlloc(allocator) catch |err| {
                         debug.print(
-                            "{s}\n",
-                            .{@errorName(err)},
+                            "not able to encode KV for key {s} error {s}\n",
+                            .{ item.key, @errorName(err) },
                         );
                         return;
                     };
 
-                    if (out.items.len >= mem.page_size) {
-                        for (out.items) |i| {
-                            const msg = i;
+                    kvs.append(data) catch return;
+
+                    if (kvs.items.len >= mem.page_size) {
+                        for (kvs.items) |d| {
+                            const msg = d;
                             writer.publish(msg) catch |err| {
                                 debug.print(
-                                    "error publishing row {s}\n",
+                                    "not able to publish items {s}\n",
                                     .{@errorName(err)},
                                 );
-                                return;
                             };
                         }
-                        out.clearRetainingCapacity();
+                        kvs.clearRetainingCapacity();
                     }
-                    count += 1;
-                    row = [2][]const u8{ undefined, undefined };
+
                     idx = 0;
-                },
+                }
             }
         }
 
-        if (out.items.len > 0) {
-            for (out.items) |i| {
-                const msg = i;
+        if (kvs.items.len > 0) {
+            for (kvs.items) |d| {
+                const msg = d;
                 writer.publish(msg) catch |err| {
                     debug.print(
-                        "error publishing row {s}\n",
+                        "not able to publish items {s}\n",
                         .{@errorName(err)},
                     );
-                    return;
                 };
             }
         }

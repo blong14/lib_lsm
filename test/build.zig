@@ -12,7 +12,6 @@ pub fn buildLsm(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *Comp
         .target = target,
         .optimize = optimize,
     });
-    b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

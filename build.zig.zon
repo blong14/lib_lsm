@@ -23,6 +23,10 @@
             .url = "https://github.com/zigcc/zig-msgpack/archive/refs/tags/0.0.5.tar.gz",
             .hash = "12207ec1296852c17c0424b5e650003bd9a3c4f35e9d0ab586d39ea0ab812c2d9f2c",
         },
+        .@"csv-fast-reader" = .{
+            .url = "https://github.com/jandoczy/csv-fast-reader/archive/refs/heads/master.zip",
+            .hash = "1220b2d4dd8df92f89b4277a28ba9440d8cdb01ff21d1b693098f13a072404457ac1",
+        },
     },
     .paths = .{
         // This makes *all* files, recursively, included in this package. It is generally

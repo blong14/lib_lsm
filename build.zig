@@ -21,10 +21,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const fast_csv = b.dependency("csv-fast-reader", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Add custom modules so they can be referenced from our test directory
     const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/main.zig") });
     lsm.addImport("msgpack", msgpack.module("msgpack"));
+    lsm.addIncludePath(fast_csv.path(""));
 
     // Main library build definition
     {
@@ -37,13 +42,22 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
 
+        lib.addCSourceFiles(.{
+            .root = fast_csv.path(""),
+            .files = &.{"csv.c"},
+        });
+        lib.installHeadersDirectory(fast_csv.path(""), "", .{
+            .include_extensions = &.{"csv.h"},
+        });
+
         lib.root_module.addImport("msgpack", msgpack.module("msgpack"));
+        lib.addIncludePath(fast_csv.path(""));
+        lib.linkLibC();
 
         // This declares intent for the library to be installed into the standard
         // location when the user invokes the "install" step (the default step when
         // running `zig build`).
         b.installArtifact(lib);
-        lib.linkLibC();
 
         // Creates a step for unit testing. This only builds the test executable
         // but does not run it.
@@ -68,9 +82,18 @@ pub fn build(b: *std.Build) void {
     {
         const exe = cmds.buildLsm(b, target, optimize);
         const clap = b.dependency("clap", .{});
+        exe.addCSourceFiles(.{
+            .root = fast_csv.path(""),
+            .files = &.{"csv.c"},
+        });
+        exe.installHeadersDirectory(fast_csv.path(""), "", .{
+            .include_extensions = &.{"csv.h"},
+        });
         exe.root_module.addImport("clap", clap.module("clap"));
         exe.root_module.addImport("msgpack", msgpack.module("msgpack"));
         exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();
+
+        b.installArtifact(exe);
     }
 }
