@@ -10,9 +10,9 @@ pub const Opts = struct {
 
 pub fn defaultOpts() Opts {
     return .{
-        .data_dir = "data",
+        .data_dir = ".tmp/data",
         // TODO: temp
-        .sst_capacity = PageSize * 16,
+        .sst_capacity = 1_000_000,
         .wal_capacity = PageSize * PageSize,
     };
 }
