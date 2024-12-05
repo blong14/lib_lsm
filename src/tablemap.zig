@@ -3,6 +3,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
 
+const assert = std.debug.assert;
+
 pub fn TableMap(
     comptime K: type,
     comptime V: type,
@@ -23,27 +25,29 @@ pub fn TableMap(
         };
 
         cap: usize,
-        ximpl: std.MultiArrayList(Entry),
+        cnt: usize,
+        impl: std.MultiArrayList(Entry),
 
         pub fn init(alloc: Allocator, capacity: usize) !Self {
-            var ximpl = std.MultiArrayList(Entry){};
-            try ximpl.ensureTotalCapacity(alloc, capacity);
+            var impl = std.MultiArrayList(Entry){};
+            try impl.ensureTotalCapacity(alloc, capacity);
             return .{
                 .cap = capacity,
-                .ximpl = ximpl,
+                .cnt = 0,
+                .impl = impl,
             };
         }
 
         pub fn deinit(self: *Self, alloc: Allocator) void {
-            self.ximpl.deinit(alloc);
+            self.impl.deinit(alloc);
         }
 
-        pub fn findIndex(self: Self, key: K, low: usize, high: usize) usize {
+        inline fn index(key: K, keys: []const K, low: usize, high: usize) usize {
             var start = low;
             var end = high;
             while (start < end) {
                 const mid: usize = start + (end - start) / 2;
-                const current_item = self.ximpl.items(.key)[mid];
+                const current_item = keys[mid];
                 switch (compareFn(key, current_item)) {
                     .lt => end = mid,
                     .gt => start = mid + 1,
@@ -53,18 +57,12 @@ pub fn TableMap(
             return start;
         }
 
-        inline fn equalto(self: Self, key: K, idx: usize) bool {
-            const entry = self.ximpl.get(idx);
-            return compareFn(key, entry.key) == .eq;
-        }
-
-        inline fn greaterthan(self: Self, key: K, idx: usize) bool {
-            const entry = self.ximpl.get(idx);
-            return compareFn(key, entry.key) == .gt;
+        inline fn equalto(key: K, idx: usize, keys: []const K) bool {
+            return compareFn(key, keys[idx]) == .eq;
         }
 
         pub fn count(self: Self) usize {
-            return self.ximpl.items(.key).len;
+            return self.cnt;
         }
 
         pub fn getEntryByIdx(self: Self, idx: usize) TableMapError!V {
@@ -73,7 +71,7 @@ pub fn TableMap(
                 return TableMapError.NotFound;
             }
 
-            return self.ximpl.get(idx).value;
+            return self.impl.get(idx).value;
         }
 
         pub fn get(self: Self, key: K) TableMapError!V {
@@ -82,28 +80,32 @@ pub fn TableMap(
                 return TableMapError.NotFound;
             }
 
-            const idx = self.findIndex(key, 0, cnt - 1);
-            if ((idx == cnt) or !self.equalto(key, idx)) {
+            const keys = self.impl.items(.key);
+            const idx = index(key, keys, 0, cnt - 1);
+            if ((idx == cnt) or !equalto(key, idx, keys)) {
                 return TableMapError.NotFound;
             }
 
-            return self.ximpl.get(idx).value;
+            return self.impl.get(idx).value;
         }
 
         pub fn put(self: *Self, key: K, value: V) TableMapError!void {
             const cnt: usize = self.count();
             if (cnt == self.cap) {
                 return TableMapError.OutOfMemory;
-            } else if ((cnt == 0) or (self.greaterthan(key, cnt - 1))) {
-                self.ximpl.appendAssumeCapacity(Entry{ .key = key, .value = value });
+            } else if (cnt == 0) {
+                self.impl.appendAssumeCapacity(Entry{ .key = key, .value = value });
+                self.cnt += 1;
                 return;
             }
 
-            const idx = self.findIndex(key, 0, cnt - 1);
-            if (self.equalto(key, idx)) {
-                self.ximpl.set(idx, Entry{ .key = key, .value = value });
+            const keys = self.impl.items(.key);
+            const idx = index(key, keys, 0, cnt - 1);
+            if (equalto(key, idx, keys)) {
+                self.impl.set(idx, Entry{ .key = key, .value = value });
             } else {
-                self.ximpl.insertAssumeCapacity(idx, Entry{ .key = key, .value = value });
+                self.impl.insertAssumeCapacity(idx, Entry{ .key = key, .value = value });
+                self.cnt += 1;
             }
 
             return;
