@@ -43,11 +43,6 @@ const SSTable = @import("sstable.zig").SSTable;
 const TableMap = @import("tablemap.zig").TableMap;
 const WAL = @import("wal.zig").WAL;
 
-fn lessThan(context: void, a: KV, b: KV) Order {
-    _ = context;
-    return mem.order(u8, a.key, b.key);
-}
-
 pub const Database = struct {
     alloc: Allocator,
     capacity: usize,
@@ -113,6 +108,11 @@ pub const Database = struct {
         mtbls: std.ArrayList(*Memtable.Iterator),
         queue: std.PriorityQueue(KV, void, lessThan),
         v: KV,
+
+        fn lessThan(context: void, a: KV, b: KV) Order {
+            _ = context;
+            return mem.order(u8, a.key, b.key);
+        }
 
         pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
             const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
@@ -182,9 +182,6 @@ pub const Database = struct {
         }
 
         const item = KV.init(key, value);
-        //const item = try self.kv_pool.create();
-        //item.*.key = key;
-        //item.*.value = value;
 
         if ((self.mtable.size() + item.len()) >= self.capacity) {
             try self.flush();
