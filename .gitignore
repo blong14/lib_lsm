@@ -10,3 +10,4 @@ callgrind.o
 massif.o
 *.csv
 *.txt
+perf.*
