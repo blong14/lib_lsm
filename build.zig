@@ -17,10 +17,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Add lib specific deps
-    const msgpack = b.dependency("zig-msgpack", .{
-        .target = target,
-        .optimize = optimize,
-    });
     const fast_csv = b.dependency("csv-fast-reader", .{
         .target = target,
         .optimize = optimize,
@@ -28,7 +24,6 @@ pub fn build(b: *std.Build) void {
 
     // Add custom modules so they can be referenced from our test directory
     const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/main.zig") });
-    lsm.addImport("msgpack", msgpack.module("msgpack"));
     lsm.addIncludePath(fast_csv.path(""));
 
     // Main library build definition
@@ -41,7 +36,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-
         lib.addCSourceFiles(.{
             .root = fast_csv.path(""),
             .files = &.{"csv.c"},
@@ -49,8 +43,6 @@ pub fn build(b: *std.Build) void {
         lib.installHeadersDirectory(fast_csv.path(""), "", .{
             .include_extensions = &.{"csv.h"},
         });
-
-        lib.root_module.addImport("msgpack", msgpack.module("msgpack"));
         lib.addIncludePath(fast_csv.path(""));
         lib.linkLibC();
 
@@ -66,9 +58,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        main_tests.root_module.addImport("msgpack", msgpack.module("msgpack"));
-
         main_tests.linkLibC();
+
         const run_main_tests = b.addRunArtifact(main_tests);
 
         // This creates a build step. It will be visible in the `zig build --help` menu,
@@ -90,7 +81,6 @@ pub fn build(b: *std.Build) void {
             .include_extensions = &.{"csv.h"},
         });
         exe.root_module.addImport("clap", clap.module("clap"));
-        exe.root_module.addImport("msgpack", msgpack.module("msgpack"));
         exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();
 
@@ -114,10 +104,10 @@ pub fn build(b: *std.Build) void {
             .include_extensions = &.{"csv.h"},
         });
         exe.root_module.addImport("clap", clap.module("clap"));
-        exe.root_module.addImport("msgpack", msgpack.module("msgpack"));
         exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();
         b.installArtifact(exe);
+
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
         if (b.args) |args| {
