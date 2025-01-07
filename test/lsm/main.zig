@@ -128,12 +128,58 @@ const SingleThreadedImpl = struct {
         defer lsm.EndProfile();
 
         try parse(allocator, input);
+
+        // read(allocator);
+    }
+
+    var ballast: usize = std.mem.page_size;
+
+    fn xalloc(alloc: Allocator, buffer: *[]u8, len_: usize) ![]u8 {
+        if (buffer.*.len == 0) {
+            buffer.* = try alloc.alloc(u8, ballast);
+            ballast *= 2;
+        }
+        const result = @subWithOverflow(buffer.*.len - 1, len_);
+        var offset = result[0];
+        if (result[1] != 0) {
+            buffer.* = try alloc.alloc(u8, ballast);
+            ballast *= 2;
+            offset = (buffer.*.len - 1) - len_;
+        }
+        var n: []u8 = undefined;
+        n = buffer.*[offset .. buffer.*.len - 1];
+        buffer.* = buffer.*[0..offset];
+        return n;
+    }
+
+    test "xalloc" {
+        const testing = std.testing;
+        const alloc = testing.allocator;
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+
+        var buffer = try arena.allocator().alloc(u8, ballast);
+
+        var actual = try xalloc(arena.allocator(), &buffer, 4094);
+
+        try testing.expectEqual(actual.len, 4094);
+
+        actual = try xalloc(arena.allocator(), &buffer, 4094);
+
+        try testing.expectEqual(actual.len, 4094);
+
+        actual = try xalloc(arena.allocator(), &buffer, 2);
+
+        try testing.expectEqual(actual.len, 2);
     }
 
     fn parse(alloc: Allocator, input: []const u8) !void {
         var idx: usize = 0;
         var data = [2][]const u8{ undefined, undefined };
+        var byte_buffer = try alloc.alloc(u8, ballast);
 
+        var cnt: usize = 0;
         const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
         while (lsm.ReadNextRow(handle)) |row| {
             while (lsm.ReadNextCol(row, handle)) |val| {
@@ -142,10 +188,12 @@ const SingleThreadedImpl = struct {
                 }
                 idx += 1;
                 if (idx == 2) {
-                    const key = try alloc.alloc(u8, data[0].len);
+                    const key_len = data[0].len;
+                    const key = try xalloc(alloc, &byte_buffer, key_len);
                     mem.copyForwards(u8, key, data[0]);
 
-                    const value = try alloc.alloc(u8, data[1].len);
+                    const value_len = data[1].len;
+                    const value = try xalloc(alloc, &byte_buffer, value_len);
                     mem.copyForwards(u8, value, data[1]);
 
                     self.db.write(key, value) catch |err| {
@@ -156,6 +204,7 @@ const SingleThreadedImpl = struct {
                         return;
                     };
                     idx = 0;
+                    cnt += 1;
                 }
             }
         }
@@ -169,7 +218,7 @@ const SingleThreadedImpl = struct {
         };
     }
 
-    fn read() void {
+    fn read(alloc: Allocator) void {
         var iter = self.db.iterator() catch |err| {
             debug.print(
                 "database iter err: {s}\n",
@@ -177,14 +226,11 @@ const SingleThreadedImpl = struct {
             );
             return;
         };
-        defer iter.deinit();
+        defer iter.deinit(alloc);
 
         var count: usize = 0;
-        while (iter.next() catch null) {
-            debug.print(
-                "key {s} value {s}\n",
-                .{ iter.value().key, iter.value().value },
-            );
+        while (iter.next() catch false) {
+            debug.print("{d}:\t{}\n", .{ count, iter.value() });
             count += 1;
         }
     }

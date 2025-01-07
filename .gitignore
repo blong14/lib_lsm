@@ -2,6 +2,8 @@
 zig-cache/
 zig-out/
 
+vendor/*/target
+
 .idea/
 
 data*

@@ -1,0 +1,16 @@
+[package]
+name = "concurrent-skiplist"
+version = "0.1.0"
+edition = "2021"
+include = ["src/skiplist.h"]
+
+[dependencies]
+crossbeam-skiplist = "0.1.3"
+lazy_static = "1.4"
+libc = "0.2"
+
+[dev-dependencies]
+cbindgen = "0.24"
+
+[lib]
+crate-type = ["cdylib"]

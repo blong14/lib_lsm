@@ -5,21 +5,20 @@ const keyvalue = @import("kv.zig");
 const options = @import("opts.zig");
 const sst = @import("sstable.zig");
 const tbm = @import("tablemap.zig");
+const skl = @import("skiplist.zig");
 
 const Allocator = std.mem.Allocator;
 const File = std.fs.File;
 
 const KV = keyvalue.KV;
 const Opts = options.Opts;
+const SkipList = skl.SkipList;
 const SSTable = sst.SSTable;
-const TableMap = tbm.TableMap;
 
 const print = std.debug.print;
 
 pub const Memtable = struct {
     const Self = @This();
-
-    const KVTableMap = TableMap([]const u8, KV, KV.order);
 
     const Error = error{
         Full,
@@ -28,7 +27,7 @@ pub const Memtable = struct {
     alloc: Allocator,
     byte_count: usize,
     cap: usize,
-    data: KVTableMap,
+    data: *SkipList([]const u8, keyvalue.decode, keyvalue.encode),
     id: u64,
     opts: Opts,
     mutable: bool,
@@ -36,7 +35,7 @@ pub const Memtable = struct {
 
     pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
         const cap = opts.sst_capacity;
-        const map = try KVTableMap.init(alloc, cap);
+        const map = try SkipList([]const u8, keyvalue.decode, keyvalue.encode).init(alloc);
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
@@ -53,7 +52,8 @@ pub const Memtable = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.data.deinit(self.alloc);
+        self.data.deinit();
+        self.alloc.destroy(self.data);
         if (self.*.sstable) |sstbl| {
             sstbl.deinit();
             self.alloc.destroy(sstbl);
@@ -69,12 +69,16 @@ pub const Memtable = struct {
         if (!self.mutable) {
             return error.Full;
         }
-        try self.data.put(item.key, item);
+        try self.data.put(item.key, item.value);
         self.byte_count += item.len();
     }
 
     pub fn get(self: Self, key: []const u8) ?KV {
-        return self.data.get(key) catch return null;
+        const value = self.data.get(key) catch |err| {
+            print("key {s} {s}\n", .{ key, @errorName(err) });
+            return null;
+        };
+        return KV.init(key, value);
     }
 
     pub fn count(self: Self) usize {
@@ -86,61 +90,32 @@ pub const Memtable = struct {
     }
 
     pub const Iterator = struct {
-        data: KVTableMap,
-        idx: usize,
-        start_idx: usize,
+        data: SkipList([]const u8, keyvalue.decode, keyvalue.encode).Iterator,
         v: KV,
+
+        pub fn deinit(it: *Iterator) void {
+            it.data.deinit();
+            it.* = undefined;
+        }
 
         pub fn value(it: Iterator) KV {
             return it.v;
         }
 
-        pub fn prev(it: *Iterator) bool {
-            if (it.data.count() == 0) {
+        pub fn next(it: *Iterator) !bool {
+            if (try it.data.next()) {
+                it.*.v = KV.init(it.data.key(), it.data.value());
+                return true;
+            } else {
                 return false;
             }
-            const entry = it.data.getEntryByIdx(it.*.idx) catch |err| {
-                print(
-                    "memtable iter error: {s}\n",
-                    .{@errorName(err)},
-                );
-                return false;
-            };
-            it.*.v = entry;
-            if (it.*.idx == 0) {
-                return false;
-            }
-            it.*.idx -= 1;
-            return true;
-        }
-
-        pub fn next(it: *Iterator) bool {
-            if (it.*.idx >= it.data.count()) {
-                return false;
-            }
-            const entry = it.data.getEntryByIdx(it.*.idx) catch |err| {
-                print(
-                    "memtable iter error: {s}\n",
-                    .{@errorName(err)},
-                );
-                return false;
-            };
-            it.*.v = entry;
-            it.*.idx += 1;
-            return true;
-        }
-
-        pub fn reset(it: *Iterator) void {
-            it.*.idx = it.start_idx;
         }
     };
 
-    pub fn iterator(self: *Self, start: usize) !*Iterator {
+    pub fn iterator(self: *Self) !*Iterator {
         const iter = try self.alloc.create(Iterator);
         iter.* = .{
-            .data = self.data,
-            .idx = start,
-            .start_idx = start,
+            .data = self.data.iter(self.alloc),
             .v = undefined,
         };
         return iter;
@@ -151,21 +126,24 @@ pub const Memtable = struct {
             return;
         }
 
-        var iter = try self.iterator(0);
-        defer self.alloc.destroy(iter);
-
         var sstable = try SSTable.init(self.alloc, self.getId(), self.opts);
         errdefer self.alloc.destroy(sstable);
         errdefer sstable.deinit();
 
-        while (iter.next()) {
-            const kv = iter.value();
-            _ = sstable.write(kv) catch |err| {
-                print(
-                    "memtable not able to write to sstable for key {s}: {s}\n",
-                    .{ kv.key, @errorName(err) },
-                );
-                return err;
+        var iter = self.data.iter(self.alloc);
+        defer iter.deinit();
+
+        while (try iter.next()) {
+            const kv = KV.init(iter.key(), iter.value());
+            _ = sstable.write(kv) catch |err| switch (err) {
+                error.DuplicateError => continue,
+                else => {
+                    print(
+                        "memtable not able to write to sstable for key {s}: {s}\n",
+                        .{ kv.key, @errorName(err) },
+                    );
+                    return err;
+                },
             };
         }
 

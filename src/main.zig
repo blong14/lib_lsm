@@ -10,7 +10,6 @@ const hasher = std.hash.Murmur2_64;
 
 const Allocator = mem.Allocator;
 const ArenaAllocator = heap.ArenaAllocator;
-const MemoryPool = heap.MemoryPool;
 const Order = math.Order;
 
 const csv = @cImport({
@@ -46,7 +45,6 @@ const WAL = @import("wal.zig").WAL;
 pub const Database = struct {
     alloc: Allocator,
     capacity: usize,
-    kv_pool: MemoryPool(KV),
     mtable: *Memtable,
     opts: Opts,
     mtables: std.ArrayList(*Memtable),
@@ -58,12 +56,10 @@ pub const Database = struct {
         const mtable = try Memtable.init(alloc, 0, opts);
         const mtables = std.ArrayList(*Memtable).init(alloc);
         const capacity = opts.sst_capacity;
-        const pool = try MemoryPool(KV).initPreheated(alloc, opts.sst_capacity);
 
         const db = try alloc.create(Self);
         db.* = .{
             .alloc = alloc,
-            .kv_pool = pool,
             .capacity = capacity,
             .mtable = mtable,
             .mtables = mtables,
@@ -80,7 +76,6 @@ pub const Database = struct {
         self.mtable.deinit();
         self.alloc.destroy(self.mtable);
         self.mtables.deinit();
-        self.kv_pool.deinit();
         self.* = undefined;
     }
 
@@ -88,15 +83,19 @@ pub const Database = struct {
         if (self.mtable.get(key)) |value| {
             return value;
         }
-        var idx: usize = self.mtables.items.len - 1;
-        while (idx > 0) {
-            var table = self.mtables.items[idx];
-            if (table.get(key)) |value| {
-                return value;
+        if (self.mtables.items.len > 0) {
+            var idx: usize = self.mtables.items.len - 1;
+            while (idx > 0) {
+                var table = self.mtables.items[idx];
+                if (table.get(key)) |value| {
+                    return value;
+                }
+                idx -= 1;
             }
-            idx -= 1;
+            return error.NotFound;
+        } else {
+            return error.NotFound;
         }
-        return error.NotFound;
     }
 
     pub fn read(self: Self, key: []const u8) !KV {
@@ -104,7 +103,7 @@ pub const Database = struct {
     }
 
     const MergeIterator = struct {
-        alloc: Allocator,
+        arena: heap.ArenaAllocator,
         mtbls: std.ArrayList(*Memtable.Iterator),
         queue: std.PriorityQueue(KV, void, lessThan),
         v: KV,
@@ -114,21 +113,25 @@ pub const Database = struct {
             return mem.order(u8, a.key, b.key);
         }
 
-        pub fn init(alloc: Allocator, m: *Database) !*MergeIterator {
-            const queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
+        pub fn init(parent_allocator: Allocator, m: *Database) !*MergeIterator {
+            var arena = heap.ArenaAllocator.init(parent_allocator);
+            const alloc = arena.allocator();
+
+            var queue = std.PriorityQueue(KV, void, lessThan).init(alloc, {});
+            try queue.ensureTotalCapacity(std.mem.page_size);
 
             var iters = std.ArrayList(*Memtable.Iterator).init(alloc);
             for (m.mtables.items) |mtable| {
-                const iter = try mtable.iterator(0);
+                const iter = try mtable.iterator();
                 try iters.append(iter);
             }
 
-            const iter = try m.mtable.iterator(0);
+            const iter = try m.mtable.iterator();
             try iters.append(iter);
 
-            const mi = try alloc.create(MergeIterator);
+            const mi = try parent_allocator.create(MergeIterator);
             mi.* = .{
-                .alloc = alloc,
+                .arena = arena,
                 .mtbls = iters,
                 .queue = queue,
                 .v = undefined,
@@ -136,14 +139,13 @@ pub const Database = struct {
             return mi;
         }
 
-        pub fn deinit(mi: *MergeIterator) void {
-            for (mi.mtbls.items) |iter| {
-                mi.alloc.destroy(iter);
+        pub fn deinit(mi: *MergeIterator, parent_allocator: Allocator) void {
+            for (mi.mtbls.items) |item| {
+                item.deinit();
+                parent_allocator.destroy(item);
             }
-            mi.mtbls.deinit();
-            mi.queue.deinit();
-            mi.alloc.destroy(mi);
-            // mi.* = undefined;
+            mi.arena.deinit();
+            mi.* = undefined;
         }
 
         pub fn value(mi: MergeIterator) KV {
@@ -152,7 +154,7 @@ pub const Database = struct {
 
         pub fn next(mi: *MergeIterator) !bool {
             for (mi.mtbls.items) |table_iter| {
-                if (table_iter.next()) {
+                if (try table_iter.next()) {
                     const kv = table_iter.value();
                     mi.queue.add(kv) catch |err| {
                         debug.print(
@@ -177,7 +179,7 @@ pub const Database = struct {
     }
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
-        if (key.len == 0) {
+        if (key.len == 0 or !std.unicode.utf8ValidateSlice(key)) {
             return error.WriteError;
         }
 
@@ -236,7 +238,9 @@ test "basic functionality" {
 }
 
 test "basic functionality with many items" {
-    var arena = ArenaAllocator.init(testing.allocator);
+    const ta = testing.allocator;
+
+    var arena = ArenaAllocator.init(ta);
     defer arena.deinit();
 
     const alloc = arena.allocator();
@@ -245,7 +249,8 @@ test "basic functionality with many items" {
     const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
     defer testDir.dir.deleteTree(dir_name) catch {};
 
-    const db = try databaseFromOpts(alloc, withDataDirOpts(dir_name));
+    const db = try databaseFromOpts(ta, withDataDirOpts(dir_name));
+    defer ta.destroy(db);
     defer db.deinit();
 
     // given
@@ -268,7 +273,8 @@ test "basic functionality with many items" {
 
     // then
     var iter = try db.iterator();
-    defer iter.deinit();
+    defer ta.destroy(iter);
+    defer iter.deinit(ta);
 
     var count: usize = 0;
     while (iter.next() catch false) {

@@ -42,6 +42,7 @@ pub const SSTable = struct {
     const Self = @This();
 
     const Error = error{
+        DuplicateError,
         NotConnected,
         NotFound,
         ReadError,
@@ -124,10 +125,10 @@ pub const SSTable = struct {
         if (self.mutable) {
             //if (self.index.getKey(value.key)) |key| {
             //    print(
-            //        "not able to write to sstable for key {s}\n",
+            //        "sstable not able to write to existing key: {s}\n",
             //        .{key},
             //    );
-            //    return Error.WriteError;
+            //    return Error.DuplicateError;
             //}
 
             const idx = self.block.write(value) catch |err| {

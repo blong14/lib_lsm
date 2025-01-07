@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     // Add custom modules so they can be referenced from our test directory
     const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/main.zig") });
     lsm.addIncludePath(fast_csv.path(""));
+    lsm.addIncludePath(b.path("vendor/crossbeam-skiplist/src"));
 
     // Main library build definition
     {
@@ -44,6 +45,12 @@ pub fn build(b: *std.Build) void {
             .include_extensions = &.{"csv.h"},
         });
         lib.addIncludePath(fast_csv.path(""));
+        lib.installHeadersDirectory(b.path("vendor/crossbeam-skiplist/src"), "", .{
+            .include_extensions = &.{"skiplist.h"},
+        });
+        lib.addLibraryPath(b.path("vendor/crossbeam-skiplist/target/release"));
+        lib.addObjectFile(b.path("vendor/crossbeam-skiplist/target/release/libconcurrent_skiplist.so"));
+        lib.addIncludePath(b.path("vendor/crossbeam-skiplist/src"));
         lib.linkLibC();
 
         // This declares intent for the library to be installed into the standard
@@ -58,6 +65,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        main_tests.installHeadersDirectory(b.path("vendor/crossbeam-skiplist/src"), "", .{
+            .include_extensions = &.{"skiplist.h"},
+        });
+        main_tests.addLibraryPath(b.path("vendor/crossbeam-skiplist/target/release"));
+        main_tests.addObjectFile(b.path("vendor/crossbeam-skiplist/target/release/libconcurrent_skiplist.so"));
+        main_tests.addIncludePath(b.path("vendor/crossbeam-skiplist/src"));
         main_tests.linkLibC();
 
         const run_main_tests = b.addRunArtifact(main_tests);
@@ -80,6 +93,11 @@ pub fn build(b: *std.Build) void {
         exe.installHeadersDirectory(fast_csv.path(""), "", .{
             .include_extensions = &.{"csv.h"},
         });
+        exe.installHeadersDirectory(b.path("vendor/crossbeam-skiplist/src"), "", .{
+            .include_extensions = &.{"skiplist.h"},
+        });
+        exe.addLibraryPath(b.path("vendor/crossbeam-skiplist/target/release"));
+        exe.addObjectFile(b.path("vendor/crossbeam-skiplist/target/release/libconcurrent_skiplist.so"));
         exe.root_module.addImport("clap", clap.module("clap"));
         exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();
@@ -103,6 +121,11 @@ pub fn build(b: *std.Build) void {
         exe.installHeadersDirectory(fast_csv.path(""), "", .{
             .include_extensions = &.{"csv.h"},
         });
+        exe.installHeadersDirectory(b.path("vendor/crossbeam-skiplist/src"), "", .{
+            .include_extensions = &.{"skiplist.h"},
+        });
+        exe.addLibraryPath(b.path("vendor/crossbeam-skiplist/target/release"));
+        exe.addObjectFile(b.path("vendor/crossbeam-skiplist/target/release/libconcurrent_skiplist.so"));
         exe.root_module.addImport("clap", clap.module("clap"));
         exe.root_module.addImport("lsm", lsm);
         exe.linkLibC();

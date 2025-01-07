@@ -1,13 +1,12 @@
 const std = @import("std");
-const msgpack = @import("msgpack");
 
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
-const Payload = msgpack.Payload;
 
 const Endian = std.builtin.Endian.little;
 
 const assert = std.debug.assert;
+const print = std.debug.print;
 
 pub const KV = struct {
     key: []const u8,
@@ -79,13 +78,31 @@ pub const KV = struct {
         return buf[0..len_];
     }
 
-    pub fn toPayload(self: Self, alloc: Allocator) !Payload {
-        var out = Payload.mapPayload(alloc);
-        try out.mapPut(self.key, try Payload.strToPayload(self.value, alloc));
+    pub fn format(
+        self: Self,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
 
-        return out;
+        try writer.print("{s}\t{s}\t{d}", .{
+            self.key,
+            self.value,
+            self.len(),
+        });
     }
 };
+
+pub fn decode(byts: []const u8) ![]const u8 {
+    return byts;
+}
+
+pub fn encode(alloc: Allocator, value: []const u8) ![]const u8 {
+    _ = alloc;
+    return value;
+}
 
 test "KV encode alloc" {
     const alloc = std.testing.allocator;
