@@ -7,7 +7,6 @@ const Order = std.math.Order;
 
 const assert = std.debug.assert;
 const fixedBufferStream = std.io.fixedBufferStream;
-const order = std.mem.order;
 const print = std.debug.print;
 const writeInt = std.mem.writeInt;
 
@@ -39,7 +38,7 @@ pub const KV = struct {
     }
 
     pub fn order(a: []const u8, b: []const u8) Order {
-        return order(u8, a, b);
+        return std.mem.order(u8, a, b);
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {
