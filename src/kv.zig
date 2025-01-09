@@ -1,12 +1,17 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const ByteAlignedInt = std.math.ByteAlignedInt;
+const FormatOptions = std.fmt.FormatOptions;
 const Order = std.math.Order;
 
-const Endian = std.builtin.Endian.little;
-
 const assert = std.debug.assert;
+const fixedBufferStream = std.io.fixedBufferStream;
+const order = std.mem.order;
 const print = std.debug.print;
+const writeInt = std.mem.writeInt;
+
+const Endian = std.builtin.Endian.little;
 
 pub const KV = struct {
     key: []const u8,
@@ -34,11 +39,11 @@ pub const KV = struct {
     }
 
     pub fn order(a: []const u8, b: []const u8) Order {
-        return std.mem.order(u8, a, b);
+        return order(u8, a, b);
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {
-        var stream = std.io.fixedBufferStream(data);
+        var stream = fixedBufferStream(data);
         var data_reader = stream.reader();
 
         const key_len = try data_reader.readInt(u64, Endian);
@@ -67,13 +72,22 @@ pub const KV = struct {
         const len_ = self.len();
         assert(len_ <= buf.len);
 
-        var stream = std.io.fixedBufferStream(buf);
-        var data_writer = stream.writer();
+        var ptr = buf.ptr;
 
-        try data_writer.writeInt(u64, self.key.len, Endian);
-        _ = try data_writer.write(self.key);
-        try data_writer.writeInt(u64, self.value.len, Endian);
-        _ = try data_writer.write(self.value);
+        var key_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
+        writeInt(ByteAlignedInt(u64), &key_len_bytes, self.key.len, Endian);
+        @memcpy(ptr, &key_len_bytes);
+        ptr += @sizeOf(u64);
+
+        @memcpy(ptr, self.key);
+        ptr += self.key.len;
+
+        var value_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
+        writeInt(ByteAlignedInt(u64), &value_len_bytes, self.value.len, Endian);
+        @memcpy(ptr, &value_len_bytes);
+        ptr += @sizeOf(u64);
+
+        @memcpy(ptr, self.value);
 
         return buf[0..len_];
     }
@@ -81,7 +95,7 @@ pub const KV = struct {
     pub fn format(
         self: Self,
         comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
+        options: FormatOptions,
         writer: anytype,
     ) !void {
         _ = fmt;
