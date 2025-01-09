@@ -5,6 +5,10 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::{ptr, slice, str};
 
+// https://nnethercote.github.io/perf-book/build-configuration.html#jemalloc
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[no_mangle]
 pub extern "C" fn skiplist_init() -> *mut c_void {
     let skip_map: SkipMap<String, Vec<u8>> = SkipMap::new();
