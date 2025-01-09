@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const MultiArrayList = std.MultiArrayList;
 const Order = std.math.Order;
 
 const assert = std.debug.assert;
@@ -26,10 +27,10 @@ pub fn TableMap(
 
         cap: usize,
         cnt: usize,
-        impl: std.MultiArrayList(Entry),
+        impl: MultiArrayList(Entry),
 
         pub fn init(alloc: Allocator, capacity: usize) !Self {
-            var impl = std.MultiArrayList(Entry){};
+            var impl = MultiArrayList(Entry){};
             try impl.ensureTotalCapacity(alloc, capacity);
             return .{
                 .cap = capacity,
@@ -109,6 +110,47 @@ pub fn TableMap(
             }
 
             return;
+        }
+
+        pub const Iterator = struct {
+            data: *const MultiArrayList(Entry),
+            k: K,
+            val: V,
+            idx: usize,
+
+            pub fn deinit(it: *Iterator) void {
+                _ = it;
+            }
+
+            pub fn key(it: Iterator) K {
+                return it.k;
+            }
+
+            pub fn value(it: Iterator) V {
+                return it.val;
+            }
+
+            pub fn next(it: *Iterator) !bool {
+                if (it.idx >= it.data.len) {
+                    return TableMapError.NotFound;
+                }
+
+                const entry = it.data.get(it.idx);
+                it.*.k = entry.key;
+                it.*.val = entry.value;
+                it.*.idx += 1;
+
+                return true;
+            }
+        };
+
+        pub fn iter(self: Self, _: Allocator) Iterator {
+            return .{
+                .data = &self.impl,
+                .k = undefined,
+                .val = undefined,
+                .idx = 0,
+            };
         }
     };
 }
