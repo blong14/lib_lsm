@@ -179,8 +179,10 @@ const SingleThreadedImpl = struct {
         var data = [2][]const u8{ undefined, undefined };
         var byte_buffer = try alloc.alloc(u8, ballast);
 
-        var cnt: usize = 0;
         const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
+        defer lsm.CsvClose(handle);
+
+        var cnt: usize = 0;
         while (lsm.ReadNextRow(handle)) |row| {
             while (lsm.ReadNextCol(row, handle)) |val| {
                 if (idx < data.len) {
@@ -259,6 +261,10 @@ const MultiThreadedImpl = struct {
         this.alloc.destroy(self);
     }
 
+    var mtx: std.Thread.Mutex = .{};
+    var signal: std.Thread.Condition = .{};
+    var done: bool = false;
+
     const Reader = struct {
         pub fn publish(
             alloc: Allocator,
@@ -294,6 +300,9 @@ const MultiThreadedImpl = struct {
 
                         if (kvs.items.len >= mem.page_size) {
                             for (kvs.items) |d| {
+                                mtx.lock();
+                                defer mtx.unlock();
+
                                 const msg = d;
                                 outbox.publish(msg) catch |err| {
                                     debug.print(
@@ -301,7 +310,10 @@ const MultiThreadedImpl = struct {
                                         .{@errorName(err)},
                                     );
                                 };
+
+                                signal.broadcast();
                             }
+
                             kvs.clearRetainingCapacity();
                         }
 
@@ -322,12 +334,21 @@ const MultiThreadedImpl = struct {
                 }
             }
 
-            outbox.done() catch return;
+            // Notify writer thread that we are finished publishing
+            {
+                mtx.lock();
+                defer mtx.unlock();
+
+                outbox.done() catch return;
+                done = true;
+                signal.broadcast();
+            }
         }
     };
 
     const Writer = struct {
         pub fn consume(opts: lsm.Opts, inbox: *lsm.ThreadMessageQueue([]const u8).ReadIter) void {
+            debug.print("consuming data...\n", .{});
             const db = lsm.databaseFromOpts(heap.c_allocator, opts) catch |err| {
                 debug.print(
                     "database init error {s}\n",
@@ -338,24 +359,35 @@ const MultiThreadedImpl = struct {
             defer db.deinit();
 
             var count: usize = 0;
-            while (inbox.next()) |item| {
-                var kv: KV = .{ .key = undefined, .value = undefined };
-                kv.decode(item) catch |err| {
-                    debug.print(
-                        "not able to decode kv {s} {any}\n",
-                        .{ @errorName(err), item },
-                    );
-                    return;
-                };
+            while (true) {
+                {
+                    mtx.lock();
+                    defer mtx.unlock();
 
-                db.write(kv.key, kv.value) catch |err| {
-                    debug.print(
-                        "db write error count {d} key {s} {s}\n",
-                        .{ count, kv.key, @errorName(err) },
-                    );
-                    return;
-                };
-                count += 1;
+                    if (done) break;
+
+                    signal.wait(&mtx);
+                }
+
+                while (inbox.next()) |item| {
+                    var kv: KV = .{ .key = undefined, .value = undefined };
+                    kv.decode(item) catch |err| {
+                        debug.print(
+                            "not able to decode kv {s} {any}\n",
+                            .{ @errorName(err), item },
+                        );
+                        return;
+                    };
+
+                    db.write(kv.key, kv.value) catch |err| {
+                        debug.print(
+                            "db write error count {d} key {s} {s}\n",
+                            .{ count, kv.key, @errorName(err) },
+                        );
+                        return;
+                    };
+                    count += 1;
+                }
             }
 
             db.flush() catch |err| {
