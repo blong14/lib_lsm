@@ -6,8 +6,8 @@ const FormatOptions = std.fmt.FormatOptions;
 const Order = std.math.Order;
 
 const assert = std.debug.assert;
-const fixedBufferStream = std.io.fixedBufferStream;
 const print = std.debug.print;
+const readInt = std.mem.readInt;
 const writeInt = std.mem.writeInt;
 
 const Endian = std.builtin.Endian.little;
@@ -17,10 +17,6 @@ pub const KV = struct {
     value: []const u8,
 
     const Self = @This();
-
-    const Error = error{
-        OutOfMemory,
-    };
 
     pub fn init(key: []const u8, value: []const u8) Self {
         return .{
@@ -42,20 +38,31 @@ pub const KV = struct {
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {
-        var stream = fixedBufferStream(data);
-        var data_reader = stream.reader();
+        var ptr: usize = 0;
 
-        const key_len = try data_reader.readInt(u64, Endian);
+        const key_len_sz = @sizeOf(u64);
+        var key_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
+        @memcpy(&key_len_bytes, data[ptr..key_len_sz]);
+
+        const key_len = readInt(u64, &key_len_bytes, Endian);
         assert(key_len > 0);
 
-        const key = stream.buffer[stream.pos..][0..key_len];
+        ptr += key_len_sz;
 
-        stream.pos += key_len;
+        const key = data[ptr..][0..key_len];
 
-        const value_len = try data_reader.readInt(u64, Endian);
+        ptr += key_len;
+
+        const value_len_sz = @sizeOf(u64);
+        var value_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
+        @memcpy(&value_len_bytes, data[ptr..][0..value_len_sz]);
+
+        const value_len = readInt(u64, &value_len_bytes, Endian);
         assert(value_len > 0);
 
-        const value = stream.buffer[stream.pos..][0..value_len];
+        ptr += value_len_sz;
+
+        const value = data[ptr..][0..value_len];
 
         self.*.key = key;
         self.*.value = value;
