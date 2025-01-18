@@ -16,10 +16,14 @@ const csv = @cImport({
     @cInclude("csv.h");
 });
 pub const CsvOpen2 = csv.CsvOpen2;
+pub const CsvClose = csv.CsvClose;
 pub const ReadNextRow = csv.CsvReadNextRow;
 pub const ReadNextCol = csv.CsvReadNextCol;
 
 pub const KV = @import("kv.zig").KV;
+
+const file = @import("file.zig");
+pub const OpenFile = file.open;
 
 const msgq = @import("msgqueue.zig");
 pub const ProcessMessageQueue = msgq.ProcessMessageQueue;
