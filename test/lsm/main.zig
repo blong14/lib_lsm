@@ -278,6 +278,8 @@ const MultiThreadedImpl = struct {
             var data_row = [2][]const u8{ undefined, undefined };
 
             const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
+            defer lsm.CsvClose(handle);
+            
             while (lsm.ReadNextRow(handle)) |row| {
                 while (lsm.ReadNextCol(row, handle)) |val| {
                     if (idx < data_row.len) {
