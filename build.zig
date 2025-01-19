@@ -85,7 +85,16 @@ pub fn build(b: *std.Build) void {
     // Integration tests
     {
         const exe = cmds.buildLsm(b, target, optimize);
-        const clap = b.dependency("clap", .{});
+        const clap = b.dependency("clap", .{
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const jemalloc = b.dependency("jemalloc", .{
+            .target = target,
+            .optimize = optimize,
+            .link_vendor = false,
+        });
         exe.addCSourceFiles(.{
             .root = fast_csv.path(""),
             .files = &.{"csv.c"},
@@ -99,7 +108,9 @@ pub fn build(b: *std.Build) void {
         exe.addLibraryPath(b.path("vendor/crossbeam-skiplist/target/release"));
         exe.addObjectFile(b.path("vendor/crossbeam-skiplist/target/release/libconcurrent_skiplist.so"));
         exe.root_module.addImport("clap", clap.module("clap"));
+        exe.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
         exe.root_module.addImport("lsm", lsm);
+        exe.linkSystemLibrary("jemalloc");
         exe.linkLibC();
 
         b.installArtifact(exe);

@@ -27,6 +27,10 @@
             .url = "https://github.com/jandoczy/csv-fast-reader/archive/refs/heads/master.zip",
             .hash = "1220b2d4dd8df92f89b4277a28ba9440d8cdb01ff21d1b693098f13a072404457ac1",
         },
+        .jemalloc = .{
+            .url = "https://github.com/jiacai2050/zig-jemalloc/archive/1b893cdfccee2c1f4cc76158561b1a0ef54ef622.tar.gz",
+            .hash = "122052dae4118b9ce7f59292cd3f903330a4724772e92fcec4cc5e5a767cc4192a0d",
+        },
     },
     .paths = .{
         // This makes *all* files, recursively, included in this package. It is generally
