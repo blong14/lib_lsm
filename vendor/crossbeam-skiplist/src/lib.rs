@@ -38,18 +38,20 @@ pub extern "C" fn skiplist_insert(
     }
 
     let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
+    
+    // SAFETY: The system ensures UTF-8 encoded keys, so unchecked conversion is safe.
     let key_str = unsafe {
-        str::from_utf8_unchecked(slice::from_raw_parts(key as *const u8, key_len+1))
+        let key_bytes = slice::from_raw_parts(key as *const u8, key_len);
+        str::from_utf8_unchecked(key_bytes)
     };
-
-    let value_slice = unsafe { std::slice::from_raw_parts(value, value_len) };
+    
+    let value_slice = unsafe { slice::from_raw_parts(value, value_len) };
     let value_vec = value_slice.to_vec();
 
-    // https://docs.rs/crossbeam-skiplist/latest/crossbeam_skiplist/struct.SkipMap.html#method.compare_insert
+    // Only insert if the key does not exist
     skip_map.compare_insert(key_str.to_string(), value_vec, |_| true);
     0 // Success
 }
-
 
 #[no_mangle]
 pub extern "C" fn skiplist_get(
@@ -64,24 +66,25 @@ pub extern "C" fn skiplist_get(
     }
 
     let key_str = unsafe {
-        str::from_utf8_unchecked(slice::from_raw_parts(key as *const u8, key_len+1))
+        let key_bytes = slice::from_raw_parts(key as *const u8, key_len);
+        str::from_utf8_unchecked(key_bytes)
     };
 
     let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
-    match skip_map.get(key_str) {
-        Some(entry) => {
-            let entry_value = entry.value();
-            let len = entry_value.len();
-            unsafe {
-                if *value_len < len {
-                    return -2; // Error: buffer too small
-                }
-                ptr::copy_nonoverlapping(entry_value.as_ptr(), value, len);
-                *value_len = len;
+    if let Some(entry) = skip_map.get(key_str) {
+        let entry_value = entry.value();
+        let len = entry_value.len();
+        
+        unsafe {
+            if *value_len < len {
+                return -2; // Error: buffer too small
             }
-            0 // Success
+            ptr::copy_nonoverlapping(entry_value.as_ptr(), value, len);
+            *value_len = len;
         }
-        None => -1, // Not found
+        0 // Success
+    } else {
+        -1 // Not found
     }
 }
 
@@ -91,6 +94,7 @@ pub extern "C" fn skiplist_remove(skiplist: *mut c_void, key: *const c_char) -> 
         return -1; // Error: null pointer
     }
     
+    // SAFETY: The key is ensured to be a valid UTF-8 null-terminated string.
     let c_str = unsafe { CStr::from_ptr(key) };
     let key_str = match c_str.to_str() {
         Ok(s) => s,

@@ -1,8 +1,10 @@
 const std = @import("std");
 
 const clap = @import("clap");
+const jemalloc = @import("jemalloc");
 const lsm = @import("lsm");
 
+const atomic = std.atomic;
 const debug = std.debug;
 const fs = std.fs;
 const heap = std.heap;
@@ -12,7 +14,9 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const KV = lsm.KV;
+const ThreadSafeBumpAllocator = lsm.ThreadSafeBumpAllocator;
 
+const allocator = jemalloc.allocator;
 const usage =
     \\-h, --help             Display this help and exit.
     \\-d, --data_dir <str>   The data directory to save files on disk.
@@ -23,9 +27,6 @@ const usage =
 ;
 
 pub fn main() !void {
-    var gpa = heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
     // First we specify what parameters our program can take.
     // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`
     const params = comptime clap.parseParamsComptime(usage);
@@ -43,7 +44,7 @@ pub fn main() !void {
     var diag = clap.Diagnostic{};
     var res = clap.parse(clap.Help, &params, parsers, .{
         .diagnostic = &diag,
-        .allocator = gpa.allocator(),
+        .allocator = allocator,
     }) catch |err| {
         // Report useful error and exit
         diag.report(io.getStdErr().writer(), err) catch {};
@@ -65,8 +66,6 @@ pub fn main() !void {
     const input = res.args.input orelse "measurements.txt";
     const mode = res.args.mode orelse Mode.singlethreaded;
 
-    const alloc = gpa.allocator();
-
     const opts: lsm.Opts = .{
         .data_dir = data_dir,
         .sst_capacity = sst_capacity,
@@ -74,9 +73,9 @@ pub fn main() !void {
     };
 
     const impl: Runnable = switch (mode) {
-        .singlethreaded => try SingleThreadedImpl.init(alloc, opts),
-        .multithreaded => try MultiThreadedImpl.init(alloc, opts),
-        .multiprocess => try MultiProcessImpl.init(alloc, opts),
+        .singlethreaded => try SingleThreadedImpl.init(allocator, opts),
+        .multithreaded => try MultiThreadedImpl.init(allocator, opts),
+        .multiprocess => try MultiProcessImpl.init(allocator, opts),
     };
 
     try impl.run(input);
@@ -88,7 +87,6 @@ const Runnable = struct {
 };
 
 const SingleThreadedImpl = struct {
-    alloc: Allocator,
     db: *lsm.Database,
 
     const Self = @This();
@@ -96,16 +94,16 @@ const SingleThreadedImpl = struct {
     var self: *Self = undefined;
 
     pub fn init(alloc: Allocator, opts: lsm.Opts) !Runnable {
-        const db = lsm.databaseFromOpts(heap.c_allocator, opts) catch |err| {
+        const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
             debug.print("database init error {s}\n", .{@errorName(err)});
             return err;
         };
 
         self = try alloc.create(Self);
         self.* = .{
-            .alloc = alloc,
             .db = db,
         };
+
         return .{
             .run = Self.run,
         };
@@ -113,21 +111,25 @@ const SingleThreadedImpl = struct {
 
     pub fn deinit(this: *Self) void {
         this.db.deinit();
-        this.alloc.destroy(self);
+        this.* = undefined;
     }
 
     pub fn run(input: []const u8) anyerror!void {
         defer self.deinit();
 
-        var arena = heap.ArenaAllocator.init(self.alloc);
+        // var arena = heap.ArenaAllocator.init(allocator);
+        // defer arena.deinit();
+
+        var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size) catch return;
         defer arena.deinit();
+        defer arena.printStats();
 
-        const allocator = arena.allocator();
+        const alloc = arena.allocator();
 
-        lsm.BeginProfile(allocator);
+        lsm.BeginProfile(alloc);
         defer lsm.EndProfile();
 
-        try parse(allocator, input);
+        try parse(alloc, input);
 
         // read(allocator);
     }
@@ -175,9 +177,13 @@ const SingleThreadedImpl = struct {
     }
 
     fn parse(alloc: Allocator, input: []const u8) !void {
+        const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
+            debug.print("database init error {s}\n", .{@errorName(err)});
+            return err;
+        };
         var idx: usize = 0;
         var data = [2][]const u8{ undefined, undefined };
-        var byte_buffer = try alloc.alloc(u8, ballast);
+        // var byte_buffer = try alloc.alloc(u8, ballast);
 
         const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
         defer lsm.CsvClose(handle);
@@ -191,11 +197,13 @@ const SingleThreadedImpl = struct {
                 idx += 1;
                 if (idx == 2) {
                     const key_len = data[0].len;
-                    const key = try xalloc(alloc, &byte_buffer, key_len);
+                    // const key = try xalloc(alloc, &byte_buffer, key_len);
+                    const key = try alloc.alloc(u8, key_len);
                     mem.copyForwards(u8, key, data[0]);
 
                     const value_len = data[1].len;
-                    const value = try xalloc(alloc, &byte_buffer, value_len);
+                    // const value = try xalloc(alloc, &byte_buffer, value_len);
+                    const value = try alloc.alloc(u8, value_len);
                     mem.copyForwards(u8, value, data[1]);
 
                     self.db.write(key, value) catch |err| {
@@ -238,8 +246,9 @@ const SingleThreadedImpl = struct {
     }
 };
 
+const MessageQueue = lsm.ThreadMessageQueue([][]const u8);
+
 const MultiThreadedImpl = struct {
-    alloc: Allocator,
     opts: lsm.Opts,
 
     const Self = @This();
@@ -249,16 +258,16 @@ const MultiThreadedImpl = struct {
     pub fn init(alloc: Allocator, opts: lsm.Opts) !Runnable {
         self = try alloc.create(Self);
         self.* = .{
-            .alloc = alloc,
             .opts = opts,
         };
+
         return .{
             .run = Self.run,
         };
     }
 
     pub fn deinit(this: *Self) void {
-        this.alloc.destroy(self);
+        this.* = undefined;
     }
 
     var mtx: std.Thread.Mutex = .{};
@@ -267,11 +276,10 @@ const MultiThreadedImpl = struct {
 
     const Reader = struct {
         pub fn publish(
-            alloc: Allocator,
             input: []const u8,
-            outbox: *lsm.ThreadMessageQueue([]const u8).Writer,
+            outbox: *MessageQueue,
         ) void {
-            var kvs = std.ArrayList([]const u8).init(alloc);
+            var kvs = std.ArrayList([]const u8).init(allocator);
             defer kvs.deinit();
 
             var idx: usize = 0;
@@ -279,7 +287,7 @@ const MultiThreadedImpl = struct {
 
             const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
             defer lsm.CsvClose(handle);
-            
+
             while (lsm.ReadNextRow(handle)) |row| {
                 while (lsm.ReadNextCol(row, handle)) |val| {
                     if (idx < data_row.len) {
@@ -290,7 +298,7 @@ const MultiThreadedImpl = struct {
                     if (idx == 2) {
                         const item = KV.init(data_row[0], data_row[1]);
 
-                        const data = item.encodeAlloc(alloc) catch |err| {
+                        const data = item.encodeAlloc(allocator) catch |err| {
                             debug.print(
                                 "not able to encode KV for key {s} error {s}\n",
                                 .{ item.key, @errorName(err) },
@@ -301,22 +309,33 @@ const MultiThreadedImpl = struct {
                         kvs.append(data) catch return;
 
                         if (kvs.items.len >= mem.page_size) {
-                            for (kvs.items) |d| {
-                                mtx.lock();
-                                defer mtx.unlock();
+                            const msg = kvs.toOwnedSlice() catch |err| {
+                                debug.print(
+                                    "not able to publish items {s}\n",
+                                    .{@errorName(err)},
+                                );
+                                return;
+                            };
 
-                                const msg = d;
-                                outbox.publish(msg) catch |err| {
-                                    debug.print(
-                                        "not able to publish items {s}\n",
-                                        .{@errorName(err)},
-                                    );
-                                };
+                            const node = allocator.create(MessageQueue.Node) catch |err| {
+                                debug.print(
+                                    "not able to publish items {s}\n",
+                                    .{@errorName(err)},
+                                );
+                                return;
+                            };
+                            node.* = .{
+                                .prev = undefined,
+                                .next = undefined,
+                                .data = msg,
+                            };
 
-                                signal.broadcast();
-                            }
+                            mtx.lock();
+                            defer mtx.unlock();
 
-                            kvs.clearRetainingCapacity();
+                            outbox.put(node);
+
+                            signal.broadcast();
                         }
 
                         idx = 0;
@@ -325,23 +344,35 @@ const MultiThreadedImpl = struct {
             }
 
             if (kvs.items.len > 0) {
-                for (kvs.items) |d| {
-                    const msg = d;
-                    outbox.publish(msg) catch |err| {
-                        debug.print(
-                            "not able to publish items {s}\n",
-                            .{@errorName(err)},
-                        );
-                    };
-                }
+                const msg = kvs.toOwnedSlice() catch |err| {
+                    debug.print(
+                        "not able to publish items {s}\n",
+                        .{@errorName(err)},
+                    );
+                    return;
+                };
+
+                const node = allocator.create(MessageQueue.Node) catch |err| {
+                    debug.print(
+                        "not able to publish items {s}\n",
+                        .{@errorName(err)},
+                    );
+                    return;
+                };
+                node.* = .{
+                    .prev = undefined,
+                    .next = undefined,
+                    .data = msg,
+                };
+
+                outbox.put(node);
             }
 
-            // Notify writer thread that we are finished publishing
             {
+                // Notify writer thread that we are finished publishing
                 mtx.lock();
                 defer mtx.unlock();
 
-                outbox.done() catch return;
                 done = true;
                 signal.broadcast();
             }
@@ -349,9 +380,37 @@ const MultiThreadedImpl = struct {
     };
 
     const Writer = struct {
-        pub fn consume(opts: lsm.Opts, inbox: *lsm.ThreadMessageQueue([]const u8).ReadIter) void {
-            debug.print("consuming data...\n", .{});
-            const db = lsm.databaseFromOpts(heap.c_allocator, opts) catch |err| {
+        fn write(wg: *std.Thread.WaitGroup, db: *lsm.Database, items: [][]const u8) void {
+            wg.start();
+            defer wg.finish();
+
+            for (items) |item| {
+                var kv: KV = .{ .key = undefined, .value = undefined };
+                kv.decode(item) catch |err| {
+                    debug.print(
+                        "not able to decode kv {s} {any}\n",
+                        .{ @errorName(err), item },
+                    );
+                    return;
+                };
+
+                db.write(kv.key, kv.value) catch |err| {
+                    debug.print(
+                        "db write error key {s} {s}\n",
+                        .{ kv.key, @errorName(err) },
+                    );
+                    return;
+                };
+            }
+        }
+
+        pub fn consume(opts: lsm.Opts, inbox: *MessageQueue) void {
+            var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size) catch return;
+            defer arena.deinit();
+            defer arena.printStats();
+
+            const arena_allocator = arena.allocator();
+            const db = lsm.databaseFromOpts(arena_allocator, opts) catch |err| {
                 debug.print(
                     "database init error {s}\n",
                     .{@errorName(err)},
@@ -359,6 +418,22 @@ const MultiThreadedImpl = struct {
                 return;
             };
             defer db.deinit();
+
+            const Pool = std.Thread.Pool;
+
+            var thread_pool: Pool = undefined;
+            thread_pool.init(Pool.Options{
+                .allocator = allocator,
+            }) catch |err| {
+                debug.print(
+                    "threadpool init error {s}\n",
+                    .{@errorName(err)},
+                );
+            };
+            defer thread_pool.deinit();
+
+            var wait_group: std.Thread.WaitGroup = undefined;
+            wait_group.reset();
 
             var count: usize = 0;
             while (true) {
@@ -371,26 +446,26 @@ const MultiThreadedImpl = struct {
                     signal.wait(&mtx);
                 }
 
-                while (inbox.next()) |item| {
-                    var kv: KV = .{ .key = undefined, .value = undefined };
-                    kv.decode(item) catch |err| {
-                        debug.print(
-                            "not able to decode kv {s} {any}\n",
-                            .{ @errorName(err), item },
-                        );
-                        return;
-                    };
-
-                    db.write(kv.key, kv.value) catch |err| {
-                        debug.print(
-                            "db write error count {d} key {s} {s}\n",
-                            .{ count, kv.key, @errorName(err) },
-                        );
-                        return;
-                    };
-                    count += 1;
+                while (!inbox.isEmpty()) {
+                    if (inbox.get()) |items| {
+                        thread_pool.spawn(
+                            write,
+                            .{ &wait_group, db, items.data },
+                        ) catch |err| {
+                            debug.print(
+                                "threadpool spawn error {s}\n",
+                                .{@errorName(err)},
+                            );
+                            return;
+                        };
+                        count += 1;
+                    }
                 }
             }
+
+            debug.print("spawned {d} workers\n", .{count});
+
+            thread_pool.waitAndWork(&wait_group);
 
             db.flush() catch |err| {
                 debug.print(
@@ -405,28 +480,18 @@ const MultiThreadedImpl = struct {
     pub fn run(input: []const u8) !void {
         defer self.deinit();
 
-        var arena = heap.ArenaAllocator.init(self.alloc);
+        var arena = heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const allocator = arena.allocator();
+        const arena_allocator = arena.allocator();
 
-        lsm.BeginProfile(allocator);
+        lsm.BeginProfile(arena_allocator);
         defer lsm.EndProfile();
 
-        var mailbox = try lsm.ThreadMessageQueue([]const u8).init(self.alloc);
-        defer self.alloc.destroy(mailbox);
-        defer mailbox.deinit();
+        var mailbox = MessageQueue.init();
 
-        const publisher = try std.Thread.spawn(.{}, Reader.publish, .{
-            allocator,
-            input,
-            @constCast(&mailbox.publisher()),
-        });
-
-        var reader = mailbox.subscribe();
-        defer reader.deinit();
-
-        const consumer = try std.Thread.spawn(.{}, Writer.consume, .{ self.opts, &reader });
+        const publisher = try std.Thread.spawn(.{}, Reader.publish, .{ input, &mailbox });
+        const consumer = try std.Thread.spawn(.{}, Writer.consume, .{ self.opts, &mailbox });
 
         consumer.join();
         publisher.join();
@@ -434,7 +499,6 @@ const MultiThreadedImpl = struct {
 };
 
 const MultiProcessImpl = struct {
-    alloc: Allocator,
     opts: lsm.Opts,
 
     const Self = @This();
@@ -443,30 +507,33 @@ const MultiProcessImpl = struct {
 
     pub fn init(alloc: Allocator, opts: lsm.Opts) !Runnable {
         self = try alloc.create(Self);
-        self.* = .{ .alloc = alloc, .opts = opts };
+        self.* = .{
+            .opts = opts,
+        };
+
         return .{
             .run = Self.run,
         };
     }
 
     pub fn deinit(this: *Self) void {
-        this.alloc.destroy(self);
+        this.* = undefined;
     }
 
     pub fn run(input: []const u8) !void {
         defer self.deinit();
 
-        var arena = heap.ArenaAllocator.init(self.alloc);
+        var arena = heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const allocator = arena.allocator();
+        const alloc = arena.allocator();
 
-        var mailbox = try lsm.ProcessMessageQueue.init(allocator, ".");
+        var mailbox = try lsm.ProcessMessageQueue.init(alloc, ".");
         defer mailbox.deinit();
 
         const reader = try std.Thread.spawn(.{}, struct {
             pub fn consume(opts: lsm.Opts, inbox: *const lsm.ProcessMessageQueue.ReadIter) void {
-                const db = lsm.databaseFromOpts(heap.c_allocator, opts) catch |err| {
+                const db = lsm.databaseFromOpts(allocator, opts) catch |err| {
                     debug.print(
                         "database init error {s}\n",
                         .{@errorName(err)},
@@ -515,6 +582,8 @@ const MultiProcessImpl = struct {
         var data_row = [2][]const u8{ undefined, undefined };
 
         const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
+        defer lsm.CsvClose(handle);
+
         while (lsm.ReadNextRow(handle)) |row| {
             while (lsm.ReadNextCol(row, handle)) |val| {
                 if (idx < data_row.len) {

@@ -8,6 +8,7 @@ const tbm = @import("tablemap.zig");
 const skl = @import("skiplist.zig");
 
 const Allocator = std.mem.Allocator;
+const AtomicValue = std.atomic.Value;
 const File = std.fs.File;
 
 const KV = keyvalue.KV;
@@ -15,46 +16,46 @@ const Opts = options.Opts;
 const SkipList = skl.SkipList;
 const SSTable = sst.SSTable;
 
+const assert = std.debug.assert;
 const print = std.debug.print;
 
 pub const Memtable = struct {
-    const Self = @This();
-
-    const Error = error{
-        Full,
-    };
-
     alloc: Allocator,
-    byte_count: usize,
     cap: usize,
-    data: *SkipList([]const u8, keyvalue.decode, keyvalue.encode),
     id: u64,
     opts: Opts,
-    mutable: bool,
-    sstable: ?*SSTable,
+
+    byte_count: AtomicValue(usize),
+    data: AtomicValue(*SkipList([]const u8, keyvalue.decode, keyvalue.encode)),
+    mutable: AtomicValue(bool),
+    sstable: AtomicValue(?*SSTable),
+
+    const Self = @This();
 
     pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
         const cap = opts.sst_capacity;
-        const map = try SkipList([]const u8, keyvalue.decode, keyvalue.encode).init(alloc);
+
+        const map = try alloc.create(SkipList([]const u8, keyvalue.decode, keyvalue.encode));
+        map.* = try SkipList([]const u8, keyvalue.decode, keyvalue.encode).init(alloc);
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
             .alloc = alloc,
-            .byte_count = 0,
             .cap = cap,
-            .data = map,
             .id = id,
-            .mutable = true,
             .opts = opts,
-            .sstable = null,
+            .byte_count = AtomicValue(usize).init(0),
+            .data = AtomicValue(*SkipList([]const u8, keyvalue.decode, keyvalue.encode)).init(map),
+            .mutable = AtomicValue(bool).init(true),
+            .sstable = AtomicValue(?*SSTable).init(null),
         };
         return mtable;
     }
 
     pub fn deinit(self: *Self) void {
-        self.data.deinit();
-        self.alloc.destroy(self.data);
-        if (self.*.sstable) |sstbl| {
+        const data = self.data.load(.seq_cst);
+        self.alloc.destroy(data);
+        if (self.sstable.load(.seq_cst)) |sstbl| {
             sstbl.deinit();
             self.alloc.destroy(sstbl);
         }
@@ -62,19 +63,16 @@ pub const Memtable = struct {
     }
 
     pub fn getId(self: Self) u64 {
-        return self.id;
+        return @atomicLoad(u64, &self.id, .seq_cst);
     }
 
     pub fn put(self: *Self, item: KV) !void {
-        if (!self.mutable) {
-            return error.Full;
-        }
-        try self.data.put(item.key, item.value);
-        self.byte_count += item.len();
+        try self.data.load(.seq_cst).put(item.key, item.value);
+        _ = self.byte_count.fetchAdd(item.len(), .seq_cst);
     }
 
     pub fn get(self: Self, key: []const u8) ?KV {
-        const value = self.data.get(key) catch |err| {
+        const value = self.data.load(.seq_cst).get(key) catch |err| {
             print("key {s} {s}\n", .{ key, @errorName(err) });
             return null;
         };
@@ -82,11 +80,19 @@ pub const Memtable = struct {
     }
 
     pub fn count(self: Self) usize {
-        return self.data.count();
+        return self.data.load(.seq_cst).count();
+    }
+
+    pub fn freeze(self: *Self) void {
+        self.mutable.store(false, .seq_cst);
+    }
+
+    pub fn frozen(self: Self) bool {
+        return !self.mutable.load(.seq_cst);
     }
 
     pub fn size(self: Self) usize {
-        return self.byte_count;
+        return self.byte_count.load(.seq_cst);
     }
 
     pub const Iterator = struct {
@@ -99,30 +105,23 @@ pub const Memtable = struct {
         }
 
         pub fn value(it: Iterator) KV {
-            return it.v;
+            return KV.init(it.data.key(), it.data.value());
         }
 
         pub fn next(it: *Iterator) !bool {
-            if (try it.data.next()) {
-                it.*.v = KV.init(it.data.key(), it.data.value());
-                return true;
-            } else {
-                return false;
-            }
+            return try it.data.next();
         }
     };
 
-    pub fn iterator(self: *Self) !*Iterator {
-        const iter = try self.alloc.create(Iterator);
-        iter.* = .{
-            .data = self.data.iter(self.alloc),
+    pub fn iterator(self: *Self) !Iterator {
+        return .{
+            .data = self.data.load(.seq_cst).iter(),
             .v = undefined,
         };
-        return iter;
     }
 
     pub fn flush(self: *Self) !void {
-        if (!self.mutable or self.count() == 0) {
+        if (self.count() == 0) {
             return;
         }
 
@@ -130,7 +129,7 @@ pub const Memtable = struct {
         errdefer self.alloc.destroy(sstable);
         errdefer sstable.deinit();
 
-        var iter = self.data.iter(self.alloc);
+        var iter = self.data.load(.seq_cst).iter();
         defer iter.deinit();
 
         while (try iter.next()) {
@@ -149,8 +148,7 @@ pub const Memtable = struct {
 
         try sstable.flush();
 
-        self.*.sstable = sstable;
-        self.*.mutable = false;
+        self.sstable.store(sstable, .seq_cst);
     }
 };
 

@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const HashMap = std.StringHashMap;
 const File = std.fs.File;
+const SinglyLinkedList = std.SinglyLinkedList;
 
 const Block = blk.Block;
 const BlockMeta = blk.BlockMeta;
@@ -35,7 +36,7 @@ pub const SSTable = struct {
     data_dir: []const u8,
     file: File,
     id: u64,
-    index: HashMap(u64),
+    index: HashMap(*SinglyLinkedList(u64)),
     mutable: bool,
     stream: *MMap,
 
@@ -65,10 +66,14 @@ pub const SSTable = struct {
             .data_dir = opts.data_dir,
             .file = undefined,
             .id = id,
-            .index = HashMap(u64).init(alloc),
+            .index = HashMap(*SinglyLinkedList(u64)).init(alloc),
             .mutable = true,
             .stream = undefined,
         };
+
+        // TODO: Why is this needed?
+        // try st.index.ensureTotalCapacity(1_000_000);
+
         return st;
     }
 
@@ -111,7 +116,16 @@ pub const SSTable = struct {
     }
 
     pub fn read(self: Self, key: []const u8, kv: *KV) !void {
-        const idx = self.index.get(key) orelse return Error.NotFound;
+        const list = self.index.get(key) orelse return Error.NotFound;
+
+        var idx: u64 = 0;
+        var it = list.first;
+        while (it) |node| : (it = node.next) {
+            // TODO implement this correctly
+            idx = node.data;
+            break;
+        }
+
         kv.* = self.block.read(idx) catch |err| {
             print(
                 "sstable not able to read from block @ offset {d}: {s}\n",
@@ -123,14 +137,6 @@ pub const SSTable = struct {
 
     pub fn write(self: *Self, value: KV) !usize {
         if (self.mutable) {
-            //if (self.index.getKey(value.key)) |key| {
-            //    print(
-            //        "sstable not able to write to existing key: {s}\n",
-            //        .{key},
-            //    );
-            //    return Error.DuplicateError;
-            //}
-
             const idx = self.block.write(value) catch |err| {
                 print(
                     "sstable not able to write to block for key {s}: {s}\n",
@@ -139,13 +145,23 @@ pub const SSTable = struct {
                 return err;
             };
 
-            self.index.put(value.key, idx) catch |err| {
+            const item = SinglyLinkedList(u64).Node{ .data = idx };
+
+            var result = self.index.getOrPut(value.key) catch |err| {
                 print(
                     "sstable not able to write to index for key {s}: {s}\n",
                     .{ value.key, @errorName(err) },
                 );
                 return err;
             };
+
+            if (result.found_existing) {
+                result.value_ptr.*.prepend(@constCast(&item));
+            } else {
+                var list = try self.alloc.create(SinglyLinkedList(u64));
+                list.prepend(@constCast(&item));
+                result.value_ptr = &list;
+            }
 
             return idx;
         }

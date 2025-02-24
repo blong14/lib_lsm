@@ -4,12 +4,15 @@ BUILD_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
 DEBUG_BUILD_OPTS := -Dcpu=x86_64 -Doptimize=Debug
 DATA_DIR := .tmp/data
 EXEC := zig-out/bin/lsm
+MODE := singlethreaded
 SOURCES := $(wildcard ./src/*.zig)
 
 # 3rd party deps
 # sudo apt install linux-tools-common
 # sudo apt install linux-tools-generic
 # sudo apt install libzmq5-dev
+# sudo apt install -y libjemalloc-dev
+# zig fetch --global-cache-dir zig-cache --save=jemalloc https://github.com/jiacai2050/zig-jemalloc/archive/1b893cdfccee2c1f4cc76158561b1a0ef54ef622.tar.gz
 # zig fetch --global-cache-dir zig-cache --save=zzmq 'https://github.com/nine-lives-later/zzmq/archive/refs/tags/v0.2.2-zig0.12.tar.gz'
 # zig fetch --global-cache-dir zig-cache --save 'https://github.com/Hejsil/zig-clap/archive/refs/tags/0.9.1.tar.gz'
 # zig fetch --global-cache-dir zig-cache --save 'https://github.com/zigcc/zig-msgpack/archive/refs/tags/0.0.5.tar.gz'
@@ -33,14 +36,14 @@ debug-build: clean fmt
 	@zig build $(DEBUG_BUILD_OPTS)
 
 perf: debug-build
-	perf record -F 200 -g $(EXEC)
+	perf record -F 200 -g $(EXEC) --mode $(MODE)
 	perf script --input=perf.data -F +pid > perf.processed.data
 
 run: clean fmt
-	zig build run-lsm -- --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
+	zig build run-lsm -- --mode $(MODE) --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
 
 profile: clean build
-	$(EXEC) --input measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
+	$(EXEC) --mode $(MODE) --input measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
 
 clean:
 	rm -rf $(BIN)/* callgrind.o massif.o $(DATA_DIR)/*.dat $(DATA_DIR)/data*/* 
@@ -51,7 +54,7 @@ test: $(SOURCES)
 poop: clean build 
 	./bin/poop './$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./measurements.txt --sst_capacity 1_000_000' \
 		'./$(EXEC) --data_dir ./.tmp/data/data2 --mode multithreaded --input ./measurements.txt --sst_capacity 1_000_000' \
-		'./$(EXEC) --data_dir ./.tmp/data/data3 --mode multiprocess --input ./measurements.txt --sst_capacity 500_000' \
+		# './$(EXEC) --data_dir ./.tmp/data/data3 --mode multiprocess --input ./measurements.txt --sst_capacity 500_000' \
 
 callgrind.o: $(EXEC)
 	# kcachegrind

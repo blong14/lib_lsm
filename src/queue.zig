@@ -1,228 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("errno.h");
-    @cInclude("stdio.h");
-    @cInclude("stdlib.h");
-});
-const sys = @cImport({
-    @cInclude("sys/ipc.h");
-    @cInclude("sys/msg.h");
-    @cInclude("sys/types.h");
-});
-
-const KV = @import("kv.zig").KV;
 
 const assert = std.debug.assert;
-const errno = std.posix.errno;
 const expect = std.testing.expect;
-const Allocator = std.mem.Allocator;
 
-const EOQ = 2;
-
-/// `ProcessMessageQueue` is a System V message queue wrapper.
-/// The calling process must have write permission on the message queue
-/// in order to send a message, and read permission to receive a message.
-pub const ProcessMessageQueue = struct {
-    alloc: Allocator,
-    msqid: c_int,
-    msqproj: c_int,
-    msqtype: c_long,
-
-    const Self = @This();
-
-    const MessageQueueError = error{
-        EOQ, // queue has been closed
-        OutOfMemory,
-        ReadError,
-        WriteError,
-    };
-
-    const Message = struct {
-        mtype: c_long,
-        mdata: []const u8,
-    };
-
-    /// Creates a `ProcessMessageQueue` with msqid derived from the given file path.
-    pub fn init(alloc: Allocator, path: [*c]const u8) MessageQueueError!*Self {
-        const msqproj = 1;
-        const key = sys.ftok(path, msqproj);
-        if (key == -1) {
-            c.perror("unable to create msqid");
-            return MessageQueueError.ReadError;
-        }
-
-        const msqid = sys.msgget(key, 0o666 | sys.IPC_CREAT);
-        if (msqid == -1) {
-            c.perror("unable to get message queue");
-            return MessageQueueError.WriteError;
-        }
-
-        const msgq = try alloc.create(Self);
-        msgq.* = .{
-            .alloc = alloc,
-            .msqid = msqid,
-            .msqproj = msqproj,
-            .msqtype = 1,
-        };
-        return msgq;
-    }
-
-    /// Remove the message queue
-    pub fn deinit(self: *Self) void {
-        if (sys.msgctl(self.msqid, sys.IPC_RMID, null) == -1) {
-            c.perror("unable to destroy message queue");
-        }
-        self.* = undefined;
-    }
-
-    /// Reader consumes messages off the queue.
-    /// The reader is active until there is an error
-    /// or the `Done` message is consumed.
-    pub const ReadIter = struct {
-        msqid: c_int,
-        msgsize: usize,
-
-        /// Consumes the next element from the queue and returns it.
-        /// returns null when done reading.
-        pub fn next(self: ReadIter) ?[]const u8 {
-            var buf: Message = undefined;
-            switch (errno(sys.msgrcv(self.msqid, &buf, self.msgsize, 0, 0))) {
-                .SUCCESS => {
-                    if (buf.mtype == EOQ) {
-                        return null;
-                    }
-                    return buf.mdata;
-                },
-                else => {
-                    c.perror("unable to read message");
-                    return null;
-                },
-            }
-        }
-    };
-
-    /// Subscribe to receive messages from this message queue.
-    pub fn subscribe(self: Self) ReadIter {
-        return .{
-            .msqid = self.msqid,
-            .msgsize = std.mem.page_size,
-        };
-    }
-
-    /// Writer publishes messages to the queue.
-    /// The writer must call `done` to signal
-    /// that the subscriber should stop consuming messages.
-    pub const Writer = struct {
-        msqid: c_int,
-        msgsize: usize,
-        msqtype: c_long,
-
-        /// Publishes a new element to the back of the queue.
-        pub fn publish(self: Writer, v: []const u8) MessageQueueError!void {
-            var mesg = Message{ .mtype = self.msqtype, .mdata = v };
-            switch (errno(sys.msgsnd(self.msqid, &mesg, v.len, 0))) {
-                .SUCCESS => return,
-                .IDRM => return MessageQueueError.EOQ,
-                else => {
-                    c.perror("unable to send message");
-                    return MessageQueueError.WriteError;
-                },
-            }
-        }
-
-        /// Signals consumers that this writer is done sending messages.
-        pub fn done(self: Writer) MessageQueueError!void {
-            var end: Message = .{ .mtype = EOQ, .mdata = undefined };
-            switch (errno(sys.msgsnd(self.msqid, &end, self.msgsize, 0))) {
-                .SUCCESS => return,
-                .IDRM => return MessageQueueError.EOQ,
-                else => {
-                    c.perror("unable to send message");
-                    return MessageQueueError.WriteError;
-                },
-            }
-        }
-    };
-
-    /// Create a publisher to send messages on the queue.
-    pub fn publisher(self: Self) Writer {
-        return .{
-            .msqid = self.msqid,
-            .msgsize = std.mem.page_size,
-            .msqtype = self.msqtype,
-        };
-    }
-};
-
-test ProcessMessageQueue {
-    const testing = std.testing;
-    const Elem = extern struct {
-        data: usize,
-        const Self = @This();
-    };
-
-    const elem: Elem = .{ .data = 1 };
-
-    // Create a mailbox to read and write messages to.
-    // The main thread will be in charge of cleaning up the mailbox
-    var alloc = testing.allocator;
-    var mailbox = try ProcessMessageQueue.init(alloc, ".");
-    defer alloc.destroy(mailbox);
-    defer mailbox.deinit();
-
-    const reader = mailbox.subscribe();
-    const writer = try std.Thread.spawn(.{}, struct {
-        pub fn publish(outbox: ProcessMessageQueue.Writer, data: Elem) !void {
-            try outbox.publish(std.mem.toBytes(data));
-        }
-    }.publish, .{ mailbox.publisher(), elem });
-
-    const actual = reader.next();
-    const byts = actual.?;
-    const value = std.mem.bytesToValue(Elem, byts);
-    try testing.expect(value.data == elem.data);
-    writer.join();
-}
-
-test "Test count" {
-    const testing = std.testing;
-    const Elem = extern struct {
-        data: usize,
-        const Self = @This();
-    };
-
-    var elems = [_]Elem{ .{ .data = 1 }, .{ .data = 2 } };
-
-    // Create a mailbox to read and write messages to.
-    // The main thread will be in charge of cleaning up the mailbox
-    var alloc = testing.allocator;
-    var mailbox = try ProcessMessageQueue.init(alloc, ".");
-    defer alloc.destroy(mailbox);
-    defer mailbox.deinit();
-
-    // Count all messages
-    const reader = mailbox.subscribe();
-    const writer = try std.Thread.spawn(.{}, struct {
-        pub fn publish(outbox: ProcessMessageQueue.Writer, data: []Elem) !void {
-            defer outbox.done() catch |err| {
-                std.debug.print("Oops {s}\n", .{@errorName(err)});
-            };
-            for (data) |elem| {
-                try outbox.publish(std.mem.toBytes(elem));
-            }
-        }
-    }.publish, .{ mailbox.publisher(), &elems });
-
-    var count: u8 = 0;
-    while (reader.next()) |_| {
-        count += 1;
-    }
-    try testing.expect(count == elems.len);
-    writer.join();
-}
-
-/// `Queue` is a many producer, many consumer, non-allocating, thread-safe.
+/// Many producer, many consumer, non-allocating, thread-safe.
 /// Uses a mutex to protect access.
 /// The queue does not manage ownership and the user is responsible to
 /// manage the storage of the nodes.
@@ -231,11 +13,8 @@ pub fn Queue(comptime T: type) type {
         head: ?*Node,
         tail: ?*Node,
         mutex: std.Thread.Mutex,
-
         pub const Self = @This();
-
         pub const Node = std.DoublyLinkedList(T).Node;
-
         /// Initializes a new queue. The queue does not provide a `deinit()`
         /// function, so the user must take care of cleaning up the queue elements.
         pub fn init() Self {
@@ -245,7 +24,6 @@ pub fn Queue(comptime T: type) type {
                 .mutex = std.Thread.Mutex{},
             };
         }
-
         /// Appends `node` to the queue.
         /// The lifetime of `node` must be longer than the lifetime of the queue.
         pub fn put(self: *Self, node: *Node) void {
@@ -261,7 +39,6 @@ pub fn Queue(comptime T: type) type {
                 self.head = node;
             }
         }
-
         /// Gets a previously inserted node or returns `null` if there is none.
         /// It is safe to `get()` a node from the queue while another thread tries
         /// to `remove()` the same node at the same time.
@@ -280,7 +57,6 @@ pub fn Queue(comptime T: type) type {
             head.next = null;
             return head;
         }
-
         /// Prepends `node` to the front of the queue.
         /// The lifetime of `node` must be longer than the lifetime of the queue.
         pub fn unget(self: *Self, node: *Node) void {
@@ -296,7 +72,6 @@ pub fn Queue(comptime T: type) type {
                 self.tail = node;
             }
         }
-
         /// Removes a node from the queue, returns whether node was actually removed.
         /// It is safe to `remove()` a node from the queue while another thread tries
         /// to `get()` the same node at the same time.
@@ -320,7 +95,6 @@ pub fn Queue(comptime T: type) type {
             node.next = null;
             return true;
         }
-
         /// Returns `true` if the queue is currently empty.
         /// Note that in a multi-consumer environment a return value of `false`
         /// does not mean that `get` will yield a non-`null` value!
@@ -329,12 +103,10 @@ pub fn Queue(comptime T: type) type {
             defer self.mutex.unlock();
             return self.head == null;
         }
-
         /// Dumps the contents of the queue to `stderr`.
         pub fn dump(self: *Self) void {
             self.dumpToStream(std.io.getStdErr().writer()) catch return;
         }
-
         /// Dumps the contents of the queue to `stream`.
         /// Up to 4 elements from the head are dumped and the tail of the queue is
         /// dumped as well.
@@ -368,7 +140,6 @@ pub fn Queue(comptime T: type) type {
         }
     };
 }
-
 const Context = struct {
     allocator: std.mem.Allocator,
     queue: *Queue(i32),
@@ -377,7 +148,6 @@ const Context = struct {
     get_count: usize,
     puts_done: bool,
 };
-
 // TODO add lazy evaluated build options and then put puts_per_thread behind
 // some option such as: "AggressiveMultithreadedFuzzTest". In the AppVeyor
 // CI we would use a less aggressive setting since at 1 core, while we still
@@ -385,7 +155,7 @@ const Context = struct {
 // we would also use a less aggressive setting when running in valgrind
 const puts_per_thread = 500;
 const put_thread_count = 3;
-test "msgqueue.Queue" {
+test "std.atomic.Queue" {
     const plenty_of_memory = try std.heap.page_allocator.alloc(u8, 300 * 1024);
     defer std.heap.page_allocator.free(plenty_of_memory);
     var fixed_buffer_allocator = std.heap.FixedBufferAllocator.init(plenty_of_memory);
@@ -444,7 +214,6 @@ test "msgqueue.Queue" {
         });
     }
 }
-
 fn startPuts(ctx: *Context) u8 {
     var put_count: usize = puts_per_thread;
     var prng = std.rand.DefaultPrng.init(0xdeadbeef);
@@ -463,7 +232,6 @@ fn startPuts(ctx: *Context) u8 {
     }
     return 0;
 }
-
 fn startGets(ctx: *Context) u8 {
     while (true) {
         const last = @atomicLoad(bool, &ctx.puts_done, .SeqCst);
@@ -475,8 +243,7 @@ fn startGets(ctx: *Context) u8 {
         if (last) return 0;
     }
 }
-
-test "msgqueue.Queue single-threaded" {
+test "std.atomic.Queue single-threaded" {
     var queue = Queue(i32).init();
     try expect(queue.isEmpty());
     var node_0 = Queue(i32).Node{
@@ -538,8 +305,7 @@ test "msgqueue.Queue single-threaded" {
     try expect(queue.get() == null);
     try expect(queue.isEmpty());
 }
-
-test "msgqueue.Queue dump" {
+test "std.atomic.Queue dump" {
     const mem = std.mem;
     var buffer: [1024]u8 = undefined;
     var expected_buffer: [1024]u8 = undefined;
