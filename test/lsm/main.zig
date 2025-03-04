@@ -96,10 +96,7 @@ const SingleThreadedImpl = struct {
     }
 
     pub fn run(input: []const u8, opts: lsm.Opts) anyerror!void {
-        // var arena = heap.ArenaAllocator.init(allocator);
-        // defer arena.deinit();
-
-        var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size * 2) catch return;
+        var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size) catch return;
         defer arena.deinit();
         defer arena.printStats();
 
@@ -111,48 +108,6 @@ const SingleThreadedImpl = struct {
         try parse(alloc, input, opts);
     }
 
-    var ballast: usize = std.mem.page_size;
-
-    fn xalloc(alloc: Allocator, buffer: *[]u8, len_: usize) ![]u8 {
-        if (buffer.*.len == 0) {
-            buffer.* = try alloc.alloc(u8, ballast);
-            ballast *= 2;
-        }
-        const result = @subWithOverflow(buffer.*.len - 1, len_);
-        var offset = result[0];
-        if (result[1] != 0) {
-            buffer.* = try alloc.alloc(u8, ballast);
-            ballast *= 2;
-            offset = (buffer.*.len - 1) - len_;
-        }
-        var n: []u8 = undefined;
-        n = buffer.*[offset .. buffer.*.len - 1];
-        buffer.* = buffer.*[0..offset];
-        return n;
-    }
-
-    test "xalloc" {
-        const testing = std.testing;
-        const alloc = testing.allocator;
-
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-
-        var buffer = try arena.allocator().alloc(u8, ballast);
-
-        var actual = try xalloc(arena.allocator(), &buffer, 4094);
-
-        try testing.expectEqual(actual.len, 4094);
-
-        actual = try xalloc(arena.allocator(), &buffer, 4094);
-
-        try testing.expectEqual(actual.len, 4094);
-
-        actual = try xalloc(arena.allocator(), &buffer, 2);
-
-        try testing.expectEqual(actual.len, 2);
-    }
-
     fn parse(alloc: Allocator, input: []const u8, opts: lsm.Opts) !void {
         const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
             debug.print("database init error {s}\n", .{@errorName(err)});
@@ -160,7 +115,6 @@ const SingleThreadedImpl = struct {
         };
         var idx: usize = 0;
         var data = [2][]const u8{ undefined, undefined };
-        // var byte_buffer = try alloc.alloc(u8, ballast);
 
         const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
         defer lsm.CsvClose(handle);
@@ -175,15 +129,11 @@ const SingleThreadedImpl = struct {
                 if (idx == 2) {
                     const key_len = data[0].len;
                     const value_len = data[1].len;
-
-                    // const key = try xalloc(alloc, &byte_buffer, key_len);
+                    
                     const byts = try alloc.alloc(u8, key_len + value_len);
 
                     mem.copyForwards(u8, byts[0..key_len], data[0]);
                     mem.copyForwards(u8, byts[key_len..], data[1]);
-
-                    // const value = try xalloc(alloc, &byte_buffer, value_len);
-                    // const value = try alloc.alloc(u8, value_len);
 
                     db.write(byts[0..key_len], byts[key_len..]) catch |err| {
                         debug.print(
@@ -192,6 +142,7 @@ const SingleThreadedImpl = struct {
                         );
                         return;
                     };
+                    
                     idx = 0;
                     cnt += 1;
                 }
@@ -354,7 +305,7 @@ const MultiThreadedImpl = struct {
         }
 
         pub fn consume(opts: lsm.Opts, inbox: *MessageQueue) void {
-            var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size * 4) catch return;
+            var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size) catch return;
             defer arena.deinit();
             defer arena.printStats();
 
@@ -372,7 +323,7 @@ const MultiThreadedImpl = struct {
 
             var thread_pool: Pool = undefined;
             thread_pool.init(Pool.Options{
-                .allocator = allocator,
+                .allocator = arena_allocator,
             }) catch |err| {
                 debug.print(
                     "threadpool init error {s}\n",

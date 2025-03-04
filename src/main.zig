@@ -23,7 +23,7 @@ pub const CsvClose = csv.CsvClose;
 pub const ReadNextRow = csv.CsvReadNextRow;
 pub const ReadNextCol = csv.CsvReadNextCol;
 
-pub const ThreadSafeBumpAllocator = @import("byte_arena.zig").ThreadSafeBumpAllocator;
+pub const ThreadSafeBumpAllocator = @import("bump_allocator.zig").ThreadSafeBumpAllocator;
 
 pub const KV = @import("kv.zig").KV;
 

@@ -114,9 +114,9 @@ pub const SSTable = struct {
         // idea 3: map keys and indices
         var stream = fixedBufferStream(self.block.offset_data.items);
         var stream_reader = stream.reader();
-        
+
         while (stream.pos < stream.buffer.len) {
-            const idx = try stream_reader.readInt(u64, Endian); 
+            const idx = try stream_reader.readInt(u64, Endian);
 
             const value = self.block.read(idx) catch |err| {
                 print(
@@ -129,7 +129,7 @@ pub const SSTable = struct {
             if (std.mem.eql(u8, value.key, key)) {
                 kv.* = value;
                 return;
-            } 
+            }
         }
     }
 
