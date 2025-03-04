@@ -129,7 +129,7 @@ const SingleThreadedImpl = struct {
                 if (idx == 2) {
                     const key_len = data[0].len;
                     const value_len = data[1].len;
-                    
+
                     const byts = try alloc.alloc(u8, key_len + value_len);
 
                     mem.copyForwards(u8, byts[0..key_len], data[0]);
@@ -142,7 +142,7 @@ const SingleThreadedImpl = struct {
                         );
                         return;
                     };
-                    
+
                     idx = 0;
                     cnt += 1;
                 }
