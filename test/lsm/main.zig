@@ -73,54 +73,33 @@ pub fn main() !void {
     };
 
     const impl: Runnable = switch (mode) {
-        .singlethreaded => try SingleThreadedImpl.init(allocator, opts),
-        .multithreaded => try MultiThreadedImpl.init(allocator, opts),
-        .multiprocess => try MultiProcessImpl.init(allocator, opts),
+        .singlethreaded => try SingleThreadedImpl.init(),
+        .multithreaded => try MultiThreadedImpl.init(),
+        .multiprocess => try MultiProcessImpl.init(),
     };
 
-    try impl.run(input);
+    try impl.run(input, opts);
 }
 
 /// Runnable defines the standard interface for a command
 const Runnable = struct {
-    run: *const fn (input: []const u8) anyerror!void,
+    run: *const fn (input: []const u8, opts: lsm.Opts) anyerror!void,
 };
 
 const SingleThreadedImpl = struct {
-    db: *lsm.Database,
-
     const Self = @This();
 
-    var self: *Self = undefined;
-
-    pub fn init(alloc: Allocator, opts: lsm.Opts) !Runnable {
-        const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
-            debug.print("database init error {s}\n", .{@errorName(err)});
-            return err;
-        };
-
-        self = try alloc.create(Self);
-        self.* = .{
-            .db = db,
-        };
-
+    pub fn init() !Runnable {
         return .{
             .run = Self.run,
         };
     }
 
-    pub fn deinit(this: *Self) void {
-        this.db.deinit();
-        this.* = undefined;
-    }
-
-    pub fn run(input: []const u8) anyerror!void {
-        defer self.deinit();
-
+    pub fn run(input: []const u8, opts: lsm.Opts) anyerror!void {
         // var arena = heap.ArenaAllocator.init(allocator);
         // defer arena.deinit();
 
-        var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size) catch return;
+        var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size * 2) catch return;
         defer arena.deinit();
         defer arena.printStats();
 
@@ -129,9 +108,7 @@ const SingleThreadedImpl = struct {
         lsm.BeginProfile(alloc);
         defer lsm.EndProfile();
 
-        try parse(alloc, input);
-
-        // read(allocator);
+        try parse(alloc, input, opts);
     }
 
     var ballast: usize = std.mem.page_size;
@@ -176,7 +153,7 @@ const SingleThreadedImpl = struct {
         try testing.expectEqual(actual.len, 2);
     }
 
-    fn parse(alloc: Allocator, input: []const u8) !void {
+    fn parse(alloc: Allocator, input: []const u8, opts: lsm.Opts) !void {
         const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
             debug.print("database init error {s}\n", .{@errorName(err)});
             return err;
@@ -197,16 +174,18 @@ const SingleThreadedImpl = struct {
                 idx += 1;
                 if (idx == 2) {
                     const key_len = data[0].len;
-                    // const key = try xalloc(alloc, &byte_buffer, key_len);
-                    const key = try alloc.alloc(u8, key_len);
-                    mem.copyForwards(u8, key, data[0]);
-
                     const value_len = data[1].len;
-                    // const value = try xalloc(alloc, &byte_buffer, value_len);
-                    const value = try alloc.alloc(u8, value_len);
-                    mem.copyForwards(u8, value, data[1]);
 
-                    self.db.write(key, value) catch |err| {
+                    // const key = try xalloc(alloc, &byte_buffer, key_len);
+                    const byts = try alloc.alloc(u8, key_len + value_len);
+
+                    mem.copyForwards(u8, byts[0..key_len], data[0]);
+                    mem.copyForwards(u8, byts[key_len..], data[1]);
+
+                    // const value = try xalloc(alloc, &byte_buffer, value_len);
+                    // const value = try alloc.alloc(u8, value_len);
+
+                    db.write(byts[0..key_len], byts[key_len..]) catch |err| {
                         debug.print(
                             "database write error: key {s} value {s} error {s}\n",
                             .{ data[0], data[1], @errorName(err) },
@@ -219,7 +198,7 @@ const SingleThreadedImpl = struct {
             }
         }
 
-        self.db.flush() catch |err| {
+        db.flush() catch |err| {
             debug.print(
                 "not able to flush database error {s}\n",
                 .{@errorName(err)},
@@ -227,47 +206,17 @@ const SingleThreadedImpl = struct {
             return;
         };
     }
-
-    fn read(alloc: Allocator) void {
-        var iter = self.db.iterator() catch |err| {
-            debug.print(
-                "database iter err: {s}\n",
-                .{@errorName(err)},
-            );
-            return;
-        };
-        defer iter.deinit(alloc);
-
-        var count: usize = 0;
-        while (iter.next() catch false) {
-            debug.print("{d}:\t{}\n", .{ count, iter.value() });
-            count += 1;
-        }
-    }
 };
 
 const MessageQueue = lsm.ThreadMessageQueue([][]const u8);
 
 const MultiThreadedImpl = struct {
-    opts: lsm.Opts,
-
     const Self = @This();
 
-    var self: *Self = undefined;
-
-    pub fn init(alloc: Allocator, opts: lsm.Opts) !Runnable {
-        self = try alloc.create(Self);
-        self.* = .{
-            .opts = opts,
-        };
-
+    pub fn init() !Runnable {
         return .{
             .run = Self.run,
         };
-    }
-
-    pub fn deinit(this: *Self) void {
-        this.* = undefined;
     }
 
     var mtx: std.Thread.Mutex = .{};
@@ -405,7 +354,7 @@ const MultiThreadedImpl = struct {
         }
 
         pub fn consume(opts: lsm.Opts, inbox: *MessageQueue) void {
-            var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size) catch return;
+            var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size * 4) catch return;
             defer arena.deinit();
             defer arena.printStats();
 
@@ -477,9 +426,7 @@ const MultiThreadedImpl = struct {
         }
     };
 
-    pub fn run(input: []const u8) !void {
-        defer self.deinit();
-
+    pub fn run(input: []const u8, opts: lsm.Opts) !void {
         var arena = heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
@@ -491,7 +438,7 @@ const MultiThreadedImpl = struct {
         var mailbox = MessageQueue.init();
 
         const publisher = try std.Thread.spawn(.{}, Reader.publish, .{ input, &mailbox });
-        const consumer = try std.Thread.spawn(.{}, Writer.consume, .{ self.opts, &mailbox });
+        const consumer = try std.Thread.spawn(.{}, Writer.consume, .{ opts, &mailbox });
 
         consumer.join();
         publisher.join();
@@ -499,30 +446,15 @@ const MultiThreadedImpl = struct {
 };
 
 const MultiProcessImpl = struct {
-    opts: lsm.Opts,
-
     const Self = @This();
 
-    var self: *Self = undefined;
-
-    pub fn init(alloc: Allocator, opts: lsm.Opts) !Runnable {
-        self = try alloc.create(Self);
-        self.* = .{
-            .opts = opts,
-        };
-
+    pub fn init() !Runnable {
         return .{
             .run = Self.run,
         };
     }
 
-    pub fn deinit(this: *Self) void {
-        this.* = undefined;
-    }
-
-    pub fn run(input: []const u8) !void {
-        defer self.deinit();
-
+    pub fn run(input: []const u8, opts: lsm.Opts) !void {
         var arena = heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
@@ -532,8 +464,8 @@ const MultiProcessImpl = struct {
         defer mailbox.deinit();
 
         const reader = try std.Thread.spawn(.{}, struct {
-            pub fn consume(opts: lsm.Opts, inbox: *const lsm.ProcessMessageQueue.ReadIter) void {
-                const db = lsm.databaseFromOpts(allocator, opts) catch |err| {
+            pub fn consume(options: lsm.Opts, inbox: *const lsm.ProcessMessageQueue.ReadIter) void {
+                const db = lsm.databaseFromOpts(allocator, options) catch |err| {
                     debug.print(
                         "database init error {s}\n",
                         .{@errorName(err)},
@@ -571,7 +503,7 @@ const MultiProcessImpl = struct {
                     return;
                 };
             }
-        }.consume, .{ self.opts, &mailbox.subscribe() });
+        }.consume, .{ opts, &mailbox.subscribe() });
 
         const writer = mailbox.publisher();
 

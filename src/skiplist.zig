@@ -97,7 +97,6 @@ pub fn SkipList(
             }
 
             pub fn key(it: Iterator) []const u8 {
-                it.stack.pop();
                 return it.stack.items(.key)[it.crnt];
             }
 

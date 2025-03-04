@@ -6,6 +6,7 @@ const Atomic = std.atomic.Value;
 const Mutex = std.Thread.Mutex;
 
 pub const ThreadSafeBumpAllocator = struct {
+    alloc: Allocator,
     chunk_size: usize,
     chunks: ArrayList([]u8),
     free_chunks: ArrayList([]u8),
@@ -13,7 +14,6 @@ pub const ThreadSafeBumpAllocator = struct {
     used: Atomic(usize),
     total_allocations: Atomic(usize),
     total_used_bytes: Atomic(usize),
-    alloc: Allocator,
     lock: Mutex,
 
     pub fn init(alloc: Allocator, initial_chunk_size: usize) !ThreadSafeBumpAllocator {
@@ -59,9 +59,6 @@ pub const ThreadSafeBumpAllocator = struct {
     }
 
     fn add_chunk(self: *ThreadSafeBumpAllocator) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
-
         var new_chunk: []u8 = undefined;
         if (self.free_chunks.popOrNull()) |reusable| {
             new_chunk = reusable;
@@ -80,19 +77,33 @@ pub const ThreadSafeBumpAllocator = struct {
         const self: *ThreadSafeBumpAllocator = @ptrCast(@alignCast(ctx));
         const algn = @as(usize, 1) << @intCast(log2_align);
 
-        var aligned_start = self.used.load(.seq_cst);
-        if (aligned_start % algn != 0) {
-            aligned_start += algn - (aligned_start % algn);
+        var aligned_start: usize = 0;
+        var current_chunk: []u8 = undefined;
+
+        {
+            self.lock.lock();
+
+            current_chunk = self.current_chunk;
+
+            aligned_start = self.used.load(.seq_cst);
+            if (aligned_start % algn != 0) {
+                aligned_start += algn - (aligned_start % algn);
+            }
+
+            if (aligned_start + len > current_chunk.len) {
+                self.add_chunk() catch return null;
+                self.lock.unlock();
+                return allocFn(ctx, len, log2_align, ret_addr);
+            }
+
+            self.used.store(aligned_start + len, .seq_cst);
+
+            self.lock.unlock();
         }
 
-        if (aligned_start + len > self.current_chunk.len) {
-            self.add_chunk() catch return null;
-            return allocFn(ctx, len, log2_align, ret_addr);
-        }
-
-        self.used.store(aligned_start + len, .seq_cst);
         _ = self.total_used_bytes.fetchAdd(len, .seq_cst);
-        return self.current_chunk.ptr + aligned_start;
+
+        return current_chunk.ptr + aligned_start;
     }
 
     fn resizeFn(ctx: *anyopaque, buf: []u8, log2_align: u8, new_len: usize, ret_addr: usize) bool {
@@ -122,9 +133,17 @@ pub const ThreadSafeBumpAllocator = struct {
     }
 
     pub fn printStats(self: *ThreadSafeBumpAllocator) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
         std.debug.print(
             "Arena Stats: Allocations={}, UsedBytes={}, Chunks={}, FreeChunks={}\n",
-            .{ self.total_allocations.load(.seq_cst), self.total_used_bytes.load(.seq_cst), self.chunks.items.len, self.free_chunks.items.len },
+            .{
+                self.total_allocations.load(.seq_cst),
+                self.total_used_bytes.load(.seq_cst),
+                self.chunks.items.len,
+                self.free_chunks.items.len,
+            },
         );
     }
 };
@@ -138,19 +157,4 @@ fn benchmark(alloc: Allocator, iterations: usize, alloc_size: usize) u64 {
     return std.time.milliTimestamp() - start;
 }
 
-//pub fn main() !void {
-//    var gpa = std.heap.page_allocator;
-//    var arena_alloc = try ThreadSafeBumpAllocator.init(gpa, 1024); // Start with 1KB chunks
-//    defer arena_alloc.deinit();
-//
-//    var alloc = arena_alloc.allocator();
-//
-//    const iterations = 100_000;
-//    const alloc_size = 64;
-//
-//    const arena_time = benchmark(alloc, iterations, alloc_size);
-//    const gpa_time = benchmark(gpa, iterations, alloc_size);
-//
-//    std.debug.print("Arena Allocator Time: {} ms\n", .{arena_time});
-//    std.debug.print("GeneralPurposeAllocator Time: {} ms\n", .{gpa_time});
-//}
+test "Benchmark" {}

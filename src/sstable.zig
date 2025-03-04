@@ -11,7 +11,6 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const HashMap = std.StringHashMap;
 const File = std.fs.File;
-const SinglyLinkedList = std.SinglyLinkedList;
 
 const Block = blk.Block;
 const BlockMeta = blk.BlockMeta;
@@ -36,7 +35,6 @@ pub const SSTable = struct {
     data_dir: []const u8,
     file: File,
     id: u64,
-    index: HashMap(*SinglyLinkedList(u64)),
     mutable: bool,
     stream: *MMap,
 
@@ -66,19 +64,13 @@ pub const SSTable = struct {
             .data_dir = opts.data_dir,
             .file = undefined,
             .id = id,
-            .index = HashMap(*SinglyLinkedList(u64)).init(alloc),
             .mutable = true,
             .stream = undefined,
         };
-
-        // TODO: Why is this needed?
-        // try st.index.ensureTotalCapacity(1_000_000);
-
         return st;
     }
 
     pub fn deinit(self: *Self) void {
-        self.index.deinit();
         self.block.deinit();
         self.alloc.destroy(self.block);
         if (self.connected) {
@@ -116,23 +108,29 @@ pub const SSTable = struct {
     }
 
     pub fn read(self: Self, key: []const u8, kv: *KV) !void {
-        const list = self.index.get(key) orelse return Error.NotFound;
+        // TODO: fix this implementation
+        // idea 1: check block meta to see if the key is even in this block
+        // idea 2: update API to accept an index instead of a key
+        // idea 3: map keys and indices
+        var stream = fixedBufferStream(self.block.offset_data.items);
+        var stream_reader = stream.reader();
+        
+        while (stream.pos < stream.buffer.len) {
+            const idx = try stream_reader.readInt(u64, Endian); 
 
-        var idx: u64 = 0;
-        var it = list.first;
-        while (it) |node| : (it = node.next) {
-            // TODO implement this correctly
-            idx = node.data;
-            break;
+            const value = self.block.read(idx) catch |err| {
+                print(
+                    "sstable not able to read from block @ offset {d}: {s}\n",
+                    .{ idx, @errorName(err) },
+                );
+                return err;
+            };
+
+            if (std.mem.eql(u8, value.key, key)) {
+                kv.* = value;
+                return;
+            } 
         }
-
-        kv.* = self.block.read(idx) catch |err| {
-            print(
-                "sstable not able to read from block @ offset {d}: {s}\n",
-                .{ idx, @errorName(err) },
-            );
-            return err;
-        };
     }
 
     pub fn write(self: *Self, value: KV) !usize {
@@ -144,25 +142,6 @@ pub const SSTable = struct {
                 );
                 return err;
             };
-
-            const item = SinglyLinkedList(u64).Node{ .data = idx };
-
-            var result = self.index.getOrPut(value.key) catch |err| {
-                print(
-                    "sstable not able to write to index for key {s}: {s}\n",
-                    .{ value.key, @errorName(err) },
-                );
-                return err;
-            };
-
-            if (result.found_existing) {
-                result.value_ptr.*.prepend(@constCast(&item));
-            } else {
-                var list = try self.alloc.create(SinglyLinkedList(u64));
-                list.prepend(@constCast(&item));
-                result.value_ptr = &list;
-            }
-
             return idx;
         }
 
