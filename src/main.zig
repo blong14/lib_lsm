@@ -96,6 +96,40 @@ pub const Database = struct {
         self.* = undefined;
     }
 
+    pub fn open(self: *Self) !void {
+        var data_dir = try std.fs.openDirAbsolute(self.opts.data_dir, .{ .iterate = true });
+        defer data_dir.close();
+
+        var count: u64 = 0;
+
+        var dir_iter = data_dir.iterate();
+        while (try dir_iter.next()) |f| {
+            const nxt_file = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/{s}",
+                .{ self.opts.data_dir, f.name },
+            );
+            errdefer self.alloc.free(nxt_file);
+
+            const data_file = file.open(nxt_file) catch |err| switch (err) {
+                error.IsDir => {
+                    self.alloc.free(nxt_file);
+                    continue;
+                },
+                else => return err,
+            };
+
+            self.alloc.free(nxt_file);
+
+            var mtable = try Memtable.init(self.alloc, count, self.opts);
+            try mtable.loadFromFile(data_file);
+
+            try self.mtables.append(mtable);
+
+            count += 1;
+        }
+    }
+
     pub fn allocator(self: Self) Allocator {
         return self.alloc;
     }
@@ -323,4 +357,16 @@ test "basic functionality with many items" {
         count += 1;
     }
     try testing.expectEqual(kvs.len, count);
+}
+
+test "load data" {
+    const alloc = testing.allocator;
+
+    const db = try databaseFromOpts(alloc, withDataDirOpts("/home/blong14/Developer/git/lib_lsm/.tmp/data"));
+    defer alloc.destroy(db);
+    defer db.deinit();
+
+    try db.open();
+
+    try testing.expectEqual(33, db.mtables.items.len);
 }

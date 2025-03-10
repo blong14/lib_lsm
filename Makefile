@@ -4,9 +4,10 @@ BUILD_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
 DEBUG_BUILD_OPTS := -Dcpu=x86_64 -Doptimize=Debug
 DATA_DIR := .tmp/data
 EXEC := zig-out/bin/lsm
-# MODE := singlethreaded
-MODE := multithreaded
+MODE := singlethreaded
+# MODE := multithreaded
 SOURCES := $(wildcard ./src/*.zig)
+ZIG := bin/zig-linux-x86_64-0.13.0/zig
 
 # 3rd party deps
 # sudo apt install linux-tools-common
@@ -24,24 +25,24 @@ SOURCES := $(wildcard ./src/*.zig)
 all: build callgrind.o massif.o
 
 fmt: $(SOURCES)
-	@zig fmt .
+	$(ZIG) fmt .
 
 # gdb --tui zig-out/bin/lsm
 # b src/tablemap.zig:76
 # r
 # ipcrm -q <tab>
 build: fmt
-	@zig build $(BUILD_OPTS)
+	$(ZIG) build $(BUILD_OPTS)
 
 debug-build: clean fmt
-	@zig build $(DEBUG_BUILD_OPTS)
+	$(ZIG) build $(DEBUG_BUILD_OPTS)
 
 perf: debug-build
 	perf record -F 200 -g $(EXEC) --mode $(MODE)
 	perf script --input=perf.data -F +pid > perf.processed.data
 
 run: clean fmt
-	zig build run-lsm -- --mode $(MODE) --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
+	$(ZIG) build run-lsm -- --mode $(MODE) --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
 
 profile: clean build
 	$(EXEC) --mode $(MODE) --input measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
@@ -50,7 +51,7 @@ clean:
 	rm -rf $(BIN)/* callgrind.o massif.o $(DATA_DIR)/*.dat $(DATA_DIR)/data*/* 
 
 test: $(SOURCES)
-	@zig build test --summary all
+	$(ZIG) build test --summary all
 
 poop: clean build 
 	./bin/poop './$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./measurements.txt --sst_capacity 1_000_000' \

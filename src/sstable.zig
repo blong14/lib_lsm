@@ -97,10 +97,12 @@ pub const SSTable = struct {
         const block_size = try reader.readInt(u64, Endian);
         if (block_size > 0) {
             const decoded_bytes = try self.block.decode(&stream.buf);
-            assert(decoded_bytes == block_size);
+            assert(decoded_bytes > 0);
 
             self.*.mutable = false;
         }
+
+        stream.buf.reset();
 
         self.*.connected = true;
         self.*.file = file;
@@ -158,14 +160,16 @@ pub const SSTable = struct {
         if (!self.connected and self.mutable) {
             try self.block.freeze();
 
+            const sz = self.block.size();
+
             const filename = try std.fmt.allocPrint(
                 self.alloc,
-                "{s}/{d}.dat",
-                .{ self.data_dir, self.id },
+                "{s}/{d}_{d}.dat",
+                .{ self.data_dir, self.id, sz },
             );
             defer self.alloc.free(filename);
 
-            const out_file = try file_utils.openWithCapacity(filename, self.block.size());
+            const out_file = try file_utils.openWithCapacity(filename, sz);
             try self.open(out_file);
 
             _ = self.block.flush(&self.stream.buf) catch |err| {

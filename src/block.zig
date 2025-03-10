@@ -123,7 +123,7 @@ pub const Block = struct {
 
     pub fn blockMeta(self: Self) !BlockMeta {
         var meta_data: BlockMeta = undefined;
-        try meta_data.decode(self.meta_data.items);
+        try meta_data.decode(self.meta_data.items[0..]);
         return meta_data;
     }
 
@@ -201,18 +201,18 @@ pub const Block = struct {
         const meta_data = try block_meta_data.encodeAlloc(self.alloc);
         defer self.alloc.free(meta_data);
 
-        try self.meta_data.appendSlice(meta_data);
+        try self.meta_data.appendSlice(meta_data[0..]);
     }
 
     pub fn decode(self: *Self, stream: *FixedBuffer([]align(PageSize) u8)) !usize {
         var stream_reader = stream.reader();
 
-        try stream_reader.skipBytes(@sizeOf(u64), .{});
+        const meta_data_start = try stream.getPos();
 
         const meta_data_len = try stream_reader.readInt(u64, Endian);
         assert(meta_data_len > 0);
 
-        const meta_data = stream.buffer[stream.pos..][0..meta_data_len];
+        const meta_data = stream.buffer[meta_data_start..meta_data_len];
 
         try self.meta_data.appendSlice(meta_data);
 
