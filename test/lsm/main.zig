@@ -105,14 +105,48 @@ const SingleThreadedImpl = struct {
         lsm.BeginProfile(alloc);
         defer lsm.EndProfile();
 
-        try parse(alloc, input, opts);
-    }
-
-    fn parse(alloc: Allocator, input: []const u8, opts: lsm.Opts) !void {
-        const db = lsm.databaseFromOpts(alloc, opts) catch |err| {
+        const db = lsm.databaseFromOpts(allocator, opts) catch |err| {
             debug.print("database init error {s}\n", .{@errorName(err)});
             return err;
         };
+
+        try db.open();
+
+        try parse(alloc, input, db);
+        try read(db);
+        try scan(db);
+    }
+
+    fn scan(db: *lsm.Database) !void {
+        var iter = try db.scan(allocator, "Atlanta", "Berlin");
+        defer iter.deinit();
+
+        var nxt_kv: KV = undefined;
+        var count: usize = 0;
+        while (iter.next()) |nxt| {
+            count += 1;
+            nxt_kv = nxt;
+            debug.print("{}\n", .{nxt});
+        }
+
+        debug.print("\ntotal keys read {}\n", .{count});
+    }
+
+    fn read(db: *lsm.Database) !void {
+        var iter = try db.iterator(allocator);
+        defer iter.deinit();
+
+        var nxt_kv: KV = undefined;
+        var count: usize = 0;
+        while (iter.next()) |nxt| {
+            count += 1;
+            nxt_kv = nxt;
+        }
+
+        debug.print("total keys read {} last key {}\n", .{ count, nxt_kv });
+    }
+
+    fn parse(alloc: Allocator, input: []const u8, db: *lsm.Database) !void {
         var idx: usize = 0;
         var data = [2][]const u8{ undefined, undefined };
 
@@ -156,6 +190,8 @@ const SingleThreadedImpl = struct {
             );
             return;
         };
+
+        debug.print("total keys written {}\n", .{cnt});
     }
 };
 
