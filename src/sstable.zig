@@ -268,13 +268,13 @@ test SSTable {
 
     // when
     var nxt_actual: KV = undefined;
-    
+
     var siter = try st.iterator(alloc);
     defer siter.deinit();
 
     while (siter.next()) |nxt| {
         nxt_actual = nxt;
     }
-    
+
     try testing.expectEqualStrings(expected, nxt_actual.value);
 }

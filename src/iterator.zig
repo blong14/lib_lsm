@@ -77,7 +77,7 @@ test Iterator {
 
     var actual = std.ArrayList(u32).init(alloc);
     defer actual.deinit();
-    
+
     var stream = U32Stream.init(expected);
 
     var iter = stream.iterator();
