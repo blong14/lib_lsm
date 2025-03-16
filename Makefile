@@ -2,7 +2,7 @@
 BIN := zig-out/bin
 BUILD_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
 DEBUG_BUILD_OPTS := -Dcpu=x86_64 -Doptimize=Debug
-DATA_DIR := .tmp/data
+DATA_DIR := /home/blong14/Developer/git/lib_lsm/.tmp/data
 EXEC := zig-out/bin/lsm
 MODE := singlethreaded
 # MODE := multithreaded
