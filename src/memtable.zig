@@ -2,6 +2,7 @@ const std = @import("std");
 
 const file_utils = @import("file.zig");
 const keyvalue = @import("kv.zig");
+const iter = @import("iterator.zig");
 const options = @import("opts.zig");
 const sst = @import("sstable.zig");
 const tbm = @import("tablemap.zig");
@@ -11,10 +12,13 @@ const Allocator = std.mem.Allocator;
 const AtomicValue = std.atomic.Value;
 const File = std.fs.File;
 
+const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
 const Opts = options.Opts;
 const SkipList = skl.SkipList;
 const SSTable = sst.SSTable;
+
+const KeyValueSkipList = SkipList([]const u8, keyvalue.decode, keyvalue.encode);
 
 const assert = std.debug.assert;
 const print = std.debug.print;
@@ -26,7 +30,7 @@ pub const Memtable = struct {
     opts: Opts,
 
     byte_count: AtomicValue(usize),
-    data: AtomicValue(*SkipList([]const u8, keyvalue.decode, keyvalue.encode)),
+    data: AtomicValue(*KeyValueSkipList),
     mutable: AtomicValue(bool),
     sstable: AtomicValue(?*SSTable),
 
@@ -35,8 +39,8 @@ pub const Memtable = struct {
     pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
         const cap = opts.sst_capacity;
 
-        const map = try alloc.create(SkipList([]const u8, keyvalue.decode, keyvalue.encode));
-        map.* = try SkipList([]const u8, keyvalue.decode, keyvalue.encode).init(alloc);
+        const map = try alloc.create(KeyValueSkipList);
+        map.* = try KeyValueSkipList.init(alloc);
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
@@ -45,7 +49,7 @@ pub const Memtable = struct {
             .id = id,
             .opts = opts,
             .byte_count = AtomicValue(usize).init(0),
-            .data = AtomicValue(*SkipList([]const u8, keyvalue.decode, keyvalue.encode)).init(map),
+            .data = AtomicValue(*KeyValueSkipList).init(map),
             .mutable = AtomicValue(bool).init(true),
             .sstable = AtomicValue(?*SSTable).init(null),
         };
@@ -72,6 +76,13 @@ pub const Memtable = struct {
         errdefer sstable.deinit();
 
         try sstable.open(file);
+
+        var siter = try sstable.iterator(self.alloc);
+        defer siter.deinit();
+
+        while (siter.next()) |nxt| {
+            try self.put(nxt);
+        }
 
         self.sstable.store(sstable, .seq_cst);
     }
@@ -105,29 +116,29 @@ pub const Memtable = struct {
         return self.byte_count.load(.seq_cst);
     }
 
-    pub const Iterator = struct {
-        data: SkipList([]const u8, keyvalue.decode, keyvalue.encode).Iterator,
-        v: KV,
+    const MemtableIterator = struct {
+        alloc: Allocator,
+        iter: Iterator(KeyValueSkipList.Item),
 
-        pub fn deinit(it: *Iterator) void {
-            it.data.deinit();
-            it.* = undefined;
+        pub fn deinit(ctx: *anyopaque) void {
+            const self: *MemtableIterator = @ptrCast(@alignCast(ctx));
+            self.iter.deinit();
+            self.alloc.destroy(self);
         }
 
-        pub fn value(it: Iterator) KV {
-            return KV.init(it.data.key(), it.data.value());
-        }
-
-        pub fn next(it: *Iterator) !bool {
-            return try it.data.next();
+        pub fn next(ctx: *anyopaque) ?KV {
+            const self: *MemtableIterator = @ptrCast(@alignCast(ctx));
+            if (self.iter.next()) |nxt| {
+                return KV.init(nxt.key, nxt.value);
+            }
+            return null;
         }
     };
 
-    pub fn iterator(self: *Self) !Iterator {
-        return .{
-            .data = self.data.load(.seq_cst).iter(),
-            .v = undefined,
-        };
+    pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
+        const it = try alloc.create(MemtableIterator);
+        it.* = .{ .alloc = alloc, .iter = try self.data.load(.seq_cst).iterator(alloc) };
+        return Iterator(KV).init(it, MemtableIterator.next, MemtableIterator.deinit);
     }
 
     pub fn flush(self: *Self) !void {
@@ -139,17 +150,16 @@ pub const Memtable = struct {
         errdefer self.alloc.destroy(sstable);
         errdefer sstable.deinit();
 
-        var iter = self.data.load(.seq_cst).iter();
-        defer iter.deinit();
+        var it = try self.iterator(self.alloc);
+        defer it.deinit();
 
-        while (try iter.next()) {
-            const kv = KV.init(iter.key(), iter.value());
-            _ = sstable.write(kv) catch |err| switch (err) {
+        while (it.next()) |nxt| {
+            _ = sstable.write(nxt) catch |err| switch (err) {
                 error.DuplicateError => continue,
                 else => {
                     print(
                         "memtable not able to write to sstable for key {s}: {s}\n",
-                        .{ kv.key, @errorName(err) },
+                        .{ nxt.key, @errorName(err) },
                     );
                     return err;
                 },
@@ -181,6 +191,6 @@ test Memtable {
     try testing.expectEqualStrings(kv.value, actual.?.value);
 
     mtable.flush() catch |err| {
-        std.debug.print("{s}\n", .{@errorName(err)});
+        print("{s}\n", .{@errorName(err)});
     };
 }

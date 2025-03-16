@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const blk = @import("block.zig");
+const iter = @import("iterator.zig");
 const keyvalue = @import("kv.zig");
 const mmap = @import("mmap.zig");
 const options = @import("opts.zig");
@@ -15,6 +16,7 @@ const File = std.fs.File;
 const Block = blk.Block;
 const BlockMeta = blk.BlockMeta;
 const KV = keyvalue.KV;
+const Iterator = iter.Iterator;
 const MMap = mmap.AppendOnlyMMap;
 const Opts = options.Opts;
 const TableMap = tm.TableMap;
@@ -25,6 +27,7 @@ const PageSize = std.mem.page_size;
 const assert = std.debug.assert;
 const fixedBufferStream = std.io.fixedBufferStream;
 const print = std.debug.print;
+const readInt = std.mem.readInt;
 
 /// sstable[meta_data,block,block]
 pub const SSTable = struct {
@@ -150,6 +153,42 @@ pub const SSTable = struct {
         return Error.WriteError;
     }
 
+    const SSTableIterator = struct {
+        alloc: Allocator,
+        block: *Block = undefined,
+        nxt: usize = 0,
+
+        pub fn deinit(ctx: *anyopaque) void {
+            const self: *SSTableIterator = @ptrCast(@alignCast(ctx));
+            self.alloc.destroy(self);
+        }
+
+        pub fn next(ctx: *anyopaque) ?KV {
+            const self: *SSTableIterator = @ptrCast(@alignCast(ctx));
+
+            var kv: ?KV = null;
+            if (self.nxt < self.block.offset_data.items.len) {
+                const nxt_offset_byts = self.block.offset_data.items[self.nxt];
+                const nxt_offset = readInt(u8, &nxt_offset_byts, Endian);
+
+                kv = self.block.read(nxt_offset) catch |err| {
+                    print("sstable iter error {s}\n", .{@errorName(err)});
+                    return null;
+                };
+
+                self.nxt += 1;
+            }
+
+            return kv;
+        }
+    };
+
+    pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
+        const it = try alloc.create(SSTableIterator);
+        it.* = .{ .alloc = alloc, .block = self.block };
+        return Iterator(KV).init(it, SSTableIterator.next, SSTableIterator.deinit);
+    }
+
     pub fn freeze(self: *Self) !void {
         if (self.connected and self.mutable) {
             try self.block.freeze();
@@ -226,4 +265,16 @@ test SSTable {
 
     // then
     try testing.expectEqualStrings(expected, actual.value);
+
+    // when
+    var nxt_actual: KV = undefined;
+    
+    var siter = try st.iterator(alloc);
+    defer siter.deinit();
+
+    while (siter.next()) |nxt| {
+        nxt_actual = nxt;
+    }
+    
+    try testing.expectEqualStrings(expected, nxt_actual.value);
 }

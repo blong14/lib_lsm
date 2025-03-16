@@ -3,9 +3,12 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("skiplist.h");
 });
+const iter = @import("iterator.zig");
 const kv = @import("kv.zig");
 
 const Allocator = std.mem.Allocator;
+
+const Iterator = iter.Iterator;
 const KV = kv.KV;
 
 const assert = std.debug.assert;
@@ -69,43 +72,38 @@ pub fn SkipList(
             }
         }
 
-        pub const Iterator = struct {
-            const Item = struct {
-                key: []const u8,
-                value: V,
-            };
+        pub const Item = struct {
+            data: []const u8,
+            key: []const u8,
+            value: V,
+        };
 
+        const SkiplistIterator = struct {
             alloc: Allocator,
-            impl: ?*c.SkipMapIterator,
-            crnt: usize,
-            nxt: usize,
-            stack: std.MultiArrayList(Item),
-            state: State,
+            impl: *c.SkipMapIterator,
+            items: std.ArrayList(Item),
 
-            const State = enum {
-                Open,
-                Closed,
-            };
+            pub fn init(ctx: *anyopaque, alloc: Allocator) SkiplistIterator {
+                const items = std.ArrayList(Item).init(alloc);
+                return .{
+                    .alloc = alloc,
+                    .impl = c.skiplist_iterator_create(ctx).?,
+                    .items = items,
+                };
+            }
 
-            pub fn deinit(it: *Iterator) void {
-                for (it.stack.items(.value)) |item| {
-                    it.alloc.free(item);
+            pub fn deinit(ctx: *anyopaque) void {
+                const self: *SkiplistIterator = @ptrCast(@alignCast(ctx));
+                c.skiplist_iterator_free(self.impl);
+                for (self.items.items) |item| {
+                    self.alloc.free(item.data);
                 }
-                it.stack.deinit(it.alloc);
-                c.skiplist_iterator_free(it.impl.?);
-                it.* = undefined;
+                self.items.deinit();
+                self.alloc.destroy(self);
             }
 
-            pub fn key(it: Iterator) []const u8 {
-                return it.stack.items(.key)[it.crnt];
-            }
-
-            pub fn value(it: Iterator) V {
-                return it.stack.items(.value)[it.crnt];
-            }
-
-            pub fn next(it: *Iterator) !bool {
-                if (it.impl == null) return false;
+            pub fn next(ctx: *anyopaque) ?Item {
+                const it: *SkiplistIterator = @ptrCast(@alignCast(ctx));
 
                 var key_buffer: [std.mem.page_size]u8 = undefined;
                 var key_len: usize = std.mem.page_size;
@@ -114,7 +112,7 @@ pub fn SkipList(
                 var value_len: usize = std.mem.page_size;
 
                 const result = c.skiplist_iterator_next(
-                    it.impl.?,
+                    it.impl,
                     &key_buffer[0],
                     &key_len,
                     &value_buffer[0],
@@ -122,37 +120,40 @@ pub fn SkipList(
                 );
                 if (result == -1) {
                     // No more elements
-                    return false;
+                    return null;
                 } else if (result != 0) {
                     print("skiplist iterator error: {d}\n", .{result});
-                    return false;
+                    return null;
                 }
 
-                const nxt_value = try it.alloc.alloc(u8, value_len);
-                @memcpy(nxt_value, value_buffer[0..value_len]);
-
-                const val = decodeFn(nxt_value) catch |err| {
+                const val = decodeFn(value_buffer[0..value_len]) catch |err| {
                     print("not able to decode value {s}\n", .{@errorName(err)});
-                    return false;
+                    return null;
                 };
 
-                try it.stack.append(it.alloc, Item{ .key = key_buffer[0..key_len], .value = val });
-                it.crnt = it.nxt;
-                it.nxt += 1;
+                const byts = it.alloc.alloc(u8, key_len + value_len) catch unreachable;
+                std.mem.copyForwards(u8, byts[0..key_len], key_buffer[0..key_len]);
+                std.mem.copyForwards(u8, byts[key_len..], val);
 
-                return true;
+                const item: Item = .{
+                    .data = byts,
+                    .key = byts[0..key_len],
+                    .value = byts[key_len..],
+                };
+
+                it.items.append(item) catch |err| {
+                    print("skiplist iterator error: {s}\n", .{@errorName(err)});
+                    return null;
+                };
+
+                return item;
             }
         };
 
-        pub fn iter(self: Self) Iterator {
-            return .{
-                .alloc = self.alloc,
-                .impl = c.skiplist_iterator_create(self.impl),
-                .crnt = 0,
-                .nxt = 0,
-                .stack = std.MultiArrayList(Iterator.Item){},
-                .state = .Open,
-            };
+        pub fn iterator(self: *Self, alloc: Allocator) !Iterator(Item) {
+            const it = try alloc.create(SkiplistIterator);
+            it.* = SkiplistIterator.init(self.impl.?, alloc);
+            return Iterator(Item).init(it, SkiplistIterator.next, SkiplistIterator.deinit);
         }
 
         pub fn count(self: Self) usize {
@@ -217,11 +218,11 @@ test "SkipList.Iterator" {
     var actual = std.ArrayList([]const u8).init(alloc);
     defer actual.deinit();
 
-    var iter = skl.iter();
-    defer iter.deinit();
+    var it = try skl.iterator(alloc);
+    defer it.deinit();
 
-    while (try iter.next()) {
-        try actual.append(iter.value());
+    while (it.next()) |nxt| {
+        try actual.append(nxt.value);
     }
 
     try testing.expectEqual(3, actual.items.len);
