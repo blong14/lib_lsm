@@ -100,6 +100,9 @@ pub const Database = struct {
     }
 
     pub fn open(self: *Self) !void {
+        mtx.lock();
+        defer mtx.unlock();
+
         var data_dir = try std.fs.openDirAbsolute(self.opts.data_dir, .{ .iterate = true });
         defer data_dir.close();
 
@@ -128,12 +131,31 @@ pub const Database = struct {
             self.alloc.free(nxt_file);
 
             var mtable = try Memtable.init(self.alloc, count, self.opts);
-            try mtable.loadFromFile(data_file);
+
+            var sstable = try SSTable.init(self.alloc, mtable.getId(), self.opts);
+            errdefer self.alloc.destroy(sstable);
+            errdefer sstable.deinit();
+
+            try sstable.open(data_file);
+
+            var siter = try sstable.iterator(self.alloc);
+            defer siter.deinit();
+
+            while (siter.next()) |nxt| {
+                try mtable.put(nxt);
+            }
+
+            mtable.freeze();
 
             try self.mtables.append(mtable);
 
             count += 1;
         }
+
+        const nxt_table = try Memtable.init(self.alloc, count, self.opts);
+        self.mtable.store(nxt_table, .seq_cst);
+
+        debug.print("database opened @ {s} w/ {d} warm tables\n", .{ self.opts.data_dir, self.mtables.items.len });
     }
 
     pub fn read(self: Self, key: []const u8) !KV {

@@ -70,23 +70,6 @@ pub const Memtable = struct {
         return @atomicLoad(u64, &self.id, .seq_cst);
     }
 
-    pub fn loadFromFile(self: *Self, file: File) !void {
-        var sstable = try SSTable.init(self.alloc, self.getId(), self.opts);
-        errdefer self.alloc.destroy(sstable);
-        errdefer sstable.deinit();
-
-        try sstable.open(file);
-
-        var siter = try sstable.iterator(self.alloc);
-        defer siter.deinit();
-
-        while (siter.next()) |nxt| {
-            try self.put(nxt);
-        }
-
-        self.sstable.store(sstable, .seq_cst);
-    }
-
     pub fn put(self: *Self, item: KV) !void {
         try self.data.load(.seq_cst).put(item.key, item.value);
         _ = self.byte_count.fetchAdd(item.len(), .seq_cst);
