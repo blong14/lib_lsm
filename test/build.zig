@@ -7,7 +7,7 @@ const ResolvedTarget = std.Build.ResolvedTarget;
 
 pub fn buildLsm(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *CompileStep {
     const exe = b.addExecutable(.{
-        .name = "lsm",
+        .name = "xlsm",
         .root_source_file = b.path("test/lsm/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -17,7 +17,7 @@ pub fn buildLsm(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *Comp
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run-lsm", "Run the test app with no concurrency");
+    const run_step = b.step("run-xlsm", "Run the test app with no concurrency");
     run_step.dependOn(&run_cmd.step);
     return exe;
 }

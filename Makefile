@@ -3,7 +3,7 @@ BIN := zig-out/bin
 BUILD_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
 DEBUG_BUILD_OPTS := -Dcpu=x86_64 -Doptimize=Debug
 DATA_DIR := /home/blong14/Developer/git/lib_lsm/.tmp/data
-EXEC := zig-out/bin/lsm
+EXEC := zig-out/bin/xlsm
 MODE := singlethreaded
 # MODE := multithreaded
 SOURCES := $(wildcard ./src/*.zig)
@@ -38,11 +38,11 @@ debug-build: clean fmt
 	$(ZIG) build $(DEBUG_BUILD_OPTS)
 
 perf: debug-build
-	perf record -F 200 -g $(EXEC) --mode $(MODE)
+	perf record -F 200 -g $(EXEC) --mode $(MODE) --data_dir $(DATA_DIR)
 	perf script --input=perf.data -F +pid > perf.processed.data
 
 run: clean fmt
-	$(ZIG) build run-lsm -- --mode $(MODE) --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
+	$(ZIG) build run-xlsm -- --mode $(MODE) --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
 
 profile: clean build
 	$(EXEC) --mode $(MODE) --input measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 

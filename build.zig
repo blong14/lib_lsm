@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Add custom modules so they can be referenced from our test directory
-    const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/main.zig") });
+    const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/lib.zig") });
     lsm.addIncludePath(fast_csv.path(""));
     lsm.addIncludePath(b.path("vendor/crossbeam-skiplist/src"));
 
@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
             .name = "lib_lsm",
             // In this case the main source file is merely a path, however, in more
             // complicated build scripts, this could be a generated file.
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/lib.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
         // Creates a step for unit testing. This only builds the test executable
         // but does not run it.
         const main_tests = b.addTest(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/lib.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -119,8 +119,8 @@ pub fn build(b: *std.Build) void {
     // Main cli
     {
         const exe = b.addExecutable(.{
-            .name = "lsmx",
-            .root_source_file = b.path("src/cmd/main.zig"),
+            .name = "lsm",
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
         });
