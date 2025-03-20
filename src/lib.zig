@@ -82,15 +82,14 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        {
-            mtx.lock();
-            defer mtx.unlock();
-            for (self.mtables.items) |mtable| {
-                mtable.deinit();
-                self.alloc.destroy(mtable);
-            }
-            self.mtables.deinit();
+        mtx.lock();
+        defer mtx.unlock();
+
+        for (self.mtables.items) |mtable| {
+            mtable.deinit();
+            self.alloc.destroy(mtable);
         }
+        self.mtables.deinit();
 
         var mtable = self.mtable.load(.seq_cst);
         mtable.deinit();
@@ -105,8 +104,6 @@ pub const Database = struct {
 
         var data_dir = try std.fs.openDirAbsolute(self.opts.data_dir, .{ .iterate = true });
         defer data_dir.close();
-
-        debug.print("opening database @ {s}\n", .{self.opts.data_dir});
 
         var dir_iter = try data_dir.walk(self.alloc);
         defer dir_iter.deinit();
@@ -147,6 +144,9 @@ pub const Database = struct {
 
             mtable.freeze();
 
+            mtable.isFlushed.store(true, .seq_cst);
+            mtable.sstable.store(sstable, .seq_cst);
+
             try self.mtables.append(mtable);
 
             count += 1;
@@ -163,23 +163,21 @@ pub const Database = struct {
             return value;
         }
 
-        {
-            mtx.lock();
-            defer mtx.unlock();
+        mtx.lock();
+        defer mtx.unlock();
 
-            if (self.mtables.items.len > 0) {
-                var idx: usize = self.mtables.items.len - 1;
-                while (idx > 0) {
-                    var table = self.mtables.items[idx];
-                    if (table.get(key)) |value| {
-                        return value;
-                    }
-                    idx -= 1;
+        if (self.mtables.items.len > 0) {
+            var idx: usize = self.mtables.items.len - 1;
+            while (idx > 0) {
+                var table = self.mtables.items[idx];
+                if (table.get(key)) |value| {
+                    return value;
                 }
-                return error.NotFound;
-            } else {
-                return error.NotFound;
+                idx -= 1;
             }
+            return error.NotFound;
+        } else {
+            return error.NotFound;
         }
     }
 
@@ -323,36 +321,52 @@ pub const Database = struct {
 
         var mtable = self.mtable.load(.seq_cst);
         if ((mtable.size() + item.len()) >= self.capacity) {
-            try self.freezeAndFlush(mtable);
+            try self.freeze(mtable);
         }
 
-        try self.mtable.load(.seq_cst).put(item);
+        mtable = self.mtable.load(.seq_cst);
+        try mtable.put(item);
     }
 
     pub fn flush(self: *Self) !void {
-        const mtable = self.mtable.load(.seq_cst);
-        try self.freezeAndFlush(mtable);
+        mtx.lock();
+        defer mtx.unlock();
+
+        const hot_table = self.mtable.load(.seq_cst);
+        hot_table.freeze();
+        try hot_table.flush();
+
+        const current_id = hot_table.getId();
+        const nxt_table = try Memtable.init(self.alloc, current_id + 1, self.opts);
+
+        self.mtable.store(nxt_table, .seq_cst);
+
+        for (self.mtables.items) |mtable| {
+            if (!mtable.flushed()) {
+                try mtable.flush();
+            }
+            mtable.deinit();
+            self.alloc.destroy(mtable);
+        }
+
+        self.mtables.clearRetainingCapacity();
     }
 
-    inline fn freezeAndFlush(self: *Self, mtable: *Memtable) !void {
-        {
-            mtx.lock();
-            defer mtx.unlock();
+    fn freeze(self: *Self, mtable: *Memtable) !void {
+        mtx.lock();
+        defer mtx.unlock();
 
-            if (mtable.frozen()) {
-                return;
-            }
-
-            mtable.freeze();
-
-            try self.mtables.append(mtable);
-
-            const current_id = mtable.getId();
-            const nxt_table = try Memtable.init(self.alloc, current_id + 1, self.opts);
-            self.mtable.store(nxt_table, .seq_cst);
-
-            try mtable.flush();
+        if (mtable.frozen()) {
+            return;
         }
+
+        mtable.freeze();
+
+        const current_id = mtable.getId();
+        const nxt_table = try Memtable.init(self.alloc, current_id + 1, self.opts);
+
+        self.mtable.store(nxt_table, .seq_cst);
+        try self.mtables.append(mtable);
     }
 };
 

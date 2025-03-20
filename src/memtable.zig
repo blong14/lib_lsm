@@ -32,6 +32,7 @@ pub const Memtable = struct {
     byte_count: AtomicValue(usize),
     data: AtomicValue(*KeyValueSkipList),
     mutable: AtomicValue(bool),
+    isFlushed: AtomicValue(bool),
     sstable: AtomicValue(?*SSTable),
 
     const Self = @This();
@@ -51,6 +52,7 @@ pub const Memtable = struct {
             .byte_count = AtomicValue(usize).init(0),
             .data = AtomicValue(*KeyValueSkipList).init(map),
             .mutable = AtomicValue(bool).init(true),
+            .isFlushed = AtomicValue(bool).init(false),
             .sstable = AtomicValue(?*SSTable).init(null),
         };
         return mtable;
@@ -71,7 +73,8 @@ pub const Memtable = struct {
     }
 
     pub fn put(self: *Self, item: KV) !void {
-        try self.data.load(.seq_cst).put(item.key, item.value);
+        var data = self.data.load(.seq_cst);
+        try data.put(item.key, item.value);
         _ = self.byte_count.fetchAdd(item.len(), .seq_cst);
     }
 
@@ -93,6 +96,10 @@ pub const Memtable = struct {
 
     pub fn frozen(self: Self) bool {
         return !self.mutable.load(.seq_cst);
+    }
+
+    pub fn flushed(self: Self) bool {
+        return self.isFlushed.load(.seq_cst);
     }
 
     pub fn size(self: Self) usize {
@@ -152,6 +159,7 @@ pub const Memtable = struct {
         try sstable.flush();
 
         self.sstable.store(sstable, .seq_cst);
+        self.isFlushed.store(true, .seq_cst);
     }
 };
 
