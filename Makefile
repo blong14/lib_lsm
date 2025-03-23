@@ -41,8 +41,8 @@ perf: debug-build
 	perf record -F 200 -g $(EXEC) --mode $(MODE) --data_dir $(DATA_DIR)
 	perf script --input=perf.data -F +pid > perf.processed.data
 
-run: clean fmt
-	$(ZIG) build run-xlsm -- --mode $(MODE) --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
+run: fmt
+	$(ZIG) build lsm -- --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
 
 profile: clean build
 	$(EXEC) --mode $(MODE) --input measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 

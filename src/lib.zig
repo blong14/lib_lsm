@@ -58,6 +58,7 @@ var mtx: Mutex = .{};
 
 pub const Database = struct {
     alloc: Allocator,
+    byte_allocator: ThreadSafeBumpAllocator,
     capacity: usize,
     mtable: AtomicValue(*Memtable),
     opts: Opts,
@@ -66,6 +67,7 @@ pub const Database = struct {
     const Self = @This();
 
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
+        const byte_allocator = try ThreadSafeBumpAllocator.init(alloc, std.mem.page_size);
         const mtable = try Memtable.init(alloc, 0, opts);
         const mtables = std.ArrayList(*Memtable).init(alloc);
         const capacity = opts.sst_capacity;
@@ -73,6 +75,7 @@ pub const Database = struct {
         const db = try alloc.create(Self);
         db.* = .{
             .alloc = alloc,
+            .byte_allocator = byte_allocator,
             .capacity = capacity,
             .mtable = AtomicValue(*Memtable).init(mtable),
             .mtables = mtables,
@@ -95,13 +98,12 @@ pub const Database = struct {
         mtable.deinit();
         self.alloc.destroy(mtable);
 
+        self.byte_allocator.deinit();
+
         self.* = undefined;
     }
 
     pub fn open(self: *Self) !void {
-        mtx.lock();
-        defer mtx.unlock();
-
         var data_dir = try std.fs.openDirAbsolute(self.opts.data_dir, .{ .iterate = true });
         defer data_dir.close();
 
@@ -125,13 +127,9 @@ pub const Database = struct {
                 else => return err,
             };
 
-            self.alloc.free(nxt_file);
-
-            var mtable = try Memtable.init(self.alloc, count, self.opts);
-
-            var sstable = try SSTable.init(self.alloc, mtable.getId(), self.opts);
-            errdefer self.alloc.destroy(sstable);
-            errdefer sstable.deinit();
+            var sstable = try SSTable.init(self.alloc, count, self.opts);
+            defer self.alloc.destroy(sstable);
+            defer sstable.deinit();
 
             try sstable.open(data_file);
 
@@ -139,21 +137,16 @@ pub const Database = struct {
             defer siter.deinit();
 
             while (siter.next()) |nxt| {
-                try mtable.put(nxt);
+                try self.write(nxt.key, nxt.value);
             }
 
-            mtable.freeze();
-
-            mtable.isFlushed.store(true, .seq_cst);
-            mtable.sstable.store(sstable, .seq_cst);
-
-            try self.mtables.append(mtable);
+            const mtable = self.mtable.load(.seq_cst);
+            try self.freeze(mtable);
 
             count += 1;
-        }
 
-        const nxt_table = try Memtable.init(self.alloc, count, self.opts);
-        self.mtable.store(nxt_table, .seq_cst);
+            self.alloc.free(nxt_file);
+        }
 
         debug.print("database opened @ {s} w/ {d} warm tables\n", .{ self.opts.data_dir, self.mtables.items.len });
     }
@@ -199,6 +192,7 @@ pub const Database = struct {
             {
                 mtx.lock();
                 defer mtx.unlock();
+
                 warm_tables = try db.mtables.clone();
             }
 
@@ -365,8 +359,9 @@ pub const Database = struct {
         const current_id = mtable.getId();
         const nxt_table = try Memtable.init(self.alloc, current_id + 1, self.opts);
 
-        self.mtable.store(nxt_table, .seq_cst);
         try self.mtables.append(mtable);
+
+        self.mtable.store(nxt_table, .seq_cst);
     }
 };
 

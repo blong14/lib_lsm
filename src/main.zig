@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const clap = @import("clap");
+const jemalloc = @import("jemalloc");
 const lsm = @import("lsm");
 
 const debug = std.debug;
@@ -13,6 +14,7 @@ const Allocator = mem.Allocator;
 
 const KV = lsm.KV;
 
+const allocator = jemalloc.allocator;
 const usage =
     \\-h, --help             Display this help and exit.
     \\-d, --data_dir <str>   The data directory to save files on disk.
@@ -22,11 +24,6 @@ const usage =
 ;
 
 pub fn main() !void {
-    var gpa = heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-
-    const allocator = gpa.allocator();
-
     // First we specify what parameters our program can take.
     // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`
     const params = comptime clap.parseParamsComptime(usage);
@@ -63,8 +60,6 @@ pub fn main() !void {
     const sst_capacity = res.args.sst_capacity orelse default_opts.sst_capacity;
     const wal_capacity = default_opts.wal_capacity;
 
-    // const input = res.args.input orelse "measurements.txt";
-
     const opts: lsm.Opts = .{
         .data_dir = data_dir,
         .sst_capacity = sst_capacity,
@@ -75,5 +70,15 @@ pub fn main() !void {
         debug.print("database init error {s}\n", .{@errorName(err)});
         return err;
     };
+    defer allocator.destroy(db);
     defer db.deinit();
+
+    try db.open();
+
+    var it = try db.scan(allocator, "Atlanta", "New York");
+    defer it.deinit();
+
+    while (it.next()) |nxt| {
+        debug.print("{}\n", .{nxt});
+    }
 }

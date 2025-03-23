@@ -166,17 +166,21 @@ pub const SSTable = struct {
         pub fn next(ctx: *anyopaque) ?KV {
             const self: *SSTableIterator = @ptrCast(@alignCast(ctx));
 
+            const offset_sz = @sizeOf(u64);
+
             var kv: ?KV = null;
-            if (self.nxt < self.block.offset_data.items.len) {
-                const nxt_offset_byts = self.block.offset_data.items[self.nxt];
-                const nxt_offset = readInt(u8, &nxt_offset_byts, Endian);
+            if (self.nxt + offset_sz <= self.block.offset_data.items.len) {
+                var nxt_offset_byts: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
+                @memcpy(&nxt_offset_byts, self.block.offset_data.items[self.nxt .. self.nxt + offset_sz]);
+
+                const nxt_offset = readInt(u64, &nxt_offset_byts, Endian);
 
                 kv = self.block.read(nxt_offset) catch |err| {
                     print("sstable iter error {s}\n", .{@errorName(err)});
                     return null;
                 };
 
-                self.nxt += 1;
+                self.*.nxt += offset_sz;
             }
 
             return kv;
@@ -258,7 +262,6 @@ test SSTable {
     const kv = KV.init("__key__", expected);
 
     _ = try st.write(kv);
-    _ = try st.flush();
 
     var actual: KV = undefined;
     try st.read(kv.key, &actual);
@@ -267,14 +270,18 @@ test SSTable {
     try testing.expectEqualStrings(expected, actual.value);
 
     // when
-    var nxt_actual: KV = undefined;
+    const akv = KV.init("__another_key__", "__another_value__");
+
+    _ = try st.write(akv);
 
     var siter = try st.iterator(alloc);
     defer siter.deinit();
 
-    while (siter.next()) |nxt| {
-        nxt_actual = nxt;
-    }
+    _ = siter.next();
 
-    try testing.expectEqualStrings(expected, nxt_actual.value);
+    const nxt_actual = siter.next();
+
+    try testing.expectEqualStrings(akv.value, nxt_actual.?.value);
+
+    _ = try st.flush();
 }
