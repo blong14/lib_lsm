@@ -158,7 +158,7 @@ pub const Block = struct {
         const offset_count = self.offset_data.items.len;
         const data_count = self.data.items.len;
 
-        return @sizeOf(u64) + meta_data_count + @sizeOf(u64) + offset_count + data_count;
+        return @sizeOf(u64) + @sizeOf(u64) + meta_data_count + @sizeOf(u64) + offset_count + data_count;
     }
 
     pub fn flush(self: *Self, stream: *FixedBuffer([]align(PageSize) u8)) !usize {
@@ -174,10 +174,14 @@ pub const Block = struct {
         var block_size: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
         writeInt(std.math.ByteAlignedInt(u64), &block_size, total_bytes, Endian);
 
+        var meta_data_size: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
+        writeInt(std.math.ByteAlignedInt(u64), &meta_data_size, self.meta_data.items.len, Endian);
+
         var count: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
         writeInt(std.math.ByteAlignedInt(u64), &count, self.count, Endian);
 
         var bytes = try stream.write(&block_size);
+        bytes += try stream.write(&meta_data_size);
         bytes += try stream.write(self.meta_data.items);
         bytes += try stream.write(&count);
         bytes += try stream.write(self.offset_data.items);
