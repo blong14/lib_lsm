@@ -325,12 +325,7 @@ const MultiThreadedImpl = struct {
         }
 
         pub fn consume(opts: lsm.Opts, inbox: *MessageQueue) void {
-            var arena = ThreadSafeBumpAllocator.init(allocator, std.mem.page_size) catch return;
-            defer arena.deinit();
-            defer arena.printStats();
-
-            const arena_allocator = arena.allocator();
-            const db = lsm.databaseFromOpts(arena_allocator, opts) catch |err| {
+            const db = lsm.databaseFromOpts(allocator, opts) catch |err| {
                 debug.print(
                     "database init error {s}\n",
                     .{@errorName(err)},
@@ -343,7 +338,7 @@ const MultiThreadedImpl = struct {
 
             var thread_pool: Pool = undefined;
             thread_pool.init(Pool.Options{
-                .allocator = arena_allocator,
+                .allocator = allocator,
             }) catch |err| {
                 debug.print(
                     "threadpool init error {s}\n",
