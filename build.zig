@@ -58,6 +58,9 @@ pub fn build(b: *std.Build) void {
         // running `zig build`).
         b.installArtifact(lib);
 
+        _ = b.addInstallFile(lib.getEmittedH(), "include");
+        // b.getInstallStep().dependOn(&install_header.step);
+
         // Creates a step for unit testing. This only builds the test executable
         // but does not run it.
         const main_tests = b.addTest(.{

@@ -1,8 +1,9 @@
 package main
 
-/*
-#cgo LDFLAGS: /home/blong14/Developer/git/lib_lsm/zig-out/lib/liblib_lsm.a -L/home/blong14/Developer/git/lib_lsm/zig-out/lib -Wl,-rpath,/home/blong14/Developer/git/lib_lsm/zig-out/lib -lm -lstdc++ -pthread -ldl
-*/
+// #cgo CFLAGS: -I/home/blong14/Developer/git/lib_lsm/bin/zig-linux-x86_64-0.13.0/lib
+// #cgo CFLAGS: -I/home/blong14/Developer/git/lib_lsm/zig-out/include
+// #cgo LDFLAGS: -L/home/blong14/Developer/git/lib_lsm/zig-out/lib -llib_lsm
+// #include <lib_lsm.h>
 import "C"
 import (
 	"context"
@@ -11,7 +12,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-//	"unsafe"
+
+    _ "unsafe"
 )
 
 func main() {
