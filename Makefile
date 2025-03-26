@@ -19,10 +19,12 @@ ZIG := bin/zig-linux-x86_64-0.13.0/zig
 # zig fetch --global-cache-dir zig-cache --save 'https://github.com/Hejsil/zig-clap/archive/refs/tags/0.9.1.tar.gz'
 # zig fetch --global-cache-dir zig-cache --save 'https://github.com/zigcc/zig-msgpack/archive/refs/tags/0.0.5.tar.gz'
 # zig fetch --global-cache-dir zig-cache --save https://github.com/almmiko/btree.c-zig/archive/fc0d08558b5104991ae43c04d7b7c10a4be49aa7.tar.gz
+# curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# zig test -lc -I vendor/crossbeam-skiplist/src -L vendor/crossbeam-skiplist/target/release vendor/crossbeam-skiplist/target/release/libconcurrent_skiplist.so src/skiplist.zig
 
 .PHONY: clean test
 
-all: build callgrind.o massif.o
+all: build 
 
 fmt: $(SOURCES)
 	$(ZIG) fmt .
@@ -31,17 +33,14 @@ fmt: $(SOURCES)
 # b src/tablemap.zig:76
 # r
 # ipcrm -q <tab>
-build: fmt
-	$(ZIG) build $(BUILD_OPTS)
-
-debug-build: clean fmt
+debug-build: clean fmt target/release/libconcurrent_skiplist.so
 	$(ZIG) build $(DEBUG_BUILD_OPTS)
 
 perf: debug-build
 	perf record -F 200 -g $(EXEC) --mode $(MODE) --data_dir $(DATA_DIR)
 	perf script --input=perf.data -F +pid > perf.processed.data
 
-run: fmt
+run: fmt target/release/libconcurrent_skiplist.so
 	$(ZIG) build lsm -- --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
 
 profile: clean build
@@ -65,3 +64,17 @@ callgrind.o: $(EXEC)
 massif.o: $(EXEC)
 	# ms_print
 	valgrind --tool=massif --time-unit=B --massif-out-file=$@ ./$(EXEC) --data_dir $(DATA_DIR)
+
+include/skiplist.h: src/lib.rs
+	cbindgen --config cbindgen.toml --crate concurrent-skiplist --output include/skiplist.h
+
+target/release/libconcurrent_skiplist.so: include/skiplist.h
+	# https://nnethercote.github.io/perf-book/build-configuration.html
+	MALLOC_CONF="thp:always,metadata_thp:always" cargo build --release
+
+zig-out/lib/liblib_lsm.a: fmt target/release/libconcurrent_skiplist.so
+	$(ZIG) build $(BUILD_OPTS)
+
+build: zig-out/lib/liblib_lsm.a src/main.go
+	go build src/main.go
+

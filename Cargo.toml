@@ -2,7 +2,7 @@
 name = "concurrent-skiplist"
 version = "0.1.0"
 edition = "2021"
-include = ["src/skiplist.h"]
+include = ["include/skiplist.h"]
 
 [dependencies]
 crossbeam-skiplist = "0.1.3"

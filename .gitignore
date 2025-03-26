@@ -2,7 +2,8 @@
 zig-cache/
 zig-out/
 
-vendor/*/target
+target
+include/skiplist.h
 
 .idea/
 
@@ -11,3 +12,4 @@ massif.o
 *.csv
 *.txt
 perf.*
+.tmp/*

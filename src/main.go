@@ -23,7 +23,7 @@ func main() {
     db := C.lsm_init()
 
 	key := (*C.uchar)(unsafe.Pointer(C.CString("__key__")))
-	value := (*C.uchar)(unsafe.Pointer(C.CString("__value_again__")))
+	value := (*C.uchar)(unsafe.Pointer(C.CString("__value__")))
 
     C.lsm_write(db, key, value)
 
