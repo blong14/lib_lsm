@@ -21,6 +21,7 @@ func main() {
 	_, cancel := context.WithCancel(context.Background())
 
     db := C.lsm_init()
+    defer C.lsm_deinit(db)
 
 	key := (*C.uchar)(unsafe.Pointer(C.CString("__key__")))
 	value := (*C.uchar)(unsafe.Pointer(C.CString("__value__")))

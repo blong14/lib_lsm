@@ -65,7 +65,9 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 // Public C Interface
 
 export fn lsm_init() ?*anyopaque {
-    return defaultDatabase(std.heap.c_allocator) catch return null;
+    const db = defaultDatabase(std.heap.c_allocator) catch return null;
+    db.open() catch return null;
+    return db;
 }
 
 export fn lsm_read(addr: *anyopaque, key: [*c]const u8) [*c]const u8 {
@@ -84,5 +86,13 @@ export fn lsm_write(addr: *anyopaque, key: [*c]const u8, value: [*c]const u8) bo
     db.write(k, v) catch {
         return false;
     };
+    return true;
+}
+
+export fn lsm_deinit(addr: *anyopaque) bool {
+    debug.print("flushing database...\n", .{});
+    const db: *Database = @ptrCast(@alignCast(addr));
+    db.flush() catch return false;
+    db.deinit();
     return true;
 }
