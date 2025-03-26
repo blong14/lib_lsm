@@ -6,8 +6,6 @@ vendor/*/target
 
 .idea/
 
-data*
-
 callgrind.o
 massif.o
 *.csv

@@ -1,8 +1,7 @@
 package main
 
-// #cgo CFLAGS: -I/home/blong14/Developer/git/lib_lsm/bin/zig-linux-x86_64-0.13.0/lib
-// #cgo CFLAGS: -I/home/blong14/Developer/git/lib_lsm/zig-out/include
-// #cgo LDFLAGS: -L/home/blong14/Developer/git/lib_lsm/zig-out/lib -llib_lsm
+// #cgo CFLAGS: -I../include
+// #cgo LDFLAGS: -L../zig-out/lib -llib_lsm
 // #include <lib_lsm.h>
 import "C"
 import (
@@ -12,8 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
-    _ "unsafe"
+    "unsafe"
 )
 
 func main() {
@@ -21,6 +19,19 @@ func main() {
 	signal.Notify(sigint, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
 	_, cancel := context.WithCancel(context.Background())
+
+    db := C.lsm_init()
+
+	key := (*C.uchar)(unsafe.Pointer(C.CString("__key__")))
+	value := (*C.uchar)(unsafe.Pointer(C.CString("__value_again__")))
+
+    C.lsm_write(db, key, value)
+
+    resp := C.lsm_read(db, key)
+    
+	return_value := C.GoString((*C.char)(unsafe.Pointer(resp)))
+    
+    log.Printf("hello %x db w/ %s\n", db, return_value)
 
 	s := <-sigint
 	log.Printf("received %s signal\n", s)
