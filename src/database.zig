@@ -115,6 +115,7 @@ pub const Database = struct {
             }
 
             const mtable = self.mtable.load(.seq_cst);
+            mtable.isFlushed.store(true, .seq_cst);
             try self.freeze(mtable);
 
             count += 1;
@@ -301,8 +302,12 @@ pub const Database = struct {
         defer mtx.unlock();
 
         const hot_table = self.mtable.load(.seq_cst);
+        defer self.alloc.destroy(hot_table);
+
         hot_table.freeze();
-        try hot_table.flush();
+        if (!hot_table.flushed()) {
+            try hot_table.flush();
+        }
 
         const current_id = hot_table.getId();
         const nxt_table = try Memtable.init(self.alloc, current_id + 1, self.opts);

@@ -6,7 +6,8 @@ DATA_DIR := /home/blong14/Developer/git/lib_lsm/.tmp/data
 EXEC := zig-out/bin/xlsm
 MODE := singlethreaded
 # MODE := multithreaded
-SOURCES := $(wildcard ./src/*.zig)
+SOURCES := $(wildcard ./src/*)
+GO := /home/blong14/sdk/go1.22/bin/go
 ZIG := bin/zig-linux-x86_64-0.13.0/zig
 
 # 3rd party deps
@@ -27,7 +28,8 @@ ZIG := bin/zig-linux-x86_64-0.13.0/zig
 all: build 
 
 fmt: $(SOURCES)
-	$(ZIG) fmt .
+	$(ZIG) fmt src
+	$(GO) fmt ./src/...
 
 # gdb --tui zig-out/bin/lsm
 # b src/tablemap.zig:76

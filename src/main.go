@@ -6,32 +6,32 @@ package main
 // #include <lib_lsm.h>
 import "C"
 import (
-	"bytes"
-    "context"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"path"
+	"strings"
 	"syscall"
-    "time"
-    "unsafe"
+	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
 
-    "github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgproto3/v2"
 	pgquery "github.com/pganalyze/pg_query_go/v2"
 )
 
+type LSM = unsafe.Pointer
+
 type pgEngine struct {
-	db         *bolt.DB
-	bucketName []byte
+	db LSM
 }
 
-func newPgEngine(db *bolt.DB) *pgEngine {
-	return &pgEngine{db, []byte("data")}
+func newPgEngine(db LSM) *pgEngine {
+	return &pgEngine{db}
 }
 
 type tableDefinition struct {
@@ -40,7 +40,33 @@ type tableDefinition struct {
 	ColumnTypes []string
 }
 
-func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) error {
+func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
+	keyBytes := []byte("tables_" + name)
+	key := (*C.uchar)(unsafe.Pointer(C.CString(string(keyBytes))))
+
+	resp := C.lsm_read(pe.db, key)
+	if resp == nil {
+		return nil, fmt.Errorf("[%q] key not found %s\n", pe.db, keyBytes)
+	}
+
+	valBytes := []byte(C.GoString((*C.char)(unsafe.Pointer(resp))))
+
+	var tbl tableDefinition
+	err := json.Unmarshal(valBytes, &tbl)
+	if err != nil {
+		return nil, fmt.Errorf("Could not unmarshal table: %s", err)
+	}
+
+	return &tbl, err
+}
+
+type pgResult struct {
+	fieldNames []string
+	fieldTypes []string
+	rows       [][]any
+}
+
+func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 	tbl := tableDefinition{}
 	tbl.Name = stmt.Relation.Relname
 
@@ -60,50 +86,26 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) error {
 		tbl.ColumnTypes = append(tbl.ColumnTypes, columnType)
 	}
 
+	keyBytes := []byte("tables_" + tbl.Name)
 	tableBytes, err := json.Marshal(tbl)
 	if err != nil {
-		return fmt.Errorf("Could not marshal table: %s", err)
+		return nil, fmt.Errorf("Could not marshal table: %s", err)
 	}
 
-	err = pe.db.Update(func(tx *bolt.Tx) error {
-		bkt, err := tx.CreateBucketIfNotExists(pe.bucketName)
-		if err != nil {
-			return err
-		}
+	key := (*C.uchar)(unsafe.Pointer(C.CString(string(keyBytes))))
+	value := (*C.uchar)(unsafe.Pointer(C.CString(string(tableBytes))))
 
-		return bkt.Put([]byte("tables_"+tbl.Name), tableBytes)
-	})
+	C.lsm_write(pe.db, key, value)
 
-	if err != nil {
-		return fmt.Errorf("Could not set key-value: %s", err)
-	}
+	results := &pgResult{}
 
-	return nil
+	return results, nil
 }
 
-func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
-	var tbl tableDefinition
-
-	err := pe.db.View(func(tx *bolt.Tx) error {
-		bkt := tx.Bucket(pe.bucketName)
-		if bkt == nil {
-			return fmt.Errorf("Table does not exist")
-		}
-
-		valBytes := bkt.Get([]byte("tables_" + name))
-		err := json.Unmarshal(valBytes, &tbl)
-		if err != nil {
-			return fmt.Errorf("Could not unmarshal table: %s", err)
-		}
-
-		return nil
-	})
-
-	return &tbl, err
-}
-
-func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
+func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error) {
 	tblName := stmt.Relation.Relname
+
+	results := &pgResult{}
 
 	slct := stmt.GetSelectStmt().GetSelectStmt()
 	for _, values := range slct.ValuesLists {
@@ -121,35 +123,26 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 				}
 			}
 
-			return fmt.Errorf("Unknown value type: %s", value)
-		}
-
-		rowBytes, err := json.Marshal(rowData)
-		if err != nil {
-			return fmt.Errorf("Could not marshal row: %s", err)
+			return nil, fmt.Errorf("Unknown value type: %s", value)
 		}
 
 		id := uuid.New().String()
-		err = pe.db.Update(func(tx *bolt.Tx) error {
-			bkt, err := tx.CreateBucketIfNotExists(pe.bucketName)
-			if err != nil {
-				return err
-			}
+		keyBytes := []byte("rows_" + tblName + "_" + id)
 
-			return bkt.Put([]byte("rows_"+tblName+"_"+id), rowBytes)
-		})
+		rowBytes, err := json.Marshal(rowData)
 		if err != nil {
-			return fmt.Errorf("Could not store row: %s", err)
+			return nil, fmt.Errorf("Could not marshal row: %s", err)
 		}
+
+		key := (*C.uchar)(unsafe.Pointer(C.CString(string(keyBytes))))
+		value := (*C.uchar)(unsafe.Pointer(C.CString(string(rowBytes))))
+
+		C.lsm_write(pe.db, key, value)
+
+		results.rows = append(results.rows, rowData)
 	}
 
-	return nil
-}
-
-type pgResult struct {
-	fieldNames []string
-	fieldTypes []string
-	rows       [][]any
+	return results, nil
 }
 
 func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
@@ -178,36 +171,39 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 		results.fieldTypes = append(results.fieldTypes, fieldType)
 	}
 
-	prefix := []byte("rows_" + tblName + "_")
-	pe.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(pe.bucketName).Cursor()
+	start := []byte("rows_" + tblName + "_")
+	startKey := (*C.uchar)(unsafe.Pointer(C.CString(string(start))))
 
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			var row []any
-			err = json.Unmarshal(v, &row)
-			if err != nil {
-				return fmt.Errorf("Unable to unmarshal row: %s", err)
-			}
+	end := []byte("tables_")
+	endKey := (*C.uchar)(unsafe.Pointer(C.CString(string(end))))
 
-			var targetRow []any
-			for _, target := range results.fieldNames {
-				for i, field := range tbl.ColumnNames {
-					if target == field {
-						targetRow = append(targetRow, row[i])
-					}
-				}
-			}
+	iter := C.lsm_scan(pe.db, startKey, endKey)
+	defer func() { _ = C.lsm_iter_deinit(iter) }()
 
-			results.rows = append(results.rows, targetRow)
+	for nxt := C.lsm_iter_next(iter); nxt != nil; nxt = C.lsm_iter_next(iter) {
+		var row []any
+		rowBytes := []byte(C.GoString((*C.char)(unsafe.Pointer(nxt))))
+		err = json.Unmarshal(rowBytes, &row)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to unmarshal row: %s", err)
 		}
 
-		return nil
-	})
+		var targetRow []any
+		for _, target := range results.fieldNames {
+			for i, field := range tbl.ColumnNames {
+				if target == field {
+					targetRow = append(targetRow, row[i])
+				}
+			}
+		}
+
+		results.rows = append(results.rows, targetRow)
+	}
 
 	return results, nil
 }
 
-func (pe *pgEngine) execute(tree *pgquery.ParseResult) error {
+func (pe *pgEngine) execute(tree *pgquery.ParseResult) (*pgResult, error) {
 	for _, stmt := range tree.GetStmts() {
 		n := stmt.GetStmt()
 		if c := n.GetCreateStmt(); c != nil {
@@ -219,25 +215,13 @@ func (pe *pgEngine) execute(tree *pgquery.ParseResult) error {
 		}
 
 		if c := n.GetSelectStmt(); c != nil {
-			_, err := pe.executeSelect(c)
-			return err
+			return pe.executeSelect(c)
 		}
 
-		return fmt.Errorf("Unknown statement type: %s", stmt)
+		return nil, fmt.Errorf("Unknown statement type: %s", stmt)
 	}
 
-	return nil
-}
-
-func (pe *pgEngine) delete() error {
-	return pe.db.Update(func(tx *bolt.Tx) error {
-		bkt := tx.Bucket(pe.bucketName)
-		if bkt != nil {
-			return tx.DeleteBucket(pe.bucketName)
-		}
-
-		return nil
-	})
+	return nil, fmt.Errorf("No statements to execute")
 }
 
 var dataTypeOIDMap = map[string]uint32{
@@ -247,16 +231,28 @@ var dataTypeOIDMap = map[string]uint32{
 
 type pgConn struct {
 	conn net.Conn
-	db   *bolt.DB
+	pe   *pgEngine
 }
 
 func (pc pgConn) done(buf []byte, msg string) {
-	buf = (&pgproto3.CommandComplete{CommandTag: []byte(msg)}).Encode(buf)
-	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-    pc.conn.SetWriteDeadline(time.Now().Add(3*time.Second))
-	_, err := pc.conn.Write(buf)
+	var err error
+	buf, err = (&pgproto3.CommandComplete{CommandTag: []byte(msg)}).Encode(buf)
+	if err != nil {
+		log.Printf("Failed to encode buf: %s", err)
+		return
+	}
+
+	buf, err = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+	if err != nil {
+		log.Printf("Failed to encode buf: %s", err)
+		return
+	}
+
+	pc.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	_, err = pc.conn.Write(buf)
 	if err != nil {
 		log.Printf("Failed to write query response: %s", err)
+		return
 	}
 }
 
@@ -268,7 +264,13 @@ func (pc pgConn) writePgResult(res *pgResult) {
 			DataTypeOID: dataTypeOIDMap[res.fieldTypes[i]],
 		})
 	}
-	buf := rd.Encode(nil)
+
+	buf, err := rd.Encode(nil)
+	if err != nil {
+		log.Printf("Failed to encode buf: %s\n", err)
+		return
+	}
+
 	for _, row := range res.rows {
 		dr := &pgproto3.DataRow{}
 		for _, value := range row {
@@ -277,11 +279,13 @@ func (pc pgConn) writePgResult(res *pgResult) {
 				log.Printf("Failed to marshal cell: %s\n", err)
 				return
 			}
-
 			dr.Values = append(dr.Values, bs)
 		}
-
-		buf = dr.Encode(buf)
+		buf, err = dr.Encode(buf)
+		if err != nil {
+			log.Printf("Failed to encode buf: %s\n", err)
+			return
+		}
 	}
 
 	pc.done(buf, fmt.Sprintf("SELECT %d", len(res.rows)))
@@ -295,8 +299,16 @@ func (pc pgConn) handleStartupMessage(pgconn *pgproto3.Backend) error {
 
 	switch startupMessage.(type) {
 	case *pgproto3.StartupMessage:
-		buf := (&pgproto3.AuthenticationOk{}).Encode(nil)
-		buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+		buf, err := (&pgproto3.AuthenticationOk{}).Encode(nil)
+		if err != nil {
+			return fmt.Errorf("Error sending ready for query: %s", err)
+		}
+
+		buf, err = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+		if err != nil {
+			return fmt.Errorf("Error sending ready for query: %s", err)
+		}
+
 		_, err = pc.conn.Write(buf)
 		if err != nil {
 			return fmt.Errorf("Error sending ready for query: %s", err)
@@ -332,20 +344,12 @@ func (pc pgConn) handleMessage(pgc *pgproto3.Backend) error {
 			return fmt.Errorf("Only make one request at a time.")
 		}
 
-		stmt := stmts.GetStmts()[0]
-
-		// Handle SELECTs here
-		s := stmt.GetStmt().GetSelectStmt()
-		if s != nil {
-			pe := newPgEngine(pc.db)
-			res, err := pe.executeSelect(s)
-			if err != nil {
-				return err
-			}
-
-			pc.writePgResult(res)
-			return nil
+		res, err := pc.pe.execute(stmts)
+		if err != nil {
+			return err
 		}
+
+		pc.writePgResult(res)
 
 		pc.done(nil, strings.ToUpper(strings.Split(t.String, " ")[0])+" ok")
 	case *pgproto3.Terminate:
@@ -368,11 +372,11 @@ func (pc pgConn) handle(ctx context.Context) {
 	}
 
 	for {
-        select {
-        case <-ctx.Done():
-            return
-        default:
-        }
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		err := pc.handleMessage(pgc)
 		if err != nil {
 			log.Println(err)
@@ -381,31 +385,31 @@ func (pc pgConn) handle(ctx context.Context) {
 	}
 }
 
-func runPgServer(ctx context.Context, port string, db *bolt.DB) {
+func runPgServer(ctx context.Context, pe *pgEngine, port string) {
 	ln, err := net.Listen("tcp", "localhost:"+port)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	for {
-        select {
-        case <-ctx.Done():
-            return
-        default:
-        }
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		pc := pgConn{conn, db}
+		pc := pgConn{conn, pe}
 		go pc.handle(ctx)
 	}
 }
 
 type config struct {
-	id       string
-	pgPort   string
+	id     string
+	pgPort string
 }
 
 func getConfig() config {
@@ -419,7 +423,7 @@ func getConfig() config {
 	}
 
 	if cfg.pgPort == "" {
-		log.Fatal("Missing required parameter: --pg-port")
+		cfg.pgPort = "54321"
 	}
 
 	return cfg
@@ -438,34 +442,19 @@ func main() {
 		log.Fatalf("Could not create data directory: %s", err)
 	}
 
-	db, err := bolt.Open(path.Join(dataDir, "/data"+cfg.id), 0600, nil)
-	if err != nil {
-		log.Fatalf("Could not open bolt db: %s", err)
-	}
-	defer db.Close()
-    db := C.lsm_init(dataDir)
-    defer C.lsm_deinit(db)
+	db := C.lsm_init()
 
 	pe := newPgEngine(db)
-	// Start off in clean state
-	// pe.delete()
 
-	go runPgServer(ctx, cfg.pgPort, db)
-
-	key := (*C.uchar)(unsafe.Pointer(C.CString("__key__")))
-	value := (*C.uchar)(unsafe.Pointer(C.CString("__value__")))
-
-    C.lsm_write(db, key, value)
-
-    resp := C.lsm_read(db, key)
-    
-	return_value := C.GoString((*C.char)(unsafe.Pointer(resp)))
-    
-    log.Printf("hello %x db w/ %s\n", db, return_value)
+	log.Printf("starting pg server @ 0.0.0.0:%s...\n", cfg.pgPort)
+	go runPgServer(ctx, pe, cfg.pgPort)
 
 	s := <-sigint
 	log.Printf("received %s signal\n", s)
-	cancel()
-	time.Sleep(500 * time.Millisecond)
 
+	cancel()
+
+	C.lsm_deinit(db)
+
+	time.Sleep(500 * time.Millisecond)
 }

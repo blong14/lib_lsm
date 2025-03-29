@@ -65,7 +65,10 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 // Public C Interface
 
 export fn lsm_init() ?*anyopaque {
-    const db = defaultDatabase(std.heap.c_allocator) catch return null;
+    const db = defaultDatabase(std.heap.c_allocator) catch |err| {
+        debug.print("init db error {s}\n", .{@errorName(err)});
+        return null;
+    };
     db.open() catch return null;
     return db;
 }
@@ -73,9 +76,7 @@ export fn lsm_init() ?*anyopaque {
 export fn lsm_read(addr: *anyopaque, key: [*c]const u8) [*c]const u8 {
     const db: *Database = @ptrCast(@alignCast(addr));
     const k = std.mem.span(key);
-    const kv = db.read(k) catch {
-        return null;
-    };
+    const kv = db.read(k) catch return null;
     return &kv.value[0];
 }
 
@@ -83,14 +84,34 @@ export fn lsm_write(addr: *anyopaque, key: [*c]const u8, value: [*c]const u8) bo
     const db: *Database = @ptrCast(@alignCast(addr));
     const k = std.mem.span(key);
     const v = std.mem.span(value);
-    db.write(k, v) catch {
-        return false;
-    };
+    db.write(k, v) catch return false;
+    return true;
+}
+
+export fn lsm_scan(addr: *anyopaque, start_key: [*c]const u8, end_key: [*c]const u8) ?*anyopaque {
+    const db: *Database = @ptrCast(@alignCast(addr));
+    const start = std.mem.span(start_key);
+    const end = std.mem.span(end_key);
+
+    const it = std.heap.c_allocator.create(Iterator(KV)) catch return null;
+    it.* = db.scan(std.heap.c_allocator, start, end) catch return null;
+    return it;
+}
+
+export fn lsm_iter_next(addr: *anyopaque) [*c]const u8 {
+    const it: *Iterator(KV) = @ptrCast(@alignCast(addr));
+    if (it.next()) |nxt| return &nxt.value[0];
+    return null;
+}
+
+export fn lsm_iter_deinit(addr: *anyopaque) bool {
+    const it: *Iterator(KV) = @ptrCast(@alignCast(addr));
+    it.deinit();
+    std.heap.c_allocator.destroy(it);
     return true;
 }
 
 export fn lsm_deinit(addr: *anyopaque) bool {
-    debug.print("flushing database...\n", .{});
     const db: *Database = @ptrCast(@alignCast(addr));
     db.flush() catch return false;
     db.deinit();
