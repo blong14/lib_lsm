@@ -64,11 +64,11 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 
 // Public C Interface
 
+const jemalloc = @import("jemalloc");
+const allocator = jemalloc.allocator;
+
 export fn lsm_init() ?*anyopaque {
-    const db = defaultDatabase(std.heap.c_allocator) catch |err| {
-        debug.print("init db error {s}\n", .{@errorName(err)});
-        return null;
-    };
+    const db = defaultDatabase(allocator) catch return null;
     db.open() catch return null;
     return db;
 }
@@ -93,8 +93,8 @@ export fn lsm_scan(addr: *anyopaque, start_key: [*c]const u8, end_key: [*c]const
     const start = std.mem.span(start_key);
     const end = std.mem.span(end_key);
 
-    const it = std.heap.c_allocator.create(Iterator(KV)) catch return null;
-    it.* = db.scan(std.heap.c_allocator, start, end) catch return null;
+    const it = allocator.create(Iterator(KV)) catch return null;
+    it.* = db.scan(allocator, start, end) catch return null;
     return it;
 }
 
@@ -107,7 +107,7 @@ export fn lsm_iter_next(addr: *anyopaque) [*c]const u8 {
 export fn lsm_iter_deinit(addr: *anyopaque) bool {
     const it: *Iterator(KV) = @ptrCast(@alignCast(addr));
     it.deinit();
-    std.heap.c_allocator.destroy(it);
+    allocator.destroy(it);
     return true;
 }
 

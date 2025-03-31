@@ -17,13 +17,24 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Add lib specific deps
+    const clap = b.dependency("clap", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const fast_csv = b.dependency("csv-fast-reader", .{
         .target = target,
         .optimize = optimize,
     });
+    const jemalloc = b.dependency("jemalloc", .{
+        .target = target,
+        .optimize = optimize,
+        .link_vendor = false,
+    });
 
     // Add custom modules so they can be referenced from our test directory
     const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/lib.zig") });
+    lsm.addIncludePath(fast_csv.path(""));
+    lsm.addImport("jemalloc", jemalloc.module("jemalloc"));
     lsm.addIncludePath(fast_csv.path(""));
     lsm.addIncludePath(b.path("include"));
 
@@ -51,6 +62,8 @@ pub fn build(b: *std.Build) void {
         lib.addLibraryPath(b.path("target/release"));
         lib.addObjectFile(b.path("target/release/libconcurrent_skiplist.so"));
         lib.addIncludePath(b.path("include"));
+        lib.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
+        lib.linkSystemLibrary("jemalloc");
         lib.linkLibC();
 
         // This declares intent for the library to be installed into the standard
@@ -71,6 +84,9 @@ pub fn build(b: *std.Build) void {
         main_tests.addLibraryPath(b.path("target/release"));
         main_tests.addObjectFile(b.path("target/release/libconcurrent_skiplist.so"));
         main_tests.addIncludePath(b.path("include"));
+        main_tests.root_module.addImport("lsm", lsm);
+        main_tests.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
+        main_tests.linkSystemLibrary("jemalloc");
         main_tests.linkLibC();
 
         const run_main_tests = b.addRunArtifact(main_tests);
@@ -85,16 +101,7 @@ pub fn build(b: *std.Build) void {
     // Integration tests
     {
         const exe = cmds.buildLsm(b, target, optimize);
-        const clap = b.dependency("clap", .{
-            .target = target,
-            .optimize = optimize,
-        });
 
-        const jemalloc = b.dependency("jemalloc", .{
-            .target = target,
-            .optimize = optimize,
-            .link_vendor = false,
-        });
         exe.addCSourceFiles(.{
             .root = fast_csv.path(""),
             .files = &.{"csv.c"},
@@ -124,12 +131,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        const clap = b.dependency("clap", .{});
-        const jemalloc = b.dependency("jemalloc", .{
-            .target = target,
-            .optimize = optimize,
-            .link_vendor = false,
-        });
         exe.addCSourceFiles(.{
             .root = fast_csv.path(""),
             .files = &.{"csv.c"},
@@ -143,8 +144,8 @@ pub fn build(b: *std.Build) void {
         exe.addLibraryPath(b.path("target/release"));
         exe.addObjectFile(b.path("target/release/libconcurrent_skiplist.so"));
         exe.root_module.addImport("clap", clap.module("clap"));
-        exe.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
         exe.root_module.addImport("lsm", lsm);
+        exe.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
         exe.linkSystemLibrary("jemalloc");
         exe.linkLibC();
         b.installArtifact(exe);
