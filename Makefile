@@ -9,6 +9,7 @@ MODE := singlethreaded
 SOURCES := $(wildcard ./src/*)
 GO := /home/blong14/sdk/go1.22/bin/go
 ZIG := bin/zig-linux-x86_64-0.13.0/zig
+GOEXEC := zig-out/bin/gopg 
 
 # 3rd party deps
 # sudo apt install linux-tools-common
@@ -49,7 +50,9 @@ profile: clean build
 	$(EXEC) --mode $(MODE) --input measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
 
 clean:
-	rm -rf $(BIN)/* callgrind.o massif.o $(DATA_DIR)/*.dat $(DATA_DIR)/data*/* 
+	rm -rf $(BIN)/* callgrind.o massif.o .zig-cache 
+	$(ZIG) build uninstall
+	$(GO) clean -cache
 
 test: $(SOURCES)
 	$(ZIG) build test --summary all
@@ -78,5 +81,5 @@ zig-out/lib/liblib_lsm.a: fmt target/release/libconcurrent_skiplist.so
 	$(ZIG) build $(BUILD_OPTS)
 
 build: zig-out/lib/liblib_lsm.a src/main.go
-	go build src/main.go
+	go build -o zig-out/bin/gopg src/main.go
 
