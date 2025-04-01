@@ -4,7 +4,7 @@ const ba = @import("bump_allocator.zig");
 const file = @import("file.zig");
 const iter = @import("iterator.zig");
 const keyvalue = @import("kv.zig");
-const lsm = @import("lib");
+const lsm = @import("lib.zig");
 const mtbl = @import("memtable.zig");
 const opt = @import("opts.zig");
 const sst = @import("sstable.zig");
@@ -28,6 +28,7 @@ const Memtable = mtbl.Memtable;
 const Opts = opt.Opts;
 const SSTable = sst.SSTable;
 
+const TAG = "[zig]";
 var mtx: Mutex = .{};
 
 pub const Database = struct {
@@ -41,12 +42,28 @@ pub const Database = struct {
     const Self = @This();
 
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
-        const byte_allocator = try ThreadSafeBumpAllocator.init(alloc, std.mem.page_size);
-        const mtable = try Memtable.init(alloc, 0, opts);
+        var byte_allocator = ThreadSafeBumpAllocator.init(alloc, 1096) catch |err| {
+            std.log.err("{s} unable to init bump allocator {s}", .{ TAG, @errorName(err) });
+            return err;
+        };
+        errdefer byte_allocator.deinit();
+
+        var mtable = Memtable.init(alloc, 0, opts) catch |err| {
+            std.log.err("{s} unable to init memtable {s}", .{ TAG, @errorName(err) });
+            return err;
+        };
+        errdefer mtable.deinit();
+
         const mtables = std.ArrayList(*Memtable).init(alloc);
+        errdefer mtables.deinit();
+
         const capacity = opts.sst_capacity;
 
-        const db = try alloc.create(Self);
+        const db = alloc.create(Self) catch |err| {
+            std.log.err("{s} unable to allocate db {s}", .{ TAG, @errorName(err) });
+            return err;
+        };
+
         db.* = .{
             .alloc = alloc,
             .byte_allocator = byte_allocator,
@@ -78,6 +95,8 @@ pub const Database = struct {
     }
 
     pub fn open(self: *Self) !void {
+        std.log.info("{s} database opening...", .{TAG});
+
         var data_dir = try std.fs.openDirAbsolute(self.opts.data_dir, .{ .iterate = true });
         defer data_dir.close();
 
@@ -123,7 +142,7 @@ pub const Database = struct {
             self.alloc.free(nxt_file);
         }
 
-        debug.print("database opened @ {s} w/ {d} warm tables\n", .{ self.opts.data_dir, self.mtables.items.len });
+        std.log.info("{s} database opened @ {s} w/ {d} warm tables", .{ TAG, self.opts.data_dir, self.mtables.items.len });
     }
 
     pub fn read(self: Self, key: []const u8) !KV {

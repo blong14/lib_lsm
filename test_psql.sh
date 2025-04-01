@@ -8,5 +8,3 @@ psql -h localhost -p 54321 -c "select age from users;"
 
 psql -h localhost -p 54321 -c "select name from users;"
 
-psql -h localhost -p 54321 -c "select * from users;"
-

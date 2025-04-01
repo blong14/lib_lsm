@@ -1,7 +1,7 @@
 // https://github.com/eatonphil/waterbugdb
 package main
 
-// #cgo CFLAGS: -I../include
+// #cgo CFLAGS: -I../zig-out/include
 // #cgo LDFLAGS: -L../zig-out/lib -llib_lsm
 // #include <lib_lsm.h>
 import "C"
@@ -46,7 +46,7 @@ func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 
 	resp := C.lsm_read(pe.db, key)
 	if resp == nil {
-		return nil, fmt.Errorf("[%q] key not found %s\n", pe.db, keyBytes)
+		return nil, fmt.Errorf("%#v -- key not found %s\n", pe.db, keyBytes)
 	}
 
 	valBytes := []byte(C.GoString((*C.char)(unsafe.Pointer(resp))))
@@ -54,7 +54,7 @@ func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	var tbl tableDefinition
 	err := json.Unmarshal(valBytes, &tbl)
 	if err != nil {
-		return nil, fmt.Errorf("Could not unmarshal table: %s", err)
+		return nil, fmt.Errorf("Could not unmarshal table definition: %s", err)
 	}
 
 	return &tbl, err
@@ -89,13 +89,15 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 	keyBytes := []byte("tables_" + tbl.Name)
 	tableBytes, err := json.Marshal(tbl)
 	if err != nil {
-		return nil, fmt.Errorf("Could not marshal table: %s", err)
+		return nil, fmt.Errorf("Could not marshal table key: %s", err)
 	}
 
 	key := (*C.uchar)(unsafe.Pointer(C.CString(string(keyBytes))))
 	value := (*C.uchar)(unsafe.Pointer(C.CString(string(tableBytes))))
 
-	C.lsm_write(pe.db, key, value)
+	if ok := C.lsm_write(pe.db, key, value); !ok {
+		return nil, fmt.Errorf("Could not write %s to %s", tableBytes, keyBytes)
+	}
 
 	results := &pgResult{}
 
@@ -137,7 +139,9 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error) {
 		key := (*C.uchar)(unsafe.Pointer(C.CString(string(keyBytes))))
 		value := (*C.uchar)(unsafe.Pointer(C.CString(string(rowBytes))))
 
-		C.lsm_write(pe.db, key, value)
+		if ok := C.lsm_write(pe.db, key, value); !ok {
+			return nil, fmt.Errorf("Could not write %s to %s", rowBytes, keyBytes)
+		}
 
 		results.rows = append(results.rows, rowData)
 	}
@@ -238,20 +242,20 @@ func (pc pgConn) done(buf []byte, msg string) {
 	var err error
 	buf, err = (&pgproto3.CommandComplete{CommandTag: []byte(msg)}).Encode(buf)
 	if err != nil {
-		log.Printf("Failed to encode buf: %s", err)
+		log.Printf("%s failed to encode buf: %s", tag, err)
 		return
 	}
 
 	buf, err = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 	if err != nil {
-		log.Printf("Failed to encode buf: %s", err)
+		log.Printf("%s failed to encode buf: %s", tag, err)
 		return
 	}
 
 	pc.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 	_, err = pc.conn.Write(buf)
 	if err != nil {
-		log.Printf("Failed to write query response: %s", err)
+		log.Printf("%s failed to write query response: %s", tag, err)
 		return
 	}
 }
@@ -267,7 +271,7 @@ func (pc pgConn) writePgResult(res *pgResult) {
 
 	buf, err := rd.Encode(nil)
 	if err != nil {
-		log.Printf("Failed to encode buf: %s\n", err)
+		log.Printf("%s failed to encode buf: %s\n", tag, err)
 		return
 	}
 
@@ -276,14 +280,14 @@ func (pc pgConn) writePgResult(res *pgResult) {
 		for _, value := range row {
 			bs, err := json.Marshal(value)
 			if err != nil {
-				log.Printf("Failed to marshal cell: %s\n", err)
+				log.Printf("%s failed to marshal cell: %s\n", tag, err)
 				return
 			}
 			dr.Values = append(dr.Values, bs)
 		}
 		buf, err = dr.Encode(buf)
 		if err != nil {
-			log.Printf("Failed to encode buf: %s\n", err)
+			log.Printf("%s failed to encode buf: %s\n", tag, err)
 			return
 		}
 	}
@@ -301,17 +305,17 @@ func (pc pgConn) handleStartupMessage(pgconn *pgproto3.Backend) error {
 	case *pgproto3.StartupMessage:
 		buf, err := (&pgproto3.AuthenticationOk{}).Encode(nil)
 		if err != nil {
-			return fmt.Errorf("Error sending ready for query: %s", err)
+			return fmt.Errorf("Error encoding `auth ok` ready for query: %s", err)
 		}
 
 		buf, err = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 		if err != nil {
-			return fmt.Errorf("Error sending ready for query: %s", err)
+			return fmt.Errorf("Error encoding `ready ok` for query: %s", err)
 		}
 
 		_, err = pc.conn.Write(buf)
 		if err != nil {
-			return fmt.Errorf("Error sending ready for query: %s", err)
+			return fmt.Errorf("Error writing ready for query: %s", err)
 		}
 
 		return nil
@@ -341,7 +345,7 @@ func (pc pgConn) handleMessage(pgc *pgproto3.Backend) error {
 		}
 
 		if len(stmts.GetStmts()) > 1 {
-			return fmt.Errorf("Only make one request at a time.")
+			return fmt.Errorf("Error more than one statement received [count = %d]", len(stmts.GetStmts()))
 		}
 
 		res, err := pc.pe.execute(stmts)
@@ -355,7 +359,7 @@ func (pc pgConn) handleMessage(pgc *pgproto3.Backend) error {
 	case *pgproto3.Terminate:
 		return nil
 	default:
-		return fmt.Errorf("Received message other than Query from client: %s", msg)
+		return fmt.Errorf("Error received message other than Query from client: %s", msg)
 	}
 
 	return nil
@@ -367,19 +371,20 @@ func (pc pgConn) handle(ctx context.Context) {
 
 	err := pc.handleStartupMessage(pgc)
 	if err != nil {
-		log.Println(err)
+		log.Printf("%s %s", tag, err)
 		return
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("%s handle exiting...", tag)
 			return
 		default:
 		}
 		err := pc.handleMessage(pgc)
 		if err != nil {
-			log.Println(err)
+			log.Printf("%s %s", tag, err)
 			return
 		}
 	}
@@ -394,6 +399,7 @@ func runPgServer(ctx context.Context, pe *pgEngine, port string) {
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("%s tcp server exiting...", tag)
 			return
 		default:
 		}
@@ -429,6 +435,8 @@ func getConfig() config {
 	return cfg
 }
 
+const tag = "[go]"
+
 func main() {
 	sigint := make(chan os.Signal, 1)
 	signal.Notify(sigint, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
@@ -439,18 +447,21 @@ func main() {
 	dataDir := "data"
 	err := os.MkdirAll(dataDir, os.ModePerm)
 	if err != nil {
-		log.Fatalf("Could not create data directory: %s", err)
+		log.Fatalf("%s Could not create data directory: %s", tag, err)
 	}
 
 	db := C.lsm_init()
+	if db == nil {
+		log.Fatalf("%s Could not init database", tag)
+	}
 
 	pe := newPgEngine(db)
 
-	log.Printf("starting pg server @ 0.0.0.0:%s...\n", cfg.pgPort)
+	log.Printf("%s starting pg server @ 0.0.0.0:%s...\n", tag, cfg.pgPort)
 	go runPgServer(ctx, pe, cfg.pgPort)
 
 	s := <-sigint
-	log.Printf("received %s signal\n", s)
+	log.Printf("%s received %s signal\n", tag, s)
 
 	cancel()
 
