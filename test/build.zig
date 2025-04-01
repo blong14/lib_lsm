@@ -13,11 +13,10 @@ pub fn buildLsm(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *Comp
         .optimize = optimize,
     });
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run-xlsm", "Run the test app with no concurrency");
+    const run_step = b.step("xlsm", "Run the integration tests");
     run_step.dependOn(&run_cmd.step);
     return exe;
 }

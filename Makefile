@@ -9,7 +9,6 @@ MODE := singlethreaded
 SOURCES := $(wildcard ./src/*)
 GO := /home/blong14/sdk/go1.22/bin/go
 ZIG := bin/zig-linux-x86_64-0.13.0/zig
-GOEXEC := zig-out/bin/gopg 
 
 # 3rd party deps
 # sudo apt install linux-tools-common
@@ -24,38 +23,46 @@ GOEXEC := zig-out/bin/gopg
 # curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # zig test -lc -I vendor/crossbeam-skiplist/src -L vendor/crossbeam-skiplist/target/release vendor/crossbeam-skiplist/target/release/libconcurrent_skiplist.so src/skiplist.zig
 
-.PHONY: clean test
-
 all: build 
 
+clean:
+	@rm -rf $(BIN)/* zig-out/lib/* zig-out/include/* *.o .zig-cache 
+	$(ZIG) build uninstall --summary all --verbose
+	$(GO) clean -cache -v
+
 fmt: $(SOURCES)
+	$(ZIG) fmt build.zig
 	$(ZIG) fmt src
 	$(GO) fmt ./src/...
+
+build: fmt 
+	$(ZIG) build $(BUILD_OPTS) --summary all --verbose
+
+rust: fmt 
+	$(ZIG) build $(BUILD_OPTS) rust --summary all --verbose
+
+go: fmt 
+	$(ZIG) build $(BUILD_OPTS) go --summary all --verbose
+
+test: fmt 
+	$(ZIG) build test --summary all
+
+run: fmt 
+	$(ZIG) build lsmctl -- --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
+
+profile: fmt 
+	$(ZIG) build $(BUILD_OPTS) xlsm -- --mode $(MODE) --input measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
 
 # gdb --tui zig-out/bin/lsm
 # b src/tablemap.zig:76
 # r
 # ipcrm -q <tab>
-debug-build: clean fmt target/release/libconcurrent_skiplist.so
-	$(ZIG) build $(DEBUG_BUILD_OPTS)
+debug-build: clean fmt 
+	$(ZIG) build $(DEBUG_BUILD_OPTS) xlsm
 
 perf: debug-build
 	perf record -F 200 -g $(EXEC) --mode $(MODE) --data_dir $(DATA_DIR)
 	perf script --input=perf.data -F +pid > perf.processed.data
-
-run: fmt target/release/libconcurrent_skiplist.so
-	$(ZIG) build lsm -- --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
-
-profile: clean build
-	$(EXEC) --mode $(MODE) --input measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
-
-clean:
-	rm -rf $(BIN)/* callgrind.o massif.o .zig-cache 
-	$(ZIG) build uninstall
-	$(GO) clean -cache
-
-test: $(SOURCES)
-	$(ZIG) build test --summary all
 
 poop: clean build 
 	./bin/poop './$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./measurements.txt --sst_capacity 1_000_000' \
@@ -69,17 +76,4 @@ callgrind.o: $(EXEC)
 massif.o: $(EXEC)
 	# ms_print
 	valgrind --tool=massif --time-unit=B --massif-out-file=$@ ./$(EXEC) --data_dir $(DATA_DIR)
-
-include/skiplist.h: src/lib.rs
-	cbindgen --config cbindgen.toml --crate concurrent-skiplist --output include/skiplist.h
-
-target/release/libconcurrent_skiplist.so: include/skiplist.h
-	# https://nnethercote.github.io/perf-book/build-configuration.html
-	MALLOC_CONF="thp:always,metadata_thp:always" cargo build --release
-
-zig-out/lib/liblib_lsm.a: fmt target/release/libconcurrent_skiplist.so
-	$(ZIG) build $(BUILD_OPTS)
-
-build: zig-out/lib/liblib_lsm.a src/main.go
-	go build -o zig-out/bin/gopg src/main.go
 
