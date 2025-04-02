@@ -1,8 +1,53 @@
 const std = @import("std");
-const cmds = @import("test/build.zig");
+const cmds = @import("tests/build.zig");
 
-pub fn build_rust_headers(b: *std.Build) *std.Build.Step.Run {
-    const make_header = b.addSystemCommand(
+pub fn zig_fmt(b: *std.Build) *std.Build.Step.Run {
+    const cmd = b.addSystemCommand(
+        &[_][]const u8{
+            "zig",
+            "fmt",
+            "src",
+        },
+    );
+    return cmd;
+}
+
+pub fn cp_lsm_headers(b: *std.Build) *std.Build.Step.Run {
+    const cmd = b.addSystemCommand(
+        &[_][]const u8{
+            "cp",
+            "include/lib_lsm.h",
+            "zig-out/include/lib_lsm.h",
+        },
+    );
+    return cmd;
+}
+
+pub fn go_fmt(b: *std.Build) *std.Build.Step.Run {
+    const cmd = b.addSystemCommand(
+        &[_][]const u8{
+            "go",
+            "fmt",
+            "./...",
+        },
+    );
+    return cmd;
+}
+
+pub fn go_build(b: *std.Build) *std.Build.Step.Run {
+    const cmd = b.addSystemCommand(
+        &[_][]const u8{
+            "go",
+            "build",
+            "-o=zig-out/bin/gopg",
+            "src/main.go",
+        },
+    );
+    return cmd;
+}
+
+pub fn cbindgen_build(b: *std.Build) *std.Build.Step.Run {
+    const cmd = b.addSystemCommand(
         &[_][]const u8{
             "cbindgen",
             "--config",
@@ -13,13 +58,13 @@ pub fn build_rust_headers(b: *std.Build) *std.Build.Step.Run {
             "zig-out/include/skiplist.h",
         },
     );
-    return make_header;
+    return cmd;
 }
 
-pub fn build_rust(b: *std.Build) *std.Build.Step.Run {
+pub fn rust_build(b: *std.Build) *std.Build.Step.Run {
     // https://nnethercote.github.io/perf-book/build-configuration.html
-    const rust_headers = build_rust_headers(b);
-    const rust = b.addSystemCommand(
+    const rust_headers = cbindgen_build(b);
+    const cmd = b.addSystemCommand(
         &[_][]const u8{
             // "MALLOC_CONF='thp:always,metadata_thp:always'",
             "cargo",
@@ -28,32 +73,8 @@ pub fn build_rust(b: *std.Build) *std.Build.Step.Run {
             "--target-dir=zig-out/lib",
         },
     );
-    rust.step.dependOn(&rust_headers.step);
-    return rust;
-}
-
-pub fn build_go(b: *std.Build) *std.Build.Step.Run {
-    const go = b.addSystemCommand(
-        &[_][]const u8{
-            "go",
-            "build",
-            "-v",
-            "-o=zig-out/bin/gopg",
-            "src/main.go",
-        },
-    );
-    return go;
-}
-
-pub fn build_lsm_headers(b: *std.Build) *std.Build.Step.Run {
-    const make_header = b.addSystemCommand(
-        &[_][]const u8{
-            "cp",
-            "include/lib_lsm.h",
-            "zig-out/include/lib_lsm.h",
-        },
-    );
-    return make_header;
+    cmd.step.dependOn(&rust_headers.step);
+    return cmd;
 }
 
 // Although this function looks imperative, note that its job is to
@@ -71,6 +92,14 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    // utilitiy commands
+    const zigfmt = zig_fmt(b);
+    const gofmt = go_fmt(b);
+    
+    const fmt_step = b.step("fmt", "Format source files");
+    fmt_step.dependOn(&zigfmt.step);
+    fmt_step.dependOn(&gofmt.step);
+    
     // Add lib specific deps (check zig cacheing)
     // TODO: Add rust dependency install
     // TODO: Add go dependency install
@@ -91,16 +120,16 @@ pub fn build(b: *std.Build) void {
 
     // make zig-out/include/skiplist.h
     // make zig-out/lib/libconcurrent_skiplist.so
-    const rust = build_rust(b);
+    const rust = rust_build(b);
     const rust_make_step = b.step("rust", "Build the shared rust library");
     rust_make_step.dependOn(&rust.step);
 
     const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/lib.zig") });
     lsm.addImport("jemalloc", jemalloc.module("jemalloc"));
     lsm.addIncludePath(b.path("zig-out/include"));
-
+ 
     // cp include/lib_lsm.h zig-out/include
-    const lsm_headers = build_lsm_headers(b);
+    const lsm_headers = cp_lsm_headers(b);
 
     // make zig-out/lib/liblib_lsm.a
     const lib = b.addStaticLibrary(.{
@@ -109,6 +138,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib.step.dependOn(&zigfmt.step);
     lib.step.dependOn(&rust.step);
     lib.step.dependOn(&lsm_headers.step);
     lib.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
@@ -125,7 +155,8 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     // make build gopg
-    const go = build_go(b);
+    const go = go_build(b);
+    go.step.dependOn(&gofmt.step);
     go.step.dependOn(b.getInstallStep());
 
     const go_make_step = b.step("go", "Build the go server");

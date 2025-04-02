@@ -75,7 +75,7 @@ pub fn main() !void {
 
     try db.open();
 
-    var it = try db.scan(allocator, "Atlanta", "New York");
+    var it = try db.iterator(allocator);
     defer it.deinit();
 
     while (it.next()) |nxt| {

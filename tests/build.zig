@@ -8,7 +8,7 @@ const ResolvedTarget = std.Build.ResolvedTarget;
 pub fn buildLsm(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *CompileStep {
     const exe = b.addExecutable(.{
         .name = "xlsm",
-        .root_source_file = b.path("test/lsm/main.zig"),
+        .root_source_file = b.path("tests/lsm/main.zig"),
         .target = target,
         .optimize = optimize,
     });
