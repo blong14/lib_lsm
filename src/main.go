@@ -457,7 +457,7 @@ func main() {
 
 	pe := newPgEngine(db)
 
-	log.Printf("%s starting pg server @ 0.0.0.0:%s...\n", tag, cfg.pgPort)
+	log.Printf("%s starting pg server @ 0.0.0.0:%s\n", tag, cfg.pgPort)
 	go runPgServer(ctx, pe, cfg.pgPort)
 
 	s := <-sigint

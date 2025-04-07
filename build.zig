@@ -130,6 +130,7 @@ pub fn build(b: *std.Build) void {
  
     // cp include/lib_lsm.h zig-out/include
     const lsm_headers = cp_lsm_headers(b);
+    lsm_headers.step.dependOn(&rust.step);
 
     // make zig-out/lib/liblib_lsm.a
     const lib = b.addStaticLibrary(.{

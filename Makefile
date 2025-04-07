@@ -9,6 +9,7 @@ BUILD_OUT := zig-out
 BUILD_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
 BUILD_FLAGS := --summary all --verbose
 DEBUG_BUILD_OPTS := -Dcpu=x86_64 -Doptimize=Debug
+TARGET := zig-out/lib/liblib_lsm.a 
 
 # LSM options
 DATA_DIR := /home/blong14/Developer/git/lib_lsm/.tmp/data
@@ -18,19 +19,24 @@ MODE := singlethreaded
 all: build 
 
 clean:
-	@rm -rf $(BUILD_OUT)/bin/* $(BUILD_OUT)/lib/* $(BUILD_OUT)/include/* $(BUILD_CACHE) 
 	@$(ZIG) build uninstall $(BUILD_FLAGS) 
 	@$(GO) clean -cache -v
+	@rm -rf $(BUILD_OUT) $(BUILD_CACHE) 
 
-fmt: $(SOURCES)
+fmt:
 	@$(ZIG) build $(BUILD_FLAGS) fmt 
 
-build: 
+$(TARGET): $(SOURCES)
 	$(ZIG) build $(BUILD_OPTS) $(BUILD_FLAGS) 
 
-go: 
-	@$(ZIG) build $(BUILD_OPTS) go $(BUILD_FLAGS)
-	$(GO) run $(GO_MAIN) 
+build: $(TARGET)
+	@echo "build finished"
+
+rust: $(SOURCES)
+	$(ZIG) build $(BUILD_OPTS) $(BUILD_FLAGS) rust 
+
+go: $(SOURCES)
+	$(ZIG) build $(BUILD_OPTS) $(BUILD_FLAGS) go 
 
 test: 
 	$(ZIG) build test $(BUILD_FLAGS) 
