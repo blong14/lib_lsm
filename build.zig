@@ -123,11 +123,7 @@ pub fn build(b: *std.Build) void {
     const rust = rust_build(b);
     const rust_make_step = b.step("rust", "Build the shared rust library");
     rust_make_step.dependOn(&rust.step);
-
-    const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/lib.zig") });
-    lsm.addImport("jemalloc", jemalloc.module("jemalloc"));
-    lsm.addIncludePath(b.path("zig-out/include"));
- 
+    
     // cp include/lib_lsm.h zig-out/include
     const lsm_headers = cp_lsm_headers(b);
     lsm_headers.step.dependOn(&rust.step);
@@ -143,9 +139,9 @@ pub fn build(b: *std.Build) void {
     lib.step.dependOn(&rust.step);
     lib.step.dependOn(&lsm_headers.step);
     lib.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
-    lib.addIncludePath(b.path("zig-out/include"));
-    lib.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"} });
     lib.addIncludePath(fast_csv.path(""));
+    lib.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"} });
+    lib.addIncludePath(b.path("zig-out/include"));
     lib.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
     lib.linkSystemLibrary("jemalloc");
     lib.linkLibC();
@@ -155,13 +151,13 @@ pub fn build(b: *std.Build) void {
     // running `zig build`)
     b.installArtifact(lib);
 
-    // make build gopg
-    const go = go_build(b);
-    go.step.dependOn(&gofmt.step);
-    go.step.dependOn(b.getInstallStep());
-
-    const go_make_step = b.step("go", "Build the go server");
-    go_make_step.dependOn(&go.step);
+    // Main module to be imported into separate run artifacts
+    const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/lib.zig") });
+    lsm.addImport("jemalloc", jemalloc.module("jemalloc"));
+    lsm.addIncludePath(b.path("zig-out/include"));
+    lsm.addIncludePath(fast_csv.path(""));
+    lsm.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"} });
+    lsm.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
 
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
@@ -174,8 +170,6 @@ pub fn build(b: *std.Build) void {
     main_tests.step.dependOn(&lsm_headers.step);
     main_tests.root_module.addImport("lsm", lsm);
     main_tests.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
-    main_tests.addIncludePath(b.path("zig-out/include"));
-    main_tests.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
     main_tests.linkSystemLibrary("jemalloc");
     main_tests.linkLibC();
 
@@ -190,10 +184,6 @@ pub fn build(b: *std.Build) void {
     lsmx.root_module.addImport("lsm", lsm);
     lsmx.root_module.addImport("clap", clap.module("clap"));
     lsmx.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
-    lib.addIncludePath(fast_csv.path(""));
-    lsmx.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"} });
-    lsmx.addIncludePath(b.path("zig-out/include"));
-    lsmx.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
     lsmx.linkSystemLibrary("jemalloc");
     lsmx.linkLibC();
 
@@ -209,9 +199,6 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("lsm", lsm);
     exe.root_module.addImport("clap", clap.module("clap"));
     exe.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
-    exe.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"} });
-    exe.addIncludePath(b.path("zig-out/include"));
-    exe.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
     exe.linkSystemLibrary("jemalloc");
     exe.linkLibC();
 
@@ -221,4 +208,12 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("lsmctl", "Run the lsm cli");
     run_step.dependOn(&run_cmd.step);
+
+    // make build gopg
+    const go = go_build(b);
+    go.step.dependOn(&gofmt.step);
+    go.step.dependOn(b.getInstallStep());
+
+    const go_make_step = b.step("go", "Build the go server");
+    go_make_step.dependOn(&go.step);
 }
