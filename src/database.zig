@@ -23,6 +23,8 @@ const Order = math.Order;
 
 const ThreadSafeBumpAllocator = ba.ThreadSafeBumpAllocator;
 const Iterator = iter.Iterator;
+const MergeIterator = iter.MergeIterator;
+const ScanIterator = iter.ScanIterator;
 const KV = keyvalue.KV;
 const Memtable = mtbl.Memtable;
 const Opts = opt.Opts;
@@ -30,6 +32,10 @@ const SSTable = sst.SSTable;
 
 const TAG = "[zig]";
 var mtx: Mutex = .{};
+
+fn compare(a: KV, b: KV) std.math.Order {
+    return mem.order(u8, a.key, b.key);
+}
 
 pub const Database = struct {
     alloc: Allocator,
@@ -168,136 +174,103 @@ pub const Database = struct {
         }
     }
 
-    const MergeIterator = struct {
+    const MergeIteratorWrapper = struct {
         alloc: Allocator,
-        mtbls: std.ArrayList(*Iterator(KV)),
-        queue: std.PriorityQueue(KV, void, lessThan),
-
-        fn lessThan(context: void, a: KV, b: KV) Order {
-            _ = context;
-            return mem.order(u8, a.key, b.key);
-        }
-
-        pub fn init(dalloc: Allocator, db: *const Database) !MergeIterator {
-            const hot_table = db.mtable.load(.seq_cst);
-
-            var warm_tables: std.ArrayList(*Memtable) = undefined;
-            defer warm_tables.deinit();
-            {
-                mtx.lock();
-                defer mtx.unlock();
-
-                warm_tables = try db.mtables.clone();
-            }
-
-            var iters = std.ArrayList(*Iterator(KV)).init(dalloc);
-
-            const it = try dalloc.create(Iterator(KV));
-            it.* = try hot_table.iterator(dalloc);
-            try iters.append(it);
-
-            for (warm_tables.items) |mtable| {
-                const mit = try dalloc.create(Iterator(KV));
-                mit.* = try mtable.iterator(dalloc);
-                try iters.append(mit);
-            }
-
-            var queue = std.PriorityQueue(KV, void, lessThan).init(dalloc, {});
-            try queue.ensureTotalCapacity(std.mem.page_size);
-
-            return .{
-                .alloc = dalloc,
-                .mtbls = iters,
-                .queue = queue,
-            };
-        }
+        merger: *MergeIterator(KV, compare),
+        iter: Iterator(KV),
 
         pub fn deinit(ctx: *anyopaque) void {
-            var mi: *MergeIterator = @ptrCast(@alignCast(ctx));
-            for (mi.mtbls.items) |item| {
-                item.deinit();
-                mi.alloc.destroy(item);
-            }
-            mi.mtbls.deinit();
-            mi.queue.deinit();
-            mi.alloc.destroy(mi);
+            var wrapper: *@This() = @ptrCast(@alignCast(ctx));
+            wrapper.iter.deinit();
+            wrapper.alloc.destroy(wrapper.merger);
+            wrapper.alloc.destroy(wrapper);
         }
 
         pub fn next(ctx: *anyopaque) ?KV {
-            const mi: *MergeIterator = @ptrCast(@alignCast(ctx));
-            for (mi.mtbls.items) |table_iter| {
-                if (table_iter.next()) |kv| {
-                    mi.queue.add(kv) catch |err| {
-                        debug.print(
-                            "merge iter next failure: {s}\n",
-                            .{@errorName(err)},
-                        );
-                        return null;
-                    };
-                }
-            }
-
-            if (mi.queue.count() == 0) {
-                return null;
-            }
-
-            const nxt = mi.queue.remove();
-
-            return nxt;
+            var wrapper: *@This() = @ptrCast(@alignCast(ctx));
+            return wrapper.iter.next();
         }
     };
 
     pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
-        const it = try alloc.create(MergeIterator);
-        it.* = try MergeIterator.init(alloc, self);
-        return Iterator(KV).init(it, MergeIterator.next, MergeIterator.deinit);
-    }
+        var merger = try alloc.create(MergeIterator(KV, compare));
+        merger.* = try MergeIterator(KV, compare).init(alloc);
 
-    const ScanIterator = struct {
-        alloc: Allocator,
-        it: Iterator(KV),
-        start_key: []const u8,
-        end_key: []const u8,
+        const hot_table = self.mtable.load(.seq_cst);
+        const hot_iter = try hot_table.iterator(alloc);
+        try merger.add(hot_iter);
 
-        pub fn init(alloc: Allocator, start_key: []const u8, end_key: []const u8, it: Iterator(KV)) ScanIterator {
-            return .{
-                .alloc = alloc,
-                .it = it,
-                .start_key = start_key,
-                .end_key = end_key,
-            };
+        var warm_tables: std.ArrayList(*Memtable) = undefined;
+        {
+            mtx.lock();
+            defer mtx.unlock();
+            warm_tables = try self.mtables.clone();
+        }
+        defer warm_tables.deinit();
+
+        for (warm_tables.items) |mtable| {
+            const warm_iter = try mtable.iterator(alloc);
+            try merger.add(warm_iter);
         }
 
+        const wrapper = try alloc.create(MergeIteratorWrapper);
+        errdefer alloc.destroy(wrapper);
+
+        wrapper.* = .{
+            .alloc = alloc,
+            .iter = merger.iterator(),
+            .merger = merger,
+        };
+
+        return Iterator(KV).init(wrapper, MergeIteratorWrapper.next, MergeIteratorWrapper.deinit);
+    }
+
+    const ScanWrapper = struct {
+        alloc: Allocator,
+        scanner: *ScanIterator(KV, compare),
+        iterator: Iterator(KV),
+
+        const Wrapper = @This();
+
         pub fn deinit(ctx: *anyopaque) void {
-            var self: *ScanIterator = @ptrCast(@alignCast(ctx));
-            self.it.deinit();
-            self.alloc.destroy(self);
+            const sw: *Wrapper = @ptrCast(@alignCast(ctx));
+            sw.iterator.deinit();
+            sw.alloc.destroy(sw.scanner);
+            sw.alloc.destroy(sw);
         }
 
         pub fn next(ctx: *anyopaque) ?KV {
-            var self: *ScanIterator = @ptrCast(@alignCast(ctx));
-            while (self.it.next()) |nxt| {
-                switch (mem.order(u8, nxt.key, self.start_key)) {
-                    .lt => continue,
-                    .eq => return nxt,
-                    .gt => {
-                        switch (mem.order(u8, nxt.key, self.end_key)) {
-                            .lt => return nxt,
-                            .eq => return nxt,
-                            .gt => return null,
-                        }
-                    },
-                }
-            }
-            return null;
+            const sw: *Wrapper = @ptrCast(@alignCast(ctx));
+            return sw.iterator.next();
         }
     };
 
-    pub fn scan(self: *Self, alloc: Allocator, start_key: []const u8, end_key: []const u8) !Iterator(KV) {
-        const mit = try self.iterator(alloc);
-        const it = try alloc.create(ScanIterator);
-        it.* = ScanIterator.init(alloc, start_key, end_key, mit);
-        return Iterator(KV).init(it, ScanIterator.next, ScanIterator.deinit);
+    /// Creates a scan iterator that returns items with keys
+    /// greater than start_key and less than or equal to end_key
+    pub fn scan(
+        self: *Self,
+        alloc: Allocator,
+        start_key: []const u8,
+        end_key: []const u8,
+    ) !Iterator(KV) {
+        const start = KV.init(start_key, "");
+        const end = KV.init(end_key, "");
+
+        const base_iter = try self.iterator(alloc);
+
+        const si = try alloc.create(ScanIterator(KV, compare));
+        si.* = ScanIterator(KV, compare).init(base_iter, start, end);
+
+        const wrapper = try alloc.create(ScanWrapper);
+        errdefer alloc.destroy(wrapper);
+
+        wrapper.* = .{
+            .alloc = alloc,
+            .iterator = si.iterator(),
+            .scanner = si,
+        };
+
+        return Iterator(KV).init(wrapper, ScanWrapper.next, ScanWrapper.deinit);
     }
 
     pub fn write(self: *Self, key: []const u8, value: []const u8) anyerror!void {
@@ -434,7 +407,7 @@ test "basic functionality with many items" {
     var items = std.ArrayList(KV).init(alloc);
     defer items.deinit();
 
-    var scan_iter = try db.scan(alloc, "__key_b__", "__key_d__");
+    var scan_iter = try db.scan(alloc, "__key_b__", "__key_e__");
     defer scan_iter.deinit();
 
     while (scan_iter.next()) |nxt| {

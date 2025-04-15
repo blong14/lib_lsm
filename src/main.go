@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -42,11 +43,13 @@ type tableDefinition struct {
 
 func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	keyBytes := []byte("tables_" + name)
-	key := (*C.uchar)(unsafe.Pointer(C.CString(string(keyBytes))))
+	cKey := C.CString(string(keyBytes))
+	defer C.free(unsafe.Pointer(cKey))
+	key := (*C.uchar)(unsafe.Pointer(cKey))
 
 	resp := C.lsm_read(pe.db, key)
 	if resp == nil {
-		return nil, fmt.Errorf("%#v -- key not found %s\n", pe.db, keyBytes)
+		return nil, fmt.Errorf("%#v -- key not found %s", pe.db, keyBytes)
 	}
 
 	valBytes := []byte(C.GoString((*C.char)(unsafe.Pointer(resp))))
@@ -89,14 +92,19 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 	keyBytes := []byte("tables_" + tbl.Name)
 	tableBytes, err := json.Marshal(tbl)
 	if err != nil {
-		return nil, fmt.Errorf("Could not marshal table key: %s", err)
+		return nil, fmt.Errorf("could not marshal table key: %s", err)
 	}
 
-	key := (*C.uchar)(unsafe.Pointer(C.CString(string(keyBytes))))
-	value := (*C.uchar)(unsafe.Pointer(C.CString(string(tableBytes))))
+	cKey := C.CString(string(keyBytes))
+	defer C.free(unsafe.Pointer(cKey))
+	key := (*C.uchar)(unsafe.Pointer(cKey))
+
+	cValue := C.CString(string(tableBytes))
+	defer C.free(unsafe.Pointer(cValue))
+	value := (*C.uchar)(unsafe.Pointer(cValue))
 
 	if ok := C.lsm_write(pe.db, key, value); !ok {
-		return nil, fmt.Errorf("Could not write %s to %s", tableBytes, keyBytes)
+		return nil, fmt.Errorf("could not write %s to %s", tableBytes, keyBytes)
 	}
 
 	results := &pgResult{}
@@ -133,14 +141,19 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error) {
 
 		rowBytes, err := json.Marshal(rowData)
 		if err != nil {
-			return nil, fmt.Errorf("Could not marshal row: %s", err)
+			return nil, fmt.Errorf("could not marshal row: %s", err)
 		}
 
-		key := (*C.uchar)(unsafe.Pointer(C.CString(string(keyBytes))))
-		value := (*C.uchar)(unsafe.Pointer(C.CString(string(rowBytes))))
+		cKey := C.CString(string(keyBytes))
+		defer C.free(unsafe.Pointer(cKey))
+		key := (*C.uchar)(unsafe.Pointer(cKey))
+
+		cValue := C.CString(string(rowBytes))
+		defer C.free(unsafe.Pointer(cValue))
+		value := (*C.uchar)(unsafe.Pointer(cValue))
 
 		if ok := C.lsm_write(pe.db, key, value); !ok {
-			return nil, fmt.Errorf("Could not write %s to %s", rowBytes, keyBytes)
+			return nil, fmt.Errorf("could not write %s to %s", rowBytes, keyBytes)
 		}
 
 		results.rows = append(results.rows, rowData)
@@ -176,13 +189,24 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 	}
 
 	start := []byte("rows_" + tblName + "_")
-	startKey := (*C.uchar)(unsafe.Pointer(C.CString(string(start))))
+	cStartKey := C.CString(string(start))
+	defer C.free(unsafe.Pointer(cStartKey))
+	startKey := (*C.uchar)(unsafe.Pointer(cStartKey))
 
 	end := []byte("tables_")
-	endKey := (*C.uchar)(unsafe.Pointer(C.CString(string(end))))
+	cEndKey := C.CString(string(end))
+	defer C.free(unsafe.Pointer(cEndKey))
+	endKey := (*C.uchar)(unsafe.Pointer(cEndKey))
 
 	iter := C.lsm_scan(pe.db, startKey, endKey)
-	defer func() { _ = C.lsm_iter_deinit(iter) }()
+	if iter == nil {
+		return nil, fmt.Errorf("failed to create iterator")
+	}
+	defer func() {
+		if !C.lsm_iter_deinit(iter) {
+			log.Printf("warning: failed to deinitialize iterator")
+		}
+	}()
 
 	for nxt := C.lsm_iter_next(iter); nxt != nil; nxt = C.lsm_iter_next(iter) {
 		var row []any
@@ -375,17 +399,26 @@ func (pc pgConn) handle(ctx context.Context) {
 		return
 	}
 
+	// Set a reasonable read deadline for each message
+	readTimeout := 30 * time.Second
+
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("%s handle exiting...", tag)
 			return
 		default:
-		}
-		err := pc.handleMessage(pgc)
-		if err != nil {
-			log.Printf("%s %s", tag, err)
-			return
+			// Set read deadline for this iteration
+			if err := pc.conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+				log.Printf("%s failed to set read deadline: %s", tag, err)
+				return
+			}
+
+			err := pc.handleMessage(pgc)
+			if err != nil {
+				log.Printf("%s %s", tag, err)
+				return
+			}
 		}
 	}
 }
@@ -395,17 +428,39 @@ func runPgServer(ctx context.Context, pe *pgEngine, port string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer ln.Close()
+
+	// Create a separate context for accept operations
+	acceptCtx, acceptCancel := context.WithCancel(context.Background())
+	defer acceptCancel()
+
+	// When the main context is done, close the listener to unblock Accept
+	go func() {
+		<-ctx.Done()
+		log.Printf("%s tcp server exiting...", tag)
+		ln.Close()
+	}()
 
 	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("%s tcp server exiting...", tag)
-			return
-		default:
+		// Set accept deadline
+		if err := ln.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second)); err != nil {
+			log.Printf("%s failed to set accept deadline: %s", tag, err)
 		}
+
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Fatal(err)
+			if ctx.Err() != nil {
+				// Context was canceled, exit gracefully
+				return
+			}
+
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				// This is just a timeout from our deadline, continue
+				continue
+			}
+
+			log.Printf("%s accept error: %s", tag, err)
+			continue
 		}
 
 		pc := pgConn{conn, pe}
@@ -442,6 +497,8 @@ func main() {
 	signal.Notify(sigint, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	cfg := getConfig()
 
 	dataDir := "data"
@@ -455,17 +512,43 @@ func main() {
 		log.Fatalf("%s Could not init database", tag)
 	}
 
+	// Ensure database is properly cleaned up
+	defer func() {
+		if !C.lsm_deinit(db) {
+			log.Printf("%s warning: failed to properly deinitialize database", tag)
+		}
+	}()
+
 	pe := newPgEngine(db)
 
-	log.Printf("%s starting pg server @ 0.0.0.0:%s\n", tag, cfg.pgPort)
-	go runPgServer(ctx, pe, cfg.pgPort)
+	// Create a wait group to track when server has fully stopped
+	var wg sync.WaitGroup
+	wg.Add(1)
 
+	log.Printf("%s starting pg server @ localhost:%s", tag, cfg.pgPort)
+	go func() {
+		defer wg.Done()
+		runPgServer(ctx, pe, cfg.pgPort)
+	}()
+
+	// Wait for termination signal
 	s := <-sigint
-	log.Printf("%s received %s signal\n", tag, s)
+	log.Printf("%s received %s signal", tag, s)
 
+	// Trigger graceful shutdown
 	cancel()
 
-	C.lsm_deinit(db)
+	// Wait for server to fully stop with a timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-done:
+		log.Printf("%s server shutdown complete", tag)
+	case <-time.After(3 * time.Second):
+		log.Printf("%s server shutdown timed out", tag)
+	}
 }
