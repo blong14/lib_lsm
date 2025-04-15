@@ -1,56 +1,100 @@
-SOURCES := $(wildcard ./src/*)
-GO := /home/blong14/sdk/go1.22/bin/go
-GO_MAIN := src/main.go
-ZIG := bin/zig-linux-x86_64-0.13.0/zig
+# Makefile for lib_lsm project
 
-# Executable
+# Tools
+ZIG := bin/zig-linux-x86_64-0.13.0/zig
+GO := /home/blong14/sdk/go1.22/bin/go
+
+# Source files
+SOURCES := $(wildcard ./src/*)
+GO_MAIN := src/main.go
+
+# Build configuration
 BUILD_CACHE := .zig-cache
 BUILD_OUT := zig-out
-BUILD_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
-BUILD_FLAGS := --summary all --verbose
-DEBUG_BUILD_OPTS := -Dcpu=x86_64 -Doptimize=Debug
-TARGET := zig-out/lib/liblib_lsm.a 
+TARGET := $(BUILD_OUT)/lib/liblib_lsm.a
 
-# LSM options
+# Build options
+ZIG_COMMON_FLAGS := --summary all --verbose
+ZIG_RELEASE_OPTS := -Dcpu=x86_64 -Doptimize=ReleaseFast
+ZIG_DEBUG_OPTS := -Dcpu=x86_64 -Doptimize=Debug
+
+# Runtime options
 DATA_DIR := /home/blong14/Developer/git/lib_lsm/.tmp/data
 MODE := singlethreaded
 # MODE := multithreaded
+SST_CAPACITY := 1000000
 
-all: build 
+# Help command
+.PHONY: help
+help:
+	@echo "lib_lsm Makefile Usage:"
+	@echo "======================="
+	@echo "make                - Build the project"
+	@echo "make build          - Build the project (same as default)"
+	@echo "make rust           - Build Rust bindings"
+	@echo "make go             - Build Go bindings"
+	@echo "make clean          - Remove build artifacts"
+	@echo "make fmt            - Format code"
+	@echo "make test           - Run tests"
+	@echo "make run            - Run lsmctl with default options"
+	@echo "make profile        - Run with profiling enabled"
+	@echo "make debug          - Run in debug mode"
+	@echo "make help           - Display this help message"
 
-clean:
-	@$(ZIG) build uninstall $(BUILD_FLAGS) 
-	@$(GO) clean -cache -v
-	@rm -rf $(BUILD_OUT) $(BUILD_CACHE) 
+# Default target
+.PHONY: all
+all: build
 
-fmt:
-	@$(ZIG) build $(BUILD_FLAGS) fmt 
-
-$(TARGET): $(SOURCES)
-	$(ZIG) build $(BUILD_OPTS) $(BUILD_FLAGS) 
-
+# Main build target
+.PHONY: build
 build: $(TARGET)
-	@echo "build finished"
+	@echo "Build finished"
 
+# Library target
+$(TARGET): $(SOURCES)
+	$(ZIG) build $(ZIG_RELEASE_OPTS) $(ZIG_COMMON_FLAGS)
+
+# Language-specific builds
+.PHONY: rust go
 rust: $(SOURCES)
-	$(ZIG) build $(BUILD_OPTS) $(BUILD_FLAGS) rust 
+	$(ZIG) build $(ZIG_RELEASE_OPTS) $(ZIG_COMMON_FLAGS) rust
 
 go: $(SOURCES)
-	$(ZIG) build $(BUILD_OPTS) $(BUILD_FLAGS) go 
+	$(ZIG) build $(ZIG_RELEASE_OPTS) $(ZIG_COMMON_FLAGS) go
 
-test: 
-	$(ZIG) build test $(BUILD_FLAGS) 
+# Development targets
+.PHONY: clean fmt test run profile debug
+clean:
+	@$(ZIG) build uninstall $(ZIG_COMMON_FLAGS)
+	@$(GO) clean -cache -v
+	@rm -rf $(BUILD_OUT) $(BUILD_CACHE)
 
-run: 
-	$(ZIG) build $(BUILD_OPTS) lsmctl -- --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
+fmt:
+	@$(ZIG) build $(ZIG_COMMON_FLAGS) fmt
 
-profile: 
-	$(ZIG) build $(BUILD_OPTS) xlsm -- --mode $(MODE) --input data/measurements.txt --data_dir $(DATA_DIR) --sst_capacity 1_000_000 
+test:
+	$(ZIG) build test $(ZIG_COMMON_FLAGS)
 
-debug: 
+run:
+	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
+
+profile:
+	$(ZIG) build $(ZIG_RELEASE_OPTS) xlsm -- \
+		--mode $(MODE) \
+		--input data/measurements.txt \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
+
+debug:
+	$(ZIG) build $(ZIG_DEBUG_OPTS) xlsm -- \
+		--mode $(MODE) \
+		--data_dir $(DATA_DIR)
+
+# Debug notes:
 # gdb --tui zig-out/bin/lsm
 # b src/tablemap.zig:76
 # r
 # ipcrm -q <tab>
-	$(ZIG) build $(DEBUG_BUILD_OPTS) xlsm -- --mode $(MODE) --data_dir $(DATA_DIR) 
 
