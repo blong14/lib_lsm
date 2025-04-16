@@ -154,9 +154,9 @@ pub fn build(b: *std.Build) void {
     // Main module to be imported into separate run artifacts
     const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/lib.zig") });
     lsm.addImport("jemalloc", jemalloc.module("jemalloc"));
-    lsm.addIncludePath(b.path("zig-out/include"));
     lsm.addIncludePath(fast_csv.path(""));
     lsm.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"} });
+    lsm.addIncludePath(b.path("zig-out/include"));
     lsm.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
 
     // Creates a step for unit testing. This only builds the test executable
@@ -170,6 +170,7 @@ pub fn build(b: *std.Build) void {
     main_tests.step.dependOn(&lsm_headers.step);
     main_tests.root_module.addImport("lsm", lsm);
     main_tests.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
+    main_tests.addIncludePath(b.path("zig-out/include"));
     main_tests.linkSystemLibrary("jemalloc");
     main_tests.linkLibC();
 

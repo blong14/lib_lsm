@@ -63,22 +63,27 @@ go: $(SOURCES)
 	$(ZIG) build $(ZIG_RELEASE_OPTS) $(ZIG_COMMON_FLAGS) go
 
 # Development targets
-.PHONY: clean fmt test run profile debug
+.PHONY: clean debug fmt perf profile run test 
 clean:
 	@$(ZIG) build uninstall $(ZIG_COMMON_FLAGS)
 	@$(GO) clean -cache -v
 	@rm -rf $(BUILD_OUT) $(BUILD_CACHE)
 
+debug:
+	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
+		--mode $(MODE) \
+		--data_dir $(DATA_DIR)
+
 fmt:
 	@$(ZIG) build $(ZIG_COMMON_FLAGS) fmt
 
-test:
-	$(ZIG) build test $(ZIG_COMMON_FLAGS)
-
-run:
-	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+perf:
+	perf record -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) xlsm -- \
+		--mode $(MODE) \
+		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
+	perf script --input=perf.data -F +pid > perf.processed.data
 
 profile:
 	$(ZIG) build $(ZIG_RELEASE_OPTS) xlsm -- \
@@ -87,10 +92,13 @@ profile:
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 
-debug:
-	$(ZIG) build $(ZIG_DEBUG_OPTS) xlsm -- \
-		--mode $(MODE) \
-		--data_dir $(DATA_DIR)
+run:
+	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
+
+test:
+	$(ZIG) build test $(ZIG_COMMON_FLAGS)
 
 # Debug notes:
 # gdb --tui zig-out/bin/lsm
