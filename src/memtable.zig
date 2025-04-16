@@ -24,7 +24,7 @@ const assert = std.debug.assert;
 const print = std.debug.print;
 
 pub const Memtable = struct {
-    alloc: Allocator,
+    init_alloc: Allocator,
     cap: usize,
     id: u64,
     opts: Opts,
@@ -45,7 +45,7 @@ pub const Memtable = struct {
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
-            .alloc = alloc,
+            .init_alloc = alloc,
             .cap = cap,
             .id = id,
             .opts = opts,
@@ -60,10 +60,10 @@ pub const Memtable = struct {
 
     pub fn deinit(self: *Self) void {
         const data = self.data.load(.seq_cst);
-        self.alloc.destroy(data);
+        self.init_alloc.destroy(data);
         if (self.sstable.load(.seq_cst)) |sstbl| {
             sstbl.deinit();
-            self.alloc.destroy(sstbl);
+            self.init_alloc.destroy(sstbl);
         }
         self.* = undefined;
     }
@@ -136,11 +136,11 @@ pub const Memtable = struct {
             return;
         }
 
-        var sstable = try SSTable.init(self.alloc, self.getId(), self.opts);
-        errdefer self.alloc.destroy(sstable);
+        var sstable = try SSTable.init(self.init_alloc, self.getId(), self.opts);
+        errdefer self.init_alloc.destroy(sstable);
         errdefer sstable.deinit();
 
-        var it = try self.iterator(self.alloc);
+        var it = try self.iterator(self.init_alloc);
         defer it.deinit();
 
         while (it.next()) |nxt| {
