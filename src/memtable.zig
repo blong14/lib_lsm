@@ -11,6 +11,7 @@ const skl = @import("skiplist.zig");
 const Allocator = std.mem.Allocator;
 const AtomicValue = std.atomic.Value;
 const File = std.fs.File;
+const Mutex = std.Thread.Mutex;
 
 const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
@@ -23,6 +24,8 @@ const KeyValueSkipList = SkipList([]const u8, keyvalue.decode, keyvalue.encode);
 const assert = std.debug.assert;
 const print = std.debug.print;
 
+var mtx: Mutex = .{};
+
 pub const Memtable = struct {
     init_alloc: Allocator,
     cap: usize,
@@ -34,6 +37,12 @@ pub const Memtable = struct {
     mutable: AtomicValue(bool),
     isFlushed: AtomicValue(bool),
     sstable: AtomicValue(?*SSTable),
+
+    // Memory ordering constants for better readability
+    const relaxed = .monotonic;
+    const acquire = .acquire;
+    const release = .release;
+    const seq_cst = .seq_cst;
 
     const Self = @This();
 
@@ -59,9 +68,9 @@ pub const Memtable = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        const data = self.data.load(.seq_cst);
+        const data = self.data.load(acquire);
         self.init_alloc.destroy(data);
-        if (self.sstable.load(.seq_cst)) |sstbl| {
+        if (self.sstable.load(acquire)) |sstbl| {
             sstbl.deinit();
             self.init_alloc.destroy(sstbl);
         }
@@ -69,17 +78,21 @@ pub const Memtable = struct {
     }
 
     pub fn getId(self: Self) u64 {
-        return @atomicLoad(u64, &self.id, .seq_cst);
+        return self.id;
     }
 
     pub fn put(self: *Self, item: KV) !void {
-        var data = self.data.load(.seq_cst);
+        if (!self.mutable.load(acquire)) {
+            return error.MemtableImmutable;
+        }
+
+        var data = self.data.load(acquire);
         try data.put(item.key, item.value);
-        _ = self.byte_count.fetchAdd(item.len(), .seq_cst);
+        _ = self.byte_count.fetchAdd(item.len(), release);
     }
 
     pub fn get(self: Self, key: []const u8) ?KV {
-        const value = self.data.load(.seq_cst).get(key) catch |err| {
+        const value = self.data.load(acquire).get(key) catch |err| {
             print("key {s} {s}\n", .{ key, @errorName(err) });
             return null;
         };
@@ -87,23 +100,23 @@ pub const Memtable = struct {
     }
 
     pub fn count(self: Self) usize {
-        return self.data.load(.seq_cst).count();
+        return self.data.load(acquire).count();
     }
 
     pub fn freeze(self: *Self) void {
-        self.mutable.store(false, .seq_cst);
+        self.mutable.store(false, release);
     }
 
     pub fn frozen(self: Self) bool {
-        return !self.mutable.load(.seq_cst);
+        return !self.mutable.load(acquire);
     }
 
     pub fn flushed(self: Self) bool {
-        return self.isFlushed.load(.seq_cst);
+        return self.isFlushed.load(acquire);
     }
 
     pub fn size(self: Self) usize {
-        return self.byte_count.load(.seq_cst);
+        return self.byte_count.load(acquire);
     }
 
     const MemtableIterator = struct {
@@ -127,7 +140,7 @@ pub const Memtable = struct {
 
     pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
         const it = try alloc.create(MemtableIterator);
-        it.* = .{ .alloc = alloc, .iter = try self.data.load(.seq_cst).iterator(alloc) };
+        it.* = .{ .alloc = alloc, .iter = try self.data.load(acquire).iterator(alloc) };
         return Iterator(KV).init(it, MemtableIterator.next, MemtableIterator.deinit);
     }
 
@@ -135,6 +148,15 @@ pub const Memtable = struct {
         if (self.count() == 0) {
             return;
         }
+
+        mtx.lock();
+        defer mtx.unlock();
+
+        if (self.isFlushed.load(acquire)) {
+            return error.AlreadyFlushed;
+        }
+
+        self.freeze();
 
         var sstable = try SSTable.init(self.init_alloc, self.getId(), self.opts);
         errdefer self.init_alloc.destroy(sstable);
@@ -158,8 +180,9 @@ pub const Memtable = struct {
 
         try sstable.flush();
 
-        self.sstable.store(sstable, .seq_cst);
-        self.isFlushed.store(true, .seq_cst);
+        self.sstable.store(sstable, seq_cst);
+
+        self.isFlushed.store(true, release);
     }
 };
 
@@ -184,4 +207,69 @@ test Memtable {
     mtable.flush() catch |err| {
         print("{s}\n", .{@errorName(err)});
     };
+}
+
+test "Memtable thread safety" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Thread = std.Thread;
+
+    // given
+    var mtable = try Memtable.init(alloc, 0, options.defaultOpts());
+    defer alloc.destroy(mtable);
+    defer mtable.deinit();
+
+    const thread_fn = struct {
+        fn run(mt: *Memtable, id: usize) void {
+            var i: usize = 0;
+            while (i < 100) : (i += 1) {
+                const key = std.fmt.allocPrint(alloc, "key_{d}_{d}", .{ id, i }) catch continue;
+                defer alloc.free(key);
+
+                const value = std.fmt.allocPrint(alloc, "value_{d}_{d}", .{ id, i }) catch continue;
+                defer alloc.free(value);
+
+                const kv = KV.init(key, value);
+                mt.put(kv) catch continue;
+            }
+        }
+    }.run;
+
+    var threads = std.ArrayList(Thread).init(alloc);
+    defer threads.deinit();
+
+    for (0..4) |i| {
+        const thread = Thread.spawn(.{}, thread_fn, .{ mtable, i }) catch @panic("Failed to spawn thread");
+        try threads.append(thread);
+    }
+
+    for (threads.items) |thread| {
+        thread.join();
+    }
+
+    try testing.expect(mtable.count() > 0);
+
+    var flush_cnt: AtomicValue(u8) = AtomicValue(u8).init(0);
+
+    // Test concurrent flush attempts
+    const flush_fn = struct {
+        fn run(mt: *Memtable, cnt: *AtomicValue(u8)) void {
+            mt.flush() catch return;
+            _ = cnt.fetchAdd(1, .seq_cst);
+        }
+    }.run;
+
+    threads.clearRetainingCapacity();
+
+    try threads.append(Thread.spawn(.{}, flush_fn, .{ mtable, &flush_cnt }) catch @panic("Failed to spawn thread"));
+    try threads.append(Thread.spawn(.{}, flush_fn, .{ mtable, &flush_cnt }) catch @panic("Failed to spawn thread"));
+    try threads.append(Thread.spawn(.{}, flush_fn, .{ mtable, &flush_cnt }) catch @panic("Failed to spawn thread"));
+
+    for (threads.items) |thread| {
+        thread.join();
+    }
+
+    try testing.expect(mtable.flushed());
+    try testing.expectEqual(flush_cnt.load(.seq_cst), 1);
 }

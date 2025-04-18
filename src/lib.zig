@@ -115,5 +115,6 @@ export fn lsm_deinit(addr: *anyopaque) bool {
     const db: *Database = @ptrCast(@alignCast(addr));
     db.flush() catch return false;
     db.deinit();
+    allocator.destroy(db);
     return true;
 }

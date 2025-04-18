@@ -95,6 +95,7 @@ pub const Database = struct {
         mtable.deinit();
         self.alloc.destroy(mtable);
 
+        self.byte_allocator.printStats();
         self.byte_allocator.deinit();
 
         self.* = undefined;
