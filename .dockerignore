@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+.github
+
+# Build artifacts
+bin
+.zig-cache
+tests/.zig-cache
+zig-cache/
+tests/zig-cache/
+zig-out/
+target/
+
+# IDE files
+.idea/
+
+# Debug and profiling files
+callgrind.o
+massif.o
+*.csv
+*.txt
+perf.*
+.tmp/*
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Docker files (no need to copy these into the build)
+.dockerignore
+Dockerfile*
+
+# Other unnecessary files
+*.zip
+*.tar.gz
+*.tgz
