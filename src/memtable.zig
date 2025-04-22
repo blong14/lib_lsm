@@ -189,9 +189,14 @@ pub const Memtable = struct {
 test Memtable {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_name);
+    defer testDir.dir.deleteTree(dir_name) catch {};
 
     // given
-    var mtable = try Memtable.init(alloc, 0, options.defaultOpts());
+    var mtable = try Memtable.init(alloc, 0, options.withDataDirOpts(dir_name));
     defer alloc.destroy(mtable);
     defer mtable.deinit();
 
@@ -212,11 +217,16 @@ test Memtable {
 test "Memtable thread safety" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_name);
+    defer testDir.dir.deleteTree(dir_name) catch {};
 
     const Thread = std.Thread;
 
     // given
-    var mtable = try Memtable.init(alloc, 0, options.defaultOpts());
+    var mtable = try Memtable.init(alloc, 0, options.withDataDirOpts(dir_name));
     defer alloc.destroy(mtable);
     defer mtable.deinit();
 
