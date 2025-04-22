@@ -1,6 +1,6 @@
 extern crate libc;
 
-use crossbeam_skiplist::{SkipMap, map::Entry};
+use crossbeam_skiplist::{map::Entry, SkipMap};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::{ptr, slice, str};
@@ -38,13 +38,13 @@ pub extern "C" fn skiplist_insert(
     }
 
     let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
-    
+
     // SAFETY: The system ensures UTF-8 encoded keys, so unchecked conversion is safe.
     let key_str = unsafe {
         let key_bytes = slice::from_raw_parts(key as *const u8, key_len);
         str::from_utf8_unchecked(key_bytes)
     };
-    
+
     let value_slice = unsafe { slice::from_raw_parts(value, value_len) };
     let value_vec = value_slice.to_vec();
 
@@ -74,7 +74,7 @@ pub extern "C" fn skiplist_get(
     if let Some(entry) = skip_map.get(key_str) {
         let entry_value = entry.value();
         let len = entry_value.len();
-        
+
         unsafe {
             if *value_len < len {
                 return -2; // Error: buffer too small
@@ -93,7 +93,7 @@ pub extern "C" fn skiplist_remove(skiplist: *mut c_void, key: *const c_char) -> 
     if skiplist.is_null() || key.is_null() {
         return -1; // Error: null pointer
     }
-    
+
     // SAFETY: The key is ensured to be a valid UTF-8 null-terminated string.
     let c_str = unsafe { CStr::from_ptr(key) };
     let key_str = match c_str.to_str() {
@@ -104,7 +104,7 @@ pub extern "C" fn skiplist_remove(skiplist: *mut c_void, key: *const c_char) -> 
     let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
     match skip_map.remove(key_str) {
         Some(_) => 0, // Success
-        None => -1, // Not found
+        None => -1,   // Not found
     }
 }
 
@@ -143,7 +143,11 @@ pub extern "C" fn skiplist_iterator_create(skiplist: *mut c_void) -> *mut SkipMa
 
     // Create an iterator and wrap it in a Box
     let iterator = Box::new(SkipMapIterator {
-        inner: Box::new(skip_map.iter().map(|entry| unsafe { std::mem::transmute(entry) })),
+        inner: Box::new(
+            skip_map
+                .iter()
+                .map(|entry| unsafe { std::mem::transmute(entry) }),
+        ),
     });
 
     Box::into_raw(iterator)
@@ -152,7 +156,9 @@ pub extern "C" fn skiplist_iterator_create(skiplist: *mut c_void) -> *mut SkipMa
 #[no_mangle]
 pub extern "C" fn skiplist_iterator_free(iter_ptr: *mut SkipMapIterator) {
     if !iter_ptr.is_null() {
-        unsafe { let _ = Box::from_raw(iter_ptr); };
+        unsafe {
+            let _ = Box::from_raw(iter_ptr);
+        };
     }
 }
 
@@ -164,7 +170,12 @@ pub extern "C" fn skiplist_iterator_next(
     value: *mut u8,
     value_len: *mut usize,
 ) -> c_int {
-    if iter_ptr.is_null() || key.is_null() || key_len.is_null() || value.is_null() || value_len.is_null() {
+    if iter_ptr.is_null()
+        || key.is_null()
+        || key_len.is_null()
+        || value.is_null()
+        || value_len.is_null()
+    {
         return -1; // Error: null pointer
     }
 
@@ -195,4 +206,3 @@ pub extern "C" fn skiplist_iterator_next(
         None => -1, // No more elements
     }
 }
-
