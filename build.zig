@@ -28,7 +28,8 @@ pub fn go_fmt(b: *std.Build) *std.Build.Step.Run {
         &[_][]const u8{
             "go",
             "fmt",
-            "./...",
+            "-x",
+            "./src/...",
         },
     );
     return cmd;
@@ -56,6 +57,17 @@ pub fn cbindgen_build(b: *std.Build) *std.Build.Step.Run {
             "concurrent-skiplist",
             "--output",
             "zig-out/include/skiplist.h",
+        },
+    );
+    return cmd;
+}
+
+pub fn rust_fmt(b: *std.Build) *std.Build.Step.Run {
+    const cmd = b.addSystemCommand(
+        &[_][]const u8{
+            "cargo-fmt",
+            "--all",
+            "--verbose",
         },
     );
     return cmd;
@@ -93,13 +105,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // utilitiy commands
-    const zigfmt = zig_fmt(b);
     const gofmt = go_fmt(b);
-    
+    const rustfmt = rust_fmt(b);
+    const zigfmt = zig_fmt(b);
+
     const fmt_step = b.step("fmt", "Format source files");
-    fmt_step.dependOn(&zigfmt.step);
     fmt_step.dependOn(&gofmt.step);
-    
+    fmt_step.dependOn(&rustfmt.step);
+    fmt_step.dependOn(&zigfmt.step);
+
     // Add lib specific deps (check zig cacheing)
     // TODO: Add rust dependency install
     // TODO: Add go dependency install
@@ -123,7 +137,7 @@ pub fn build(b: *std.Build) void {
     const rust = rust_build(b);
     const rust_make_step = b.step("rust", "Build the shared rust library");
     rust_make_step.dependOn(&rust.step);
-    
+
     // cp include/lib_lsm.h zig-out/include
     const lsm_headers = cp_lsm_headers(b);
     lsm_headers.step.dependOn(&rust.step);
@@ -135,7 +149,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    lib.step.dependOn(&zigfmt.step);
     lib.step.dependOn(&rust.step);
     lib.step.dependOn(&lsm_headers.step);
     lib.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
@@ -212,7 +225,6 @@ pub fn build(b: *std.Build) void {
 
     // make build gopg
     const go = go_build(b);
-    go.step.dependOn(&gofmt.step);
     go.step.dependOn(b.getInstallStep());
 
     const go_make_step = b.step("go", "Build the go server");

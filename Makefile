@@ -1,8 +1,7 @@
 # Makefile for lib_lsm project
 
-# Tools
-ZIG := bin/zig-linux-x86_64-0.13.0/zig
-GO := /home/blong14/sdk/go1.22/bin/go
+GO := $(shell which go) 
+ZIG := $(shell which zig)
 
 # Source files
 SOURCES := $(wildcard ./src/*)
