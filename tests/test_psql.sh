@@ -1,10 +1,27 @@
-psql -h localhost -p 54321 -c "create table users (age int, name text);"
+#!/bin/bash
+# Test script for PostgreSQL interface
 
-psql -h localhost -p 54321 -c "insert into users values(14, 'garry'), (20, 'ted');"
+# Configuration
+HOST="localhost"
+PORT="54321"
+PSQL_CMD="psql -h $HOST -p $PORT"
 
-psql -h localhost -p 54321 -c "select name, age from users;"
+echo "Testing PostgreSQL interface on $HOST:$PORT..."
 
-psql -h localhost -p 54321 -c "select age from users;"
+echo -e "\n1. Creating users table..."
+$PSQL_CMD -c "create table users (age int, name text);"
 
-psql -h localhost -p 54321 -c "select name from users;"
+echo -e "\n2. Inserting test data..."
+$PSQL_CMD -c "insert into users values(14, 'garry'), (20, 'ted');"
+
+echo -e "\n3. Querying all columns..."
+$PSQL_CMD -c "select name, age from users;"
+
+echo -e "\n4. Querying age column only..."
+$PSQL_CMD -c "select age from users;"
+
+echo -e "\n5. Querying name column only..."
+$PSQL_CMD -c "select name from users;"
+
+echo -e "\nAll tests completed."
 

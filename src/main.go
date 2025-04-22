@@ -1,8 +1,10 @@
-// https://github.com/eatonphil/waterbugdb
 package main
+
+// https://github.com/eatonphil/waterbugdb
 
 // #cgo CFLAGS: -I../zig-out/include
 // #cgo LDFLAGS: -L../zig-out/lib -llib_lsm
+// #include <stdlib.h>
 // #include <lib_lsm.h>
 import "C"
 import (
@@ -429,10 +431,6 @@ func runPgServer(ctx context.Context, pe *pgEngine, port string) {
 		log.Fatal(err)
 	}
 	defer ln.Close()
-
-	// Create a separate context for accept operations
-	acceptCtx, acceptCancel := context.WithCancel(context.Background())
-	defer acceptCancel()
 
 	// When the main context is done, close the listener to unblock Accept
 	go func() {
