@@ -115,6 +115,10 @@ pub const KV = struct {
     }
 };
 
+pub fn compare(a: KV, b: KV) std.math.Order {
+    return std.mem.order(u8, a.key, b.key);
+}
+
 pub fn decode(byts: []const u8) ![]const u8 {
     return byts;
 }

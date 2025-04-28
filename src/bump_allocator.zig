@@ -5,6 +5,8 @@ const ArrayList = std.ArrayList;
 const Atomic = std.atomic.Value;
 const Mutex = std.Thread.Mutex;
 
+const TAG = "[zig]";
+
 pub const ThreadSafeBumpAllocator = struct {
     alloc: Allocator,
     chunk_size: usize,
@@ -136,9 +138,10 @@ pub const ThreadSafeBumpAllocator = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        std.debug.print(
-            "Arena Stats: Allocations={}, UsedBytes={}, Chunks={}, FreeChunks={}\n",
+        std.log.info(
+            "{s} Arena Stats: Allocations={}, UsedBytes={}, Chunks={}, FreeChunks={}\n",
             .{
+                TAG,
                 self.total_allocations.load(.seq_cst),
                 self.total_used_bytes.load(.seq_cst),
                 self.chunks.items.len,
