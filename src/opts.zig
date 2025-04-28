@@ -6,6 +6,7 @@ pub const Opts = struct {
     data_dir: []const u8,
     sst_capacity: usize,
     wal_capacity: usize,
+    num_levels: ?usize,
 };
 
 pub fn defaultOpts() Opts {
@@ -14,6 +15,7 @@ pub fn defaultOpts() Opts {
         // TODO: temp
         .sst_capacity = 1_000_000,
         .wal_capacity = PageSize * PageSize,
+        .num_levels = 3,
     };
 }
 

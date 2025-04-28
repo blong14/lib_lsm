@@ -64,6 +64,7 @@ pub fn main() !void {
         .data_dir = data_dir,
         .sst_capacity = sst_capacity,
         .wal_capacity = wal_capacity,
+        .num_levels = 3,
     };
 
     const db = lsm.databaseFromOpts(allocator, opts) catch |err| {

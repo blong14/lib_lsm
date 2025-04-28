@@ -11,3 +11,9 @@ pub fn openWithCapacity(path: []const u8, capacity: usize) !File {
     try file.setEndPos(capacity);
     return file;
 }
+
+pub fn openAndTruncate(path: []const u8, capacity: usize) !File {
+    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+    try file.setEndPos(capacity);
+    return file;
+}

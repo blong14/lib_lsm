@@ -4,7 +4,6 @@ const file_utils = @import("file.zig");
 const keyvalue = @import("kv.zig");
 const iter = @import("iterator.zig");
 const options = @import("opts.zig");
-const sst = @import("sstable.zig");
 const tbm = @import("tablemap.zig");
 const skl = @import("skiplist.zig");
 
@@ -17,7 +16,6 @@ const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
 const Opts = options.Opts;
 const SkipList = skl.SkipList;
-const SSTable = sst.SSTable;
 
 const KeyValueSkipList = SkipList([]const u8, keyvalue.decode, keyvalue.encode);
 
@@ -29,14 +27,13 @@ var mtx: Mutex = .{};
 pub const Memtable = struct {
     init_alloc: Allocator,
     cap: usize,
-    id: u64,
+    id: []const u8,
     opts: Opts,
 
     byte_count: AtomicValue(usize),
     data: AtomicValue(*KeyValueSkipList),
     mutable: AtomicValue(bool),
     isFlushed: AtomicValue(bool),
-    sstable: AtomicValue(?*SSTable),
 
     // Memory ordering constants for better readability
     const relaxed = .monotonic;
@@ -46,8 +43,11 @@ pub const Memtable = struct {
 
     const Self = @This();
 
-    pub fn init(alloc: Allocator, id: u64, opts: Opts) !*Self {
+    pub fn init(alloc: Allocator, id: []const u8, opts: Opts) !*Self {
         const cap = opts.sst_capacity;
+
+        const id_copy = try alloc.alloc(u8, id.len);
+        @memcpy(id_copy, id);
 
         const map = try alloc.create(KeyValueSkipList);
         map.* = try KeyValueSkipList.init(alloc);
@@ -56,13 +56,12 @@ pub const Memtable = struct {
         mtable.* = .{
             .init_alloc = alloc,
             .cap = cap,
-            .id = id,
+            .id = id_copy,
             .opts = opts,
             .byte_count = AtomicValue(usize).init(0),
             .data = AtomicValue(*KeyValueSkipList).init(map),
             .mutable = AtomicValue(bool).init(true),
             .isFlushed = AtomicValue(bool).init(false),
-            .sstable = AtomicValue(?*SSTable).init(null),
         };
         return mtable;
     }
@@ -70,14 +69,11 @@ pub const Memtable = struct {
     pub fn deinit(self: *Self) void {
         const data = self.data.load(acquire);
         self.init_alloc.destroy(data);
-        if (self.sstable.load(acquire)) |sstbl| {
-            sstbl.deinit();
-            self.init_alloc.destroy(sstbl);
-        }
+        self.init_alloc.free(self.id);
         self.* = undefined;
     }
 
-    pub fn getId(self: Self) u64 {
+    pub fn getId(self: Self) []const u8 {
         return self.id;
     }
 
@@ -143,47 +139,6 @@ pub const Memtable = struct {
         it.* = .{ .alloc = alloc, .iter = try self.data.load(acquire).iterator(alloc) };
         return Iterator(KV).init(it, MemtableIterator.next, MemtableIterator.deinit);
     }
-
-    pub fn flush(self: *Self) !void {
-        if (self.count() == 0) {
-            return;
-        }
-
-        mtx.lock();
-        defer mtx.unlock();
-
-        if (self.isFlushed.load(acquire)) {
-            return error.AlreadyFlushed;
-        }
-
-        self.freeze();
-
-        var sstable = try SSTable.init(self.init_alloc, self.getId(), self.opts);
-        errdefer self.init_alloc.destroy(sstable);
-        errdefer sstable.deinit();
-
-        var it = try self.iterator(self.init_alloc);
-        defer it.deinit();
-
-        while (it.next()) |nxt| {
-            _ = sstable.write(nxt) catch |err| switch (err) {
-                error.DuplicateError => continue,
-                else => {
-                    print(
-                        "memtable not able to write to sstable for key {s}: {s}\n",
-                        .{ nxt.key, @errorName(err) },
-                    );
-                    return err;
-                },
-            };
-        }
-
-        try sstable.flush();
-
-        self.sstable.store(sstable, seq_cst);
-
-        self.isFlushed.store(true, release);
-    }
 };
 
 test Memtable {
@@ -196,7 +151,7 @@ test Memtable {
     defer testDir.dir.deleteTree(dir_name) catch {};
 
     // given
-    var mtable = try Memtable.init(alloc, 0, options.withDataDirOpts(dir_name));
+    var mtable = try Memtable.init(alloc, "0", options.withDataDirOpts(dir_name));
     defer alloc.destroy(mtable);
     defer mtable.deinit();
 
@@ -208,78 +163,4 @@ test Memtable {
 
     // then
     try testing.expectEqualStrings(kv.value, actual.?.value);
-
-    mtable.flush() catch |err| {
-        print("{s}\n", .{@errorName(err)});
-    };
-}
-
-test "Memtable thread safety" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const testDir = testing.tmpDir(.{});
-
-    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir_name);
-    defer testDir.dir.deleteTree(dir_name) catch {};
-
-    const Thread = std.Thread;
-
-    // given
-    var mtable = try Memtable.init(alloc, 0, options.withDataDirOpts(dir_name));
-    defer alloc.destroy(mtable);
-    defer mtable.deinit();
-
-    const thread_fn = struct {
-        fn run(mt: *Memtable, id: usize) void {
-            var i: usize = 0;
-            while (i < 100) : (i += 1) {
-                const key = std.fmt.allocPrint(alloc, "key_{d}_{d}", .{ id, i }) catch continue;
-                defer alloc.free(key);
-
-                const value = std.fmt.allocPrint(alloc, "value_{d}_{d}", .{ id, i }) catch continue;
-                defer alloc.free(value);
-
-                const kv = KV.init(key, value);
-                mt.put(kv) catch continue;
-            }
-        }
-    }.run;
-
-    var threads = std.ArrayList(Thread).init(alloc);
-    defer threads.deinit();
-
-    for (0..4) |i| {
-        const thread = Thread.spawn(.{}, thread_fn, .{ mtable, i }) catch @panic("Failed to spawn thread");
-        try threads.append(thread);
-    }
-
-    for (threads.items) |thread| {
-        thread.join();
-    }
-
-    try testing.expect(mtable.count() > 0);
-
-    var flush_cnt: AtomicValue(u8) = AtomicValue(u8).init(0);
-
-    // Test concurrent flush attempts
-    const flush_fn = struct {
-        fn run(mt: *Memtable, cnt: *AtomicValue(u8)) void {
-            mt.flush() catch return;
-            _ = cnt.fetchAdd(1, .seq_cst);
-        }
-    }.run;
-
-    threads.clearRetainingCapacity();
-
-    try threads.append(Thread.spawn(.{}, flush_fn, .{ mtable, &flush_cnt }) catch @panic("Failed to spawn thread"));
-    try threads.append(Thread.spawn(.{}, flush_fn, .{ mtable, &flush_cnt }) catch @panic("Failed to spawn thread"));
-    try threads.append(Thread.spawn(.{}, flush_fn, .{ mtable, &flush_cnt }) catch @panic("Failed to spawn thread"));
-
-    for (threads.items) |thread| {
-        thread.join();
-    }
-
-    try testing.expect(mtable.flushed());
-    try testing.expectEqual(flush_cnt.load(.seq_cst), 1);
 }
