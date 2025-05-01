@@ -30,7 +30,7 @@ const KV = keyvalue.KV;
 const Memtable = mtbl.Memtable;
 const Opts = opt.Opts;
 const SSTable = sst.SSTable;
-const TableManager = sst.TableManager;
+const SSTableStore = sst.SSTableStore;
 
 const TAG = "[zig]";
 var mtx: Mutex = .{};
@@ -42,7 +42,7 @@ pub const Database = struct {
     mtable: AtomicValue(*Memtable),
     opts: Opts,
     mtables: std.ArrayList(*Memtable),
-    sstables: *TableManager,
+    sstables: *SSTableStore,
 
     const Self = @This();
 
@@ -65,8 +65,8 @@ pub const Database = struct {
         const mtables = std.ArrayList(*Memtable).init(alloc);
         errdefer mtables.deinit();
 
-        const sstables = try alloc.create(TableManager);
-        sstables.* = try TableManager.init(alloc, opts);
+        const sstables = try alloc.create(SSTableStore);
+        sstables.* = try SSTableStore.init(alloc, opts);
 
         const capacity = opts.sst_capacity;
 
@@ -295,6 +295,10 @@ pub const Database = struct {
             mtable.deinit();
             self.alloc.destroy(mtable);
         }
+
+        self.sstables.compact(0) catch |err| {
+            std.log.err("{s} sstable compaction error {s}", .{ TAG, @errorName(err) });
+        };
 
         self.mtables.clearAndFree();
     }

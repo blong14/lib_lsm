@@ -33,10 +33,11 @@ const print = std.debug.print;
 const readInt = std.mem.readInt;
 const startsWith = std.mem.startsWith;
 
-pub const TableManager = struct {
+pub const SSTableStore = struct {
     levels: ArrayList(ArrayList(*SSTable)),
     opts: Opts,
     num_levels: usize,
+    compaction_strategy: CompactionStrategy,
 
     const Level = struct {
         pub const Error = error{InvalidLevel};
@@ -62,8 +63,7 @@ pub const TableManager = struct {
     const Self = @This();
 
     pub fn init(alloc: Allocator, opts: Opts) !Self {
-        const default_levels = 3;
-        const num_levels = opts.num_levels orelse default_levels;
+        const num_levels = opts.num_levels orelse 3;
 
         var levels = ArrayList(ArrayList(*SSTable)).init(alloc);
 
@@ -72,11 +72,49 @@ pub const TableManager = struct {
             try levels.append(ArrayList(*SSTable).init(alloc));
         }
 
+        var strategy: CompactionStrategy = undefined;
+        if (opts.compaction_strategy) |strat| {
+            switch (strat) {
+                .simple => {
+                    const simple_strategy = try alloc.create(SimpleCompactionStrategy);
+                    simple_strategy.* = SimpleCompactionStrategy.init(alloc);
+                    strategy = CompactionStrategy.init(
+                        simple_strategy,
+                        SimpleCompactionStrategy.compact,
+                        SimpleCompactionStrategy.deinit,
+                    );
+                },
+                .tiered => {
+                    const tiered_strategy = try alloc.create(TieredCompactionStrategy);
+                    tiered_strategy.* = TieredCompactionStrategy.init(alloc);
+                    strategy = CompactionStrategy.init(
+                        tiered_strategy,
+                        TieredCompactionStrategy.compact,
+                        TieredCompactionStrategy.deinit,
+                    );
+                },
+            }
+        } else {
+            const noop_strategy = try alloc.create(NoopCompactionStrategy);
+            noop_strategy.* = NoopCompactionStrategy.init(alloc);
+            strategy = CompactionStrategy.init(
+                noop_strategy,
+                NoopCompactionStrategy.compact,
+                NoopCompactionStrategy.deinit,
+            );
+        }
+
         return .{
             .levels = levels,
             .opts = opts,
             .num_levels = num_levels,
+            .compaction_strategy = strategy,
         };
+    }
+
+    pub fn setCompactionStrategy(self: *Self, alloc: Allocator, strategy: CompactionStrategy) void {
+        self.compaction_strategy.deinit(alloc);
+        self.compaction_strategy = strategy;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
@@ -88,6 +126,7 @@ pub const TableManager = struct {
             level.deinit();
         }
 
+        self.compaction_strategy.deinit(alloc);
         self.levels.deinit();
         self.* = undefined;
     }
@@ -129,9 +168,169 @@ pub const TableManager = struct {
         }
     }
 
+    pub const CompactionStrategyType = enum {
+        simple,
+        tiered,
+    };
+
+    // Compaction strategy interface
+    pub const CompactionStrategy = struct {
+        ptr: *anyopaque,
+        compactFn: *const fn (ctx: *anyopaque, tm: *SSTableStore, level: usize) anyerror!void,
+        deinitFn: *const fn (ctx: *anyopaque, alloc: Allocator) void,
+
+        pub fn init(
+            pointer: anytype,
+            comptime compactFunc: fn (ctx: @TypeOf(pointer), tm: *SSTableStore, level: usize) anyerror!void,
+            comptime deinitFunc: fn (ctx: @TypeOf(pointer), alloc: Allocator) void,
+        ) CompactionStrategy {
+            const Ptr = @TypeOf(pointer);
+            const ptr_info = @typeInfo(Ptr);
+
+            if (ptr_info != .Pointer) @compileError("Expected pointer, got " ++ @typeName(Ptr));
+            if (ptr_info.Pointer.size != .One) @compileError("Expected single-item pointer, got " ++ @typeName(Ptr));
+
+            // Create type-erased functions that handle the pointer type correctly
+            const GenericFunctions = struct {
+                fn compact(ctx: *anyopaque, tm: *SSTableStore, level: usize) !void {
+                    const self = @as(Ptr, @ptrCast(@alignCast(ctx)));
+                    return @call(.always_inline, compactFunc, .{ self, tm, level });
+                }
+
+                fn deinit(ctx: *anyopaque, alloc: Allocator) void {
+                    const self = @as(Ptr, @ptrCast(@alignCast(ctx)));
+                    @call(.always_inline, deinitFunc, .{ self, alloc });
+                }
+            };
+
+            return .{
+                .ptr = pointer,
+                .compactFn = GenericFunctions.compact,
+                .deinitFn = GenericFunctions.deinit,
+            };
+        }
+
+        pub fn deinit(self: CompactionStrategy, alloc: Allocator) void {
+            self.deinitFn(self.ptr, alloc);
+        }
+
+        pub fn compact(self: CompactionStrategy, tm: *SSTableStore, level: usize) !void {
+            return self.compactFn(self.ptr, tm, level);
+        }
+    };
+
+    pub const NoopCompactionStrategy = struct {
+        pub fn init(alloc: Allocator) NoopCompactionStrategy {
+            _ = alloc;
+            return .{};
+        }
+
+        pub fn compact(self: *NoopCompactionStrategy, tm: *SSTableStore, level: usize) !void {
+            _ = self;
+            _ = tm;
+            std.debug.print("Noop compaction on level {d}...\n", .{level});
+        }
+
+        pub fn deinit(self: *NoopCompactionStrategy, alloc: Allocator) void {
+            alloc.destroy(self);
+        }
+    };
+
+    pub const SimpleCompactionStrategy = struct {
+        alloc: Allocator,
+
+        pub fn init(alloc: Allocator) SimpleCompactionStrategy {
+            return .{ .alloc = alloc };
+        }
+
+        pub fn deinit(self: *SimpleCompactionStrategy, alloc: Allocator) void {
+            alloc.destroy(self);
+        }
+
+        pub fn compact(self: *SimpleCompactionStrategy, tm: *SSTableStore, level: usize) !void {
+            if (level >= tm.num_levels - 1) {
+                return;
+            }
+
+            const tables = tm.get(level);
+            if (tables.len == 0) {
+                return;
+            }
+
+            const next_level = level + 1;
+            const compaction_id = try std.fmt.allocPrint(self.alloc, "compaction_{d}_{d}", .{ level, std.time.timestamp() });
+            defer self.alloc.free(compaction_id);
+
+            var new_table = try SSTable.init(self.alloc, compaction_id, tm.opts);
+            errdefer {
+                new_table.deinit();
+                self.alloc.destroy(new_table);
+            }
+
+            var count: usize = 0;
+            for (tables) |table| {
+                var it = try table.iterator(self.alloc);
+                defer it.deinit();
+
+                while (it.next()) |kv| {
+                    _ = try new_table.write(kv);
+                    count += 1;
+                }
+            }
+
+            if (count > 0) {
+                try new_table.flush();
+
+                try tm.add(new_table, next_level);
+
+                std.debug.print("[simple] compacted {d} keys from level {d} to level {d}\n", .{ count, level, next_level });
+
+                var tables_to_remove = try std.ArrayList(*SSTable).initCapacity(self.alloc, tables.len);
+                defer tables_to_remove.deinit();
+
+                for (tables) |table| {
+                    try tables_to_remove.append(table);
+                }
+
+                tm.levels.items[level].clearRetainingCapacity();
+
+                for (tables_to_remove.items) |table| {
+                    table.deinit();
+                    self.alloc.destroy(table);
+                }
+            } else {
+                new_table.deinit();
+                self.alloc.destroy(new_table);
+            }
+        }
+    };
+
+    pub const TieredCompactionStrategy = struct {
+        alloc: Allocator,
+
+        pub fn init(alloc: Allocator) TieredCompactionStrategy {
+            return .{ .alloc = alloc };
+        }
+
+        pub fn deinit(self: *TieredCompactionStrategy, alloc: Allocator) void {
+            alloc.destroy(self);
+        }
+
+        pub fn compact(self: *TieredCompactionStrategy, tm: *SSTableStore, level: usize) !void {
+            _ = self;
+
+            if (level >= tm.num_levels - 1) {
+                return;
+            }
+
+            std.debug.print("[tiered] compacted {d} keys from level {d} to level {d}\n", .{ 0, level, 1 });
+
+            // pass
+        }
+    };
+
     pub fn compact(self: *Self, level: usize) !void {
-        _ = self;
-        std.debug.print("compacting level {d}...\n", .{level});
+        return self.compaction_strategy.compact(self, level);
     }
 
     pub fn add(self: *Self, st: *SSTable, level: usize) !void {
@@ -466,4 +665,169 @@ test SSTable {
     try testing.expectEqualStrings(akv.value, nxt_actual.?.value);
 
     _ = try st.flush();
+}
+
+test "CompactionStrategies" {
+    const testing = std.testing;
+    var talloc = testing.allocator;
+    const testDir = testing.tmpDir(.{});
+
+    const pathname = try testDir.dir.realpathAlloc(talloc, ".");
+    defer talloc.free(pathname);
+    defer testDir.dir.deleteTree(pathname) catch {};
+
+    const CompactionStrategy = SSTableStore.CompactionStrategy;
+
+    // Helper function to create a test SSTable with some data
+    const createTestSSTable = struct {
+        fn create(a: Allocator, id: []const u8, opts: Opts) !*SSTable {
+            var table = try SSTable.init(a, id, opts);
+            errdefer {
+                table.deinit();
+                a.destroy(table);
+            }
+
+            // Add some test data
+            _ = try table.write(KV.init("key1", "value1"));
+            _ = try table.write(KV.init("key2", "value2"));
+            _ = try table.write(KV.init("key3", "value3"));
+
+            return table;
+        }
+    }.create;
+
+    // Helper to verify compaction results
+    const verifyCompactionResults = struct {
+        fn verify(a: Allocator, tm: *SSTableStore, level: usize, expectedCount: usize) !void {
+            const tables = tm.get(level);
+            try testing.expectEqual(expectedCount, tables.len);
+
+            if (expectedCount > 0) {
+                // Verify the data in the compacted table
+                var it = try tm.iterator(a);
+                defer it.deinit();
+
+                var count: usize = 0;
+                while (it.next()) |_| {
+                    count += 1;
+                }
+
+                // We should have at least the number of keys we inserted
+                try testing.expect(count >= 3);
+            }
+        }
+    }.verify;
+
+    // Test SimpleCompactionStrategy
+    {
+        var dopts = options.defaultOpts();
+        dopts.data_dir = pathname;
+        dopts.num_levels = 3;
+
+        var tm = try SSTableStore.init(talloc, dopts);
+        defer tm.deinit(talloc);
+
+        const table1 = try createTestSSTable(talloc, "test1", dopts);
+        try tm.add(table1, 0);
+
+        const table2 = try createTestSSTable(talloc, "test2", dopts);
+        try tm.add(table2, 0);
+
+        try tm.compact(0);
+
+        // level 0 should be empty, level 1 should have 1 table
+        try verifyCompactionResults(talloc, &tm, 0, 0);
+        try verifyCompactionResults(talloc, &tm, 1, 1);
+    }
+
+    // Test TieredCompactionStrategy
+    {
+        var dopts = options.defaultOpts();
+        dopts.compaction_strategy = .tiered;
+        dopts.data_dir = pathname;
+        dopts.num_levels = 3;
+
+        var tm = try SSTableStore.init(talloc, dopts);
+        defer tm.deinit(talloc);
+
+        const table1 = try createTestSSTable(talloc, "test1", dopts);
+        try tm.add(table1, 0);
+
+        const table2 = try createTestSSTable(talloc, "test2", dopts);
+        try tm.add(table2, 0);
+
+        try tm.compact(0);
+
+        // Since TieredCompactionStrategy is just a stub, we expect no changes
+        try verifyCompactionResults(talloc, &tm, 0, 2);
+        try verifyCompactionResults(talloc, &tm, 1, 0);
+    }
+
+    // Test with a custom strategy (demonstrating extensibility)
+    {
+        const CustomCompactionStrategy = struct {
+            alloc: Allocator,
+
+            pub fn init(alloc: Allocator) @This() {
+                return .{ .alloc = alloc };
+            }
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                alloc.destroy(self);
+            }
+
+            pub fn compact(self: *@This(), tm: *SSTableStore, level: usize) !void {
+                _ = self;
+
+                // Simple implementation that just moves tables to the next level without merging
+                if (level >= tm.num_levels - 1) {
+                    return;
+                }
+
+                const tables = tm.get(level);
+                if (tables.len == 0) {
+                    return;
+                }
+
+                // Move all tables to the next level
+                const next_level = level + 1;
+                for (tables) |table| {
+                    try tm.add(table, next_level);
+                }
+
+                tm.levels.items[level].clearRetainingCapacity();
+            }
+        };
+
+        var dopts = options.defaultOpts();
+        dopts.data_dir = pathname;
+        dopts.num_levels = 3;
+
+        var tm = try SSTableStore.init(talloc, dopts);
+        defer tm.deinit(talloc);
+
+        const table1 = try createTestSSTable(talloc, "test1", dopts);
+        try tm.add(table1, 0);
+
+        const table2 = try createTestSSTable(talloc, "test2", dopts);
+        try tm.add(table2, 0);
+
+        const custom_strategy = try talloc.create(CustomCompactionStrategy);
+        custom_strategy.* = CustomCompactionStrategy.init(talloc);
+
+        tm.setCompactionStrategy(
+            talloc,
+            CompactionStrategy.init(
+                custom_strategy,
+                CustomCompactionStrategy.compact,
+                CustomCompactionStrategy.deinit,
+            ),
+        );
+
+        try tm.compact(0);
+
+        // level 0 should be empty, level 1 should have 2 tables
+        try verifyCompactionResults(talloc, &tm, 0, 0);
+        try verifyCompactionResults(talloc, &tm, 1, 2);
+    }
 }
