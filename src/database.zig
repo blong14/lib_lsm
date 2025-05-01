@@ -35,6 +35,219 @@ const SSTableStore = sst.SSTableStore;
 const TAG = "[zig]";
 var mtx: Mutex = .{};
 
+pub const DatabaseEvent = union(enum) {
+    // Events that can trigger agent decisions
+    write_completed: struct { bytes: u64 },
+    read_completed: struct { bytes: u64 },
+    memtable_frozen: struct { id: []const u8 },
+    sstable_created: struct { level: usize, id: []const u8 },
+    compaction_completed: struct { level: usize, duration_ns: u64 },
+    system_idle: struct { duration_ms: u64 },
+};
+
+pub const AgentAction = union(enum) {
+    // Actions the agent can decide to take
+    flush_memtable: struct { id: []const u8 },
+    compact_level: struct { level: usize },
+    no_action: void,
+};
+
+pub const AgentPolicy = struct {
+    // Configurable policy parameters
+    max_level0_files: u32 = 4,
+    max_unflushed_memtables: usize = 2,
+    min_write_cooldown_ms: u64 = 500,
+    compaction_level_threshold: f64 = 0.8,
+    idle_compact_threshold_ms: u64 = 5000,
+};
+
+pub const DatabaseAgent = struct {
+    alloc: Allocator,
+    db: *Database,
+    sstables: *SSTableStore,
+    policy: AgentPolicy,
+    event_queue: std.fifo.LinearFifo(DatabaseEvent, .Dynamic),
+    action_queue: std.fifo.LinearFifo(AgentAction, .Dynamic),
+    thread: ?std.Thread = null,
+    running: std.atomic.Value(bool),
+    mutex: std.Thread.Mutex,
+
+    const Self = @This();
+
+    pub fn init(alloc: Allocator, db: *Database, policy: AgentPolicy) !*Self {
+        const agent = try alloc.create(Self);
+        agent.* = .{
+            .alloc = alloc,
+            .db = db,
+            .sstables = db.sstables,
+            .policy = policy,
+            .event_queue = std.fifo.LinearFifo(DatabaseEvent, .Dynamic).init(alloc),
+            .action_queue = std.fifo.LinearFifo(AgentAction, .Dynamic).init(alloc),
+            .running = std.atomic.Value(bool).init(false),
+            .mutex = std.Thread.Mutex{},
+        };
+        return agent;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.stop();
+        self.event_queue.deinit();
+        self.action_queue.deinit();
+        self.alloc.destroy(self);
+    }
+
+    pub fn start(self: *Self) !void {
+        if (self.running.load(.acquire)) return;
+
+        self.running.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
+    }
+
+    pub fn stop(self: *Self) void {
+        if (!self.running.load(.acquire)) return;
+
+        self.running.store(false, .release);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    pub fn submitEvent(self: *Self, event: DatabaseEvent) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.event_queue.writeItem(event) catch |err| {
+            std.log.err("{s} failed to submit event: {s}", .{ TAG, @errorName(err) });
+        };
+    }
+
+    pub fn getNextAction(self: *Self) ?AgentAction {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.action_queue.readItem();
+    }
+
+    fn run(self: *Self) void {
+        while (self.running.load(.acquire)) {
+            std.time.sleep(100 * std.time.ns_per_ms); // Check every 100ms
+
+            self.processEvents();
+            self.evaluateState();
+        }
+    }
+
+    fn processEvents(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.event_queue.readItem()) |event| {
+            switch (event) {
+                .write_completed => |data| {
+                    // Update write statistics if needed
+                    _ = data;
+                },
+                .read_completed => |data| {
+                    // Update read statistics if needed
+                    _ = data;
+                },
+                .memtable_frozen => |data| {
+                    // Check if we should flush this memtable
+                    self.considerFlushingMemtable(data.id);
+                },
+                .sstable_created => |data| {
+                    // Check if we should compact this level
+                    self.considerCompactingLevel(data.level);
+                },
+                .compaction_completed => |data| {
+                    // Update compaction statistics
+                    _ = data;
+                },
+                .system_idle => |data| {
+                    // Consider background maintenance during idle time
+                    self.considerIdleCompaction(data.duration_ms);
+                },
+            }
+        }
+    }
+
+    fn evaluateState(self: *Self) void {
+        // Periodically evaluate the overall state of the database
+        // and make decisions based on the current statistics
+
+        // Check level 0 file count
+        const level0_files = self.sstables.stats.getFilesCount(0);
+        if (level0_files > self.policy.max_level0_files) {
+            self.queueAction(.{ .compact_level = .{ .level = 0 } });
+        }
+
+        // Check other levels based on size ratios
+        for (1..self.sstables.num_levels) |level| {
+            const level_stats = self.sstables.getLevelStats(level) orelse continue;
+            const next_level_stats = self.sstables.getLevelStats(level + 1) orelse continue;
+
+            // If this level is getting too full compared to the next level
+            if (level_stats.files_count > 0 and next_level_stats.files_count > 0) {
+                const ratio = @as(f64, @floatFromInt(level_stats.files_count)) /
+                    @as(f64, @floatFromInt(next_level_stats.files_count));
+
+                if (ratio > self.policy.compaction_level_threshold) {
+                    self.queueAction(.{ .compact_level = .{ .level = level } });
+                }
+            }
+        }
+    }
+
+    fn considerFlushingMemtable(self: *Self, id: []const u8) void {
+        // Simple policy: if we have too many unflushed memtables, flush this one
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.db.mtables.items.len >= self.policy.max_unflushed_memtables) {
+            self.queueAction(.{ .flush_memtable = .{ .id = id } });
+        }
+    }
+
+    fn considerCompactingLevel(self: *Self, level: usize) void {
+        // Check if this level needs compaction based on file count
+        const files_count = self.sstables.stats.getFilesCount(level);
+        const max_files = self.policy.max_level0_files * std.math.pow(u32, 10, @intCast(level));
+
+        if (files_count > max_files) {
+            self.queueAction(.{ .compact_level = .{ .level = level } });
+        }
+    }
+
+    fn considerIdleCompaction(self: *Self, idle_ms: u64) void {
+        if (idle_ms < self.policy.idle_compact_threshold_ms) return;
+
+        // Find a level that hasn't been compacted in a while
+        var oldest_level: usize = 0;
+        var oldest_time: i64 = std.time.timestamp();
+
+        for (0..self.sstables.num_levels) |level| {
+            const last_compaction = self.sstables.stats.getLastCompactionTime(level);
+            if (last_compaction > 0 and last_compaction < oldest_time) {
+                oldest_time = last_compaction;
+                oldest_level = level;
+            }
+        }
+
+        // If we found a level that hasn't been compacted in a while
+        const now = std.time.timestamp();
+        if (now - oldest_time > @as(i64, @intCast(self.policy.idle_compact_threshold_ms / 1000))) {
+            self.queueAction(.{ .compact_level = .{ .level = oldest_level } });
+        }
+    }
+
+    fn queueAction(self: *Self, action: AgentAction) void {
+        self.action_queue.writeItem(action) catch |err| {
+            std.log.err("{s} failed to queue action: {s}", .{ TAG, @errorName(err) });
+        };
+    }
+};
+
 pub const Database = struct {
     alloc: Allocator,
     byte_allocator: ThreadSafeBumpAllocator,
@@ -295,10 +508,6 @@ pub const Database = struct {
             mtable.deinit();
             self.alloc.destroy(mtable);
         }
-
-        self.sstables.compact(0) catch |err| {
-            std.log.err("{s} sstable compaction error {s}", .{ TAG, @errorName(err) });
-        };
 
         self.mtables.clearAndFree();
     }

@@ -38,6 +38,7 @@ pub const SSTableStore = struct {
     opts: Opts,
     num_levels: usize,
     compaction_strategy: CompactionStrategy,
+    stats: LevelStats,
 
     const Level = struct {
         pub const Error = error{InvalidLevel};
@@ -109,6 +110,7 @@ pub const SSTableStore = struct {
             .opts = opts,
             .num_levels = num_levels,
             .compaction_strategy = strategy,
+            .stats = LevelStats.init(alloc, num_levels),
         };
     }
 
@@ -128,6 +130,8 @@ pub const SSTableStore = struct {
 
         self.compaction_strategy.deinit(alloc);
         self.levels.deinit();
+        self.stats.printStats();
+        self.stats.deinit();
         self.* = undefined;
     }
 
@@ -167,6 +171,281 @@ pub const SSTableStore = struct {
             alloc.free(nxt_file);
         }
     }
+
+    // Statistics tracking for each level to support compaction decisions
+    pub const LevelStats = struct {
+        alloc: Allocator,
+        // Core metrics
+        bytes_written: []std.atomic.Value(u64),
+        bytes_read: []std.atomic.Value(u64),
+        files_count: []std.atomic.Value(u32),
+        total_keys: []std.atomic.Value(u64),
+
+        // Time-based metrics
+        last_compaction: []std.atomic.Value(i64),
+        compaction_count: []std.atomic.Value(u32),
+
+        // Performance metrics
+        avg_read_latency_ns: []std.atomic.Value(u64),
+        avg_write_latency_ns: []std.atomic.Value(u64),
+
+        // Custom metrics storage for strategy-specific needs
+        custom_metrics: std.StringHashMap(u64),
+        mutex: std.Thread.Mutex,
+
+        pub fn init(alloc: Allocator, num_levels: usize) LevelStats {
+            var bytes_written = alloc.alloc(std.atomic.Value(u64), num_levels) catch @panic("OOM");
+            var bytes_read = alloc.alloc(std.atomic.Value(u64), num_levels) catch @panic("OOM");
+            var files_count = alloc.alloc(std.atomic.Value(u32), num_levels) catch @panic("OOM");
+            var total_keys = alloc.alloc(std.atomic.Value(u64), num_levels) catch @panic("OOM");
+            var last_compaction = alloc.alloc(std.atomic.Value(i64), num_levels) catch @panic("OOM");
+            var compaction_count = alloc.alloc(std.atomic.Value(u32), num_levels) catch @panic("OOM");
+            var avg_read_latency_ns = alloc.alloc(std.atomic.Value(u64), num_levels) catch @panic("OOM");
+            var avg_write_latency_ns = alloc.alloc(std.atomic.Value(u64), num_levels) catch @panic("OOM");
+
+            for (0..num_levels) |i| {
+                bytes_written[i] = std.atomic.Value(u64).init(0);
+                bytes_read[i] = std.atomic.Value(u64).init(0);
+                files_count[i] = std.atomic.Value(u32).init(0);
+                total_keys[i] = std.atomic.Value(u64).init(0);
+                last_compaction[i] = std.atomic.Value(i64).init(0);
+                compaction_count[i] = std.atomic.Value(u32).init(0);
+                avg_read_latency_ns[i] = std.atomic.Value(u64).init(0);
+                avg_write_latency_ns[i] = std.atomic.Value(u64).init(0);
+            }
+
+            return .{
+                .alloc = alloc,
+                .bytes_written = bytes_written,
+                .bytes_read = bytes_read,
+                .files_count = files_count,
+                .total_keys = total_keys,
+                .last_compaction = last_compaction,
+                .compaction_count = compaction_count,
+                .avg_read_latency_ns = avg_read_latency_ns,
+                .avg_write_latency_ns = avg_write_latency_ns,
+                .custom_metrics = std.StringHashMap(u64).init(alloc),
+                .mutex = std.Thread.Mutex{},
+            };
+        }
+
+        pub fn deinit(self: *LevelStats) void {
+            self.alloc.free(self.bytes_written);
+            self.alloc.free(self.bytes_read);
+            self.alloc.free(self.files_count);
+            self.alloc.free(self.total_keys);
+            self.alloc.free(self.last_compaction);
+            self.alloc.free(self.compaction_count);
+            self.alloc.free(self.avg_read_latency_ns);
+            self.alloc.free(self.avg_write_latency_ns);
+            self.custom_metrics.deinit();
+        }
+
+        pub fn recordBytesWritten(self: *LevelStats, level: usize, bytes: u64) void {
+            if (level >= self.bytes_written.len) return;
+            _ = self.bytes_written[level].fetchAdd(bytes, .monotonic);
+            _ = self.files_count[level].fetchAdd(1, .monotonic);
+        }
+
+        pub fn recordBytesRead(self: *LevelStats, level: usize, bytes: u64) void {
+            if (level >= self.bytes_read.len) return;
+            _ = self.bytes_read[level].fetchAdd(bytes, .monotonic);
+        }
+
+        pub fn recordKeysWritten(self: *LevelStats, level: usize, count: u64) void {
+            if (level >= self.total_keys.len) return;
+            _ = self.total_keys[level].fetchAdd(count, .monotonic);
+        }
+
+        pub fn recordCompaction(self: *LevelStats, level: usize) void {
+            if (level >= self.last_compaction.len) return;
+            self.last_compaction[level].store(std.time.timestamp(), .release);
+            _ = self.compaction_count[level].fetchAdd(1, .monotonic);
+        }
+
+        pub fn updateReadLatency(self: *LevelStats, level: usize, latency_ns: u64) void {
+            if (level >= self.avg_read_latency_ns.len) return;
+            // Simple exponential moving average
+            const old_avg = self.avg_read_latency_ns[level].load(.acquire);
+            const new_avg = if (old_avg == 0) latency_ns else (old_avg * 3 + latency_ns) / 4;
+            self.avg_read_latency_ns[level].store(new_avg, .release);
+        }
+
+        pub fn updateWriteLatency(self: *LevelStats, level: usize, latency_ns: u64) void {
+            if (level >= self.avg_write_latency_ns.len) return;
+            const old_avg = self.avg_write_latency_ns[level].load(.acquire);
+            const new_avg = if (old_avg == 0) latency_ns else (old_avg * 3 + latency_ns) / 4;
+            self.avg_write_latency_ns[level].store(new_avg, .release);
+        }
+
+        pub fn setCustomMetric(self: *LevelStats, key: []const u8, value: u64) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.custom_metrics.put(key, value);
+        }
+
+        pub fn getCustomMetric(self: *LevelStats, key: []const u8) ?u64 {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.custom_metrics.get(key);
+        }
+
+        pub fn getTotalBytesWritten(self: *LevelStats, level: usize) u64 {
+            if (level >= self.bytes_written.len) return 0;
+            return self.bytes_written[level].load(.acquire);
+        }
+
+        pub fn getTotalBytesRead(self: *LevelStats, level: usize) u64 {
+            if (level >= self.bytes_read.len) return 0;
+            return self.bytes_read[level].load(.acquire);
+        }
+
+        pub fn getFilesCount(self: *LevelStats, level: usize) u32 {
+            if (level >= self.files_count.len) return 0;
+            return self.files_count[level].load(.acquire);
+        }
+
+        pub fn getLastCompactionTime(self: *LevelStats, level: usize) i64 {
+            if (level >= self.last_compaction.len) return 0;
+            return self.last_compaction[level].load(.acquire);
+        }
+
+        pub fn getCompactionCount(self: *LevelStats, level: usize) u32 {
+            if (level >= self.compaction_count.len) return 0;
+            return self.compaction_count[level].load(.acquire);
+        }
+
+        pub fn getReadLatency(self: *LevelStats, level: usize) u64 {
+            if (level >= self.avg_read_latency_ns.len) return 0;
+            return self.avg_read_latency_ns[level].load(.acquire);
+        }
+
+        pub fn getWriteLatency(self: *LevelStats, level: usize) u64 {
+            if (level >= self.avg_write_latency_ns.len) return 0;
+            return self.avg_write_latency_ns[level].load(.acquire);
+        }
+
+        pub fn resetStats(self: *LevelStats, level: usize) void {
+            if (level >= self.bytes_written.len) return;
+            self.bytes_written[level].store(0, .release);
+            self.bytes_read[level].store(0, .release);
+            // Don't reset files_count as it represents the current state
+            self.total_keys[level].store(0, .release);
+            // Don't reset last_compaction time
+            // Don't reset compaction_count as it's historical
+            self.avg_read_latency_ns[level].store(0, .release);
+            self.avg_write_latency_ns[level].store(0, .release);
+        }
+
+        pub fn printStats(self: *LevelStats) void {
+            std.debug.print("=== LSM Tree Stats ===\n", .{});
+
+            // Calculate totals for summary
+            var total_files: u32 = 0;
+            var total_keys: u64 = 0;
+            var total_bytes_written: u64 = 0;
+            var total_bytes_read: u64 = 0;
+            var total_compactions: u32 = 0;
+
+            const max_levels = @min(self.bytes_written.len, 10);
+
+            // Print header
+            std.debug.print("Level | Files | Keys | Written | Read | Compactions | Latency(ms)\n", .{});
+            std.debug.print("------+-------+------+---------+------+-------------+------------\n", .{});
+
+            // Static buffers for formatting to avoid memory issues
+            var written_buf: [32]u8 = undefined;
+            var read_buf: [32]u8 = undefined;
+            var key_buf: [32]u8 = undefined;
+
+            for (0..max_levels) |level| {
+                const files = self.getFilesCount(level);
+                const keys = self.total_keys[level].load(.acquire);
+                const bytes_written = self.getTotalBytesWritten(level);
+                const bytes_read = self.getTotalBytesRead(level);
+                const comp_count = self.getCompactionCount(level);
+                const read_latency = self.getReadLatency(level);
+                const write_latency = self.getWriteLatency(level);
+                const avg_latency_ns = if (read_latency > 0 and write_latency > 0)
+                    (read_latency + write_latency) / 2
+                else if (read_latency > 0) read_latency else write_latency;
+                // Convert to milliseconds
+                const avg_latency_ms = @as(f64, @floatFromInt(avg_latency_ns)) / 1_000_000.0;
+
+                // Update totals
+                total_files += files;
+                total_keys += keys;
+                total_bytes_written += bytes_written;
+                total_bytes_read += bytes_read;
+                total_compactions += comp_count;
+
+                // Format bytes in human-readable form with dedicated buffers
+                const written_str = formatBytesWithBuffer(bytes_written, &written_buf);
+                const read_str = formatBytesWithBuffer(bytes_read, &read_buf);
+
+                // Print row in table format with right-aligned values
+                std.debug.print("{d:4} | {d:5} | {d:4} | {s:>7} | {s:>4} | {d:11} | {d:6.2}\n", 
+                    .{level, files, keys, written_str, read_str, comp_count, avg_latency_ms});
+            }
+
+            // Print summary line
+            std.debug.print("------+-------+------+---------+------+-------------+------------\n", .{});
+
+            // Format totals with dedicated buffers
+            const total_written_str = formatBytesWithBuffer(total_bytes_written, &written_buf);
+            const total_read_str = formatBytesWithBuffer(total_bytes_read, &read_buf);
+
+            std.debug.print("Total | {d:5} | {d:4} | {s:>7} | {s:>4} | {d:11} | -\n", 
+                .{total_files, total_keys, total_written_str, total_read_str, total_compactions});
+
+            // Print additional useful metrics in a more compact format
+            std.debug.print("\n", .{});
+            
+            if (self.getCustomMetric("last_compaction_duration_ns")) |duration| {
+                const duration_ms = @as(f64, @floatFromInt(duration)) / 1_000_000.0;
+                std.debug.print("Last compaction: {d:.2} ms | ", .{duration_ms});
+            }
+
+            // Calculate and print efficiency metrics
+            if (total_bytes_written > 0) {
+                const read_write_ratio = if (total_bytes_read > 0)
+                    @as(f64, @floatFromInt(total_bytes_read)) /
+                        @as(f64, @floatFromInt(total_bytes_written))
+                else
+                    0.0;
+                std.debug.print("R/W ratio: {d:.2} | ", .{read_write_ratio});
+            }
+
+            if (total_keys > 0 and total_bytes_written > 0) {
+                const bytes_per_key = @as(f64, @floatFromInt(total_bytes_written)) /
+                    @as(f64, @floatFromInt(total_keys));
+                const bytes_per_key_str = formatBytesWithBuffer(@intFromFloat(bytes_per_key), &key_buf);
+                std.debug.print("Avg per key: {s}", .{bytes_per_key_str});
+            }
+            
+            std.debug.print("\n=====================\n", .{});
+        }
+
+        // Improved helper function to format bytes in human-readable form
+        fn formatBytesWithBuffer(bytes: u64, buf: []u8) []const u8 {
+            if (bytes == 0) {
+                return "0B";
+            }
+            
+            if (bytes < 1024) {
+                return std.fmt.bufPrint(buf, "{d}B", .{bytes}) catch "??B";
+            } else if (bytes < 1024 * 1024) {
+                const kb = @as(f64, @floatFromInt(bytes)) / 1024.0;
+                return std.fmt.bufPrint(buf, "{d:.1}K", .{kb}) catch "??K";
+            } else if (bytes < 1024 * 1024 * 1024) {
+                const mb = @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+                return std.fmt.bufPrint(buf, "{d:.1}M", .{mb}) catch "??M";
+            } else {
+                const gb = @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
+                return std.fmt.bufPrint(buf, "{d:.1}G", .{gb}) catch "??G";
+            }
+        }
+    };
 
     pub const CompactionStrategyType = enum {
         simple,
@@ -257,6 +536,8 @@ pub const SSTableStore = struct {
                 return;
             }
 
+            const start_time = std.time.nanoTimestamp();
+
             const next_level = level + 1;
             const compaction_id = try std.fmt.allocPrint(self.alloc, "compaction_{d}_{d}", .{ level, std.time.timestamp() });
             defer self.alloc.free(compaction_id);
@@ -268,7 +549,11 @@ pub const SSTableStore = struct {
             }
 
             var count: usize = 0;
+            var bytes_read: u64 = 0;
+
             for (tables) |table| {
+                bytes_read += table.block.size();
+
                 var it = try table.iterator(self.alloc);
                 defer it.deinit();
 
@@ -298,6 +583,15 @@ pub const SSTableStore = struct {
                     table.deinit();
                     self.alloc.destroy(table);
                 }
+
+                // Update statistics
+                tm.stats.recordBytesRead(level, bytes_read);
+
+                const end_time = std.time.nanoTimestamp();
+                const latency = @as(u64, @intCast(end_time - start_time));
+
+                // Store compaction duration as a custom metric
+                try tm.stats.setCustomMetric("last_compaction_duration_ns", latency);
             } else {
                 new_table.deinit();
                 self.alloc.destroy(new_table);
@@ -330,8 +624,35 @@ pub const SSTableStore = struct {
     };
 
     pub fn compact(self: *Self, level: usize) !void {
-        return self.compaction_strategy.compact(self, level);
+        try self.compaction_strategy.compact(self, level);
+        self.stats.recordCompaction(level);
     }
+
+    pub fn getLevelStats(self: *Self, level: usize) ?LevelStatsView {
+        if (level >= self.num_levels) return null;
+
+        return LevelStatsView{
+            .bytes_written = self.stats.getTotalBytesWritten(level),
+            .bytes_read = self.stats.getTotalBytesRead(level),
+            .files_count = self.stats.getFilesCount(level),
+            .total_keys = self.stats.total_keys[level].load(.acquire),
+            .last_compaction = self.stats.getLastCompactionTime(level),
+            .compaction_count = self.stats.getCompactionCount(level),
+            .avg_read_latency_ns = self.stats.getReadLatency(level),
+            .avg_write_latency_ns = self.stats.getWriteLatency(level),
+        };
+    }
+
+    pub const LevelStatsView = struct {
+        bytes_written: u64,
+        bytes_read: u64,
+        files_count: u32,
+        total_keys: u64,
+        last_compaction: i64,
+        compaction_count: u32,
+        avg_read_latency_ns: u64,
+        avg_write_latency_ns: u64,
+    };
 
     pub fn add(self: *Self, st: *SSTable, level: usize) !void {
         if (level >= self.num_levels) {
@@ -339,6 +660,9 @@ pub const SSTableStore = struct {
         }
 
         try self.levels.items[level].append(st);
+
+        self.stats.recordBytesWritten(level, st.block.size());
+        self.stats.recordKeysWritten(level, st.block.count);
     }
 
     pub fn get(self: Self, level: usize) []const *SSTable {
@@ -386,6 +710,8 @@ pub const SSTableStore = struct {
     }
 
     pub fn flush(self: *Self, alloc: Allocator, mtable: *Memtable) !void {
+        const start_time = std.time.nanoTimestamp();
+
         var sstable = try SSTable.init(alloc, mtable.getId(), self.opts);
         errdefer alloc.destroy(sstable);
         errdefer sstable.deinit();
@@ -395,6 +721,7 @@ pub const SSTableStore = struct {
         var it = try mtable.iterator(alloc);
         defer it.deinit();
 
+        var keys_written: u64 = 0;
         while (it.next()) |nxt| {
             _ = sstable.write(nxt) catch |err| switch (err) {
                 error.DuplicateError => continue,
@@ -406,6 +733,7 @@ pub const SSTableStore = struct {
                     return err;
                 },
             };
+            keys_written += 1;
         }
 
         sstable.flush() catch |err| @panic(@errorName(err));
@@ -413,6 +741,12 @@ pub const SSTableStore = struct {
         mtable.isFlushed.store(true, .release);
 
         try self.add(sstable, 0); // Add to level 0
+
+        // Record write latency
+        const end_time = std.time.nanoTimestamp();
+        const latency = @as(u64, @intCast(end_time - start_time));
+        self.stats.updateWriteLatency(0, latency);
+        self.stats.recordKeysWritten(0, keys_written);
     }
 };
 
@@ -520,6 +854,14 @@ pub const SSTable = struct {
 
             if (std.mem.eql(u8, value.key, key)) {
                 kv.* = value;
+
+                // Record read latency if we have access to stats
+                // This is a bit of a hack since we don't have direct access to the store's stats
+                // In a real implementation, we might want to pass the stats object or use a global context
+                // const start_time = std.time.nanoTimestamp();
+                // const end_time = std.time.nanoTimestamp();
+                // const latency = @as(u64, @intCast(end_time - start_time));
+
                 return;
             }
         }
