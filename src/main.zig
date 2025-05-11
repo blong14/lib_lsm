@@ -23,16 +23,18 @@ const usage =
     \\
 ;
 
+pub const std_options = .{
+    .log_level = .debug,
+};
+
 pub fn main() !void {
     // First we specify what parameters our program can take.
     // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`
     const params = comptime clap.parseParamsComptime(usage);
 
-    const Mode = enum { singlethreaded, multithreaded, multiprocess };
     const parsers = comptime .{
         .str = clap.parsers.string,
         .usize = clap.parsers.int(usize, 10),
-        .mode = clap.parsers.enumeration(Mode),
     };
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
@@ -68,7 +70,7 @@ pub fn main() !void {
     };
 
     const db = lsm.databaseFromOpts(allocator, opts) catch |err| {
-        debug.print("database init error {s}\n", .{@errorName(err)});
+        std.log.err("database init error {s}", .{@errorName(err)});
         return err;
     };
     defer allocator.destroy(db);
@@ -79,7 +81,10 @@ pub fn main() !void {
     var it = try db.iterator(allocator);
     defer it.deinit();
 
-    while (it.next()) |nxt| {
-        debug.print("{}\n", .{nxt});
+    var count: usize = 0;
+    while (it.next()) |_| {
+        count += 1;
     }
+
+    std.log.info("total rows {d}", .{count});
 }

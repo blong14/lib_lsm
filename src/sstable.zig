@@ -44,7 +44,7 @@ pub const SSTableStore = struct {
         pub const Error = error{InvalidLevel};
 
         pub fn fromString(level_name: []const u8) !usize {
-            // Parse level-N format to get the level number
+            // Parse `level-n` format to get the level number
             if (level_name.len < 7 or !startsWith(u8, level_name, "level-")) {
                 return Error.InvalidLevel;
             }
@@ -160,12 +160,11 @@ pub const SSTableStore = struct {
 
             var filename_parts = mem.split(u8, f.basename, "_");
             const level_name = filename_parts.first();
-            const sst_id = filename_parts.next().?;
+            const level = try Level.fromString(level_name);
 
-            var sstable = try SSTable.init(alloc, sst_id, self.opts);
+            var sstable = try SSTable.init(alloc, level, self.opts);
             try sstable.open(data_file);
 
-            const level = try Level.fromString(level_name);
             try self.add(sstable, level);
 
             alloc.free(nxt_file);
@@ -244,7 +243,6 @@ pub const SSTableStore = struct {
         pub fn recordBytesWritten(self: *LevelStats, level: usize, bytes: u64) void {
             if (level >= self.bytes_written.len) return;
             _ = self.bytes_written[level].fetchAdd(bytes, .monotonic);
-            _ = self.files_count[level].fetchAdd(1, .monotonic);
         }
 
         pub fn recordBytesRead(self: *LevelStats, level: usize, bytes: u64) void {
@@ -384,8 +382,7 @@ pub const SSTableStore = struct {
                 const read_str = formatBytesWithBuffer(bytes_read, &read_buf);
 
                 // Print row in table format with right-aligned values
-                std.debug.print("{d:4} | {d:5} | {d:4} | {s:>7} | {s:>4} | {d:11} | {d:6.2}\n", 
-                    .{level, files, keys, written_str, read_str, comp_count, avg_latency_ms});
+                std.debug.print("{d:4} | {d:5} | {d:4} | {s:>7} | {s:>4} | {d:11} | {d:6.2}\n", .{ level, files, keys, written_str, read_str, comp_count, avg_latency_ms });
             }
 
             // Print summary line
@@ -395,12 +392,11 @@ pub const SSTableStore = struct {
             const total_written_str = formatBytesWithBuffer(total_bytes_written, &written_buf);
             const total_read_str = formatBytesWithBuffer(total_bytes_read, &read_buf);
 
-            std.debug.print("Total | {d:5} | {d:4} | {s:>7} | {s:>4} | {d:11} | -\n", 
-                .{total_files, total_keys, total_written_str, total_read_str, total_compactions});
+            std.debug.print("Total | {d:5} | {d:4} | {s:>7} | {s:>4} | {d:11} | -\n", .{ total_files, total_keys, total_written_str, total_read_str, total_compactions });
 
             // Print additional useful metrics in a more compact format
             std.debug.print("\n", .{});
-            
+
             if (self.getCustomMetric("last_compaction_duration_ns")) |duration| {
                 const duration_ms = @as(f64, @floatFromInt(duration)) / 1_000_000.0;
                 std.debug.print("Last compaction: {d:.2} ms | ", .{duration_ms});
@@ -422,7 +418,7 @@ pub const SSTableStore = struct {
                 const bytes_per_key_str = formatBytesWithBuffer(@intFromFloat(bytes_per_key), &key_buf);
                 std.debug.print("Avg per key: {s}", .{bytes_per_key_str});
             }
-            
+
             std.debug.print("\n=====================\n", .{});
         }
 
@@ -431,7 +427,7 @@ pub const SSTableStore = struct {
             if (bytes == 0) {
                 return "0B";
             }
-            
+
             if (bytes < 1024) {
                 return std.fmt.bufPrint(buf, "{d}B", .{bytes}) catch "??B";
             } else if (bytes < 1024 * 1024) {
@@ -507,7 +503,7 @@ pub const SSTableStore = struct {
         pub fn compact(self: *NoopCompactionStrategy, tm: *SSTableStore, level: usize) !void {
             _ = self;
             _ = tm;
-            std.debug.print("Noop compaction on level {d}...\n", .{level});
+            std.log.debug("noop compaction on level {d}", .{level});
         }
 
         pub fn deinit(self: *NoopCompactionStrategy, alloc: Allocator) void {
@@ -539,10 +535,8 @@ pub const SSTableStore = struct {
             const start_time = std.time.nanoTimestamp();
 
             const next_level = level + 1;
-            const compaction_id = try std.fmt.allocPrint(self.alloc, "compaction_{d}_{d}", .{ level, std.time.timestamp() });
-            defer self.alloc.free(compaction_id);
 
-            var new_table = try SSTable.init(self.alloc, compaction_id, tm.opts);
+            var new_table = try SSTable.init(self.alloc, next_level, tm.opts);
             errdefer {
                 new_table.deinit();
                 self.alloc.destroy(new_table);
@@ -564,33 +558,70 @@ pub const SSTableStore = struct {
             }
 
             if (count > 0) {
-                try new_table.flush();
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+
+                const malloc = arena.allocator();
+
+                try new_table.block.freeze();
+
+                const sz = new_table.block.size();
+
+                const filename = try std.fmt.allocPrint(
+                    malloc,
+                    "{s}/{s}.dat",
+                    .{ new_table.data_dir, new_table.id },
+                );
+
+                const out_file = try file_utils.openAndTruncate(filename, sz);
+                try new_table.open(out_file);
+
+                _ = new_table.block.flush(&new_table.stream.buf) catch |err| {
+                    @panic(@errorName(err));
+                };
+
+                new_table.file.sync() catch |err| @panic(@errorName(err));
+
+                new_table.mutable = false;
 
                 try tm.add(new_table, next_level);
 
-                std.debug.print("[simple] compacted {d} keys from level {d} to level {d}\n", .{ count, level, next_level });
-
-                var tables_to_remove = try std.ArrayList(*SSTable).initCapacity(self.alloc, tables.len);
+                var tables_to_remove = try std.ArrayList(*SSTable).initCapacity(
+                    malloc,
+                    tables.len,
+                );
                 defer tables_to_remove.deinit();
 
                 for (tables) |table| {
                     try tables_to_remove.append(table);
                 }
 
-                tm.levels.items[level].clearRetainingCapacity();
-
                 for (tables_to_remove.items) |table| {
+                    const fln = try std.fmt.allocPrint(
+                        malloc,
+                        "{s}/{s}.dat",
+                        .{ table.data_dir, table.id },
+                    );
+
                     table.deinit();
                     self.alloc.destroy(table);
+
+                    try file_utils.delete(fln);
                 }
 
-                // Update statistics
+                // TODO: Update thread safety
+                tm.levels.items[level].clearAndFree();
+                _ = tm.stats.files_count[level].store(0, .monotonic);
+
                 tm.stats.recordBytesRead(level, bytes_read);
 
                 const end_time = std.time.nanoTimestamp();
                 const latency = @as(u64, @intCast(end_time - start_time));
 
-                // Store compaction duration as a custom metric
+                std.log.info(
+                    "[simple] compacted {d} keys from level {d} to level {d} {d:.2} ms",
+                    .{ count, level, next_level, latency / std.time.ns_per_ms },
+                );
                 try tm.stats.setCustomMetric("last_compaction_duration_ns", latency);
             } else {
                 new_table.deinit();
@@ -617,9 +648,7 @@ pub const SSTableStore = struct {
                 return;
             }
 
-            std.debug.print("[tiered] compacted {d} keys from level {d} to level {d}\n", .{ 0, level, 1 });
-
-            // pass
+            std.log.debug("[tiered] compacted {d} keys from level {d} to level {d}\n", .{ 0, level, 1 });
         }
     };
 
@@ -659,13 +688,17 @@ pub const SSTableStore = struct {
             return error.InvalidLevel;
         }
 
+        // TODO: Update thread safety
         try self.levels.items[level].append(st);
+
+        _ = self.stats.files_count[level].fetchAdd(1, .monotonic);
 
         self.stats.recordBytesWritten(level, st.block.size());
         self.stats.recordKeysWritten(level, st.block.count);
     }
 
     pub fn get(self: Self, level: usize) []const *SSTable {
+        // TODO: Update thread safety
         if (level >= self.num_levels) {
             return &[_]*SSTable{};
         }
@@ -712,7 +745,7 @@ pub const SSTableStore = struct {
     pub fn flush(self: *Self, alloc: Allocator, mtable: *Memtable) !void {
         const start_time = std.time.nanoTimestamp();
 
-        var sstable = try SSTable.init(alloc, mtable.getId(), self.opts);
+        var sstable = try SSTable.init(alloc, 0, self.opts);
         errdefer alloc.destroy(sstable);
         errdefer sstable.deinit();
 
@@ -736,15 +769,37 @@ pub const SSTableStore = struct {
             keys_written += 1;
         }
 
-        sstable.flush() catch |err| @panic(@errorName(err));
+        if (!sstable.connected and sstable.mutable) {
+            try sstable.block.freeze();
+
+            const sz = sstable.block.size();
+
+            const filename = try std.fmt.allocPrint(
+                alloc,
+                "{s}/{s}.dat",
+                .{ sstable.data_dir, sstable.id },
+            );
+            defer alloc.free(filename);
+
+            const out_file = try file_utils.openAndTruncate(filename, sz);
+            try sstable.open(out_file);
+
+            _ = sstable.block.flush(&sstable.stream.buf) catch |err| {
+                @panic(@errorName(err));
+            };
+
+            sstable.file.sync() catch |err| @panic(@errorName(err));
+
+            sstable.mutable = false;
+        }
 
         mtable.isFlushed.store(true, .release);
 
-        try self.add(sstable, 0); // Add to level 0
+        try self.add(sstable, 0);
 
-        // Record write latency
         const end_time = std.time.nanoTimestamp();
         const latency = @as(u64, @intCast(end_time - start_time));
+
         self.stats.updateWriteLatency(0, latency);
         self.stats.recordKeysWritten(0, keys_written);
     }
@@ -777,20 +832,33 @@ pub const SSTable = struct {
         mutable,
     };
 
-    pub fn init(alloc: Allocator, id: []const u8, opts: Opts) !*Self {
+    pub fn init(alloc: Allocator, level: usize, opts: Opts) !*Self {
         const block = try Block.init(alloc, opts.sst_capacity);
+        errdefer {
+            block.deinit();
+            alloc.destroy(block);
+        }
+
+        const sstid = try std.fmt.allocPrint(
+            alloc,
+            "level-{d}_{d}",
+            .{ level, std.time.milliTimestamp() },
+        );
+        errdefer alloc.free(sstid);
+
         const st = try alloc.create(Self);
         st.* = .{
             .alloc = alloc,
             .block = block,
             .capacity = opts.sst_capacity,
-            .connected = false,
             .data_dir = opts.data_dir,
-            .file = undefined,
-            .id = id,
+            .id = sstid,
             .mutable = true,
+            .connected = false,
+            .file = undefined,
             .stream = undefined,
         };
+
         return st;
     }
 
@@ -802,6 +870,7 @@ pub const SSTable = struct {
             self.alloc.destroy(self.stream);
             self.file.close();
         }
+        self.alloc.free(self.id);
         self.* = undefined;
     }
 
@@ -921,46 +990,6 @@ pub const SSTable = struct {
         it.* = .{ .alloc = alloc, .block = self.block };
         return Iterator(KV).init(it, SSTableIterator.next, SSTableIterator.deinit);
     }
-
-    pub fn flush(self: *Self) !void {
-        if (!self.connected and self.mutable) {
-            try self.block.freeze();
-
-            const sz = self.block.size();
-
-            const filename = try std.fmt.allocPrint(
-                self.alloc,
-                "{s}/level-0_{s}_{d}.dat",
-                .{ self.data_dir, self.id, sz },
-            );
-            defer self.alloc.free(filename);
-
-            const out_file = try file_utils.openAndTruncate(filename, sz);
-            try self.open(out_file);
-
-            _ = self.block.flush(&self.stream.buf) catch |err| {
-                print(
-                    "sstable not able to flush {s} block with count {d}: {s}\n",
-                    .{ filename, self.block.count, @errorName(err) },
-                );
-                return err;
-            };
-
-            self.file.sync() catch |err| {
-                const meta = try self.file.metadata();
-                print(
-                    "sstable fsync failed: {s} : meta: kind {} size {d} perms {}",
-                    .{ @errorName(err), meta.kind(), meta.size(), meta.permissions() },
-                );
-            };
-
-            self.mutable = false;
-
-            return;
-        }
-
-        return Error.WriteError;
-    }
 };
 
 test SSTable {
@@ -976,7 +1005,7 @@ test SSTable {
     dopts.data_dir = pathname;
 
     // given
-    var st = try SSTable.init(alloc, "1", dopts);
+    var st = try SSTable.init(alloc, 0, dopts);
     defer alloc.destroy(st);
     defer st.deinit();
 
@@ -1005,8 +1034,6 @@ test SSTable {
     const nxt_actual = siter.next();
 
     try testing.expectEqualStrings(akv.value, nxt_actual.?.value);
-
-    _ = try st.flush();
 }
 
 test "CompactionStrategies" {
@@ -1020,10 +1047,9 @@ test "CompactionStrategies" {
 
     const CompactionStrategy = SSTableStore.CompactionStrategy;
 
-    // Helper function to create a test SSTable with some data
     const createTestSSTable = struct {
-        fn create(a: Allocator, id: []const u8, opts: Opts) !*SSTable {
-            var table = try SSTable.init(a, id, opts);
+        fn create(a: Allocator, level: usize, opts: Opts) !*SSTable {
+            var table = try SSTable.init(a, level, opts);
             errdefer {
                 table.deinit();
                 a.destroy(table);
@@ -1038,7 +1064,6 @@ test "CompactionStrategies" {
         }
     }.create;
 
-    // Helper to verify compaction results
     const verifyCompactionResults = struct {
         fn verify(a: Allocator, tm: *SSTableStore, level: usize, expectedCount: usize) !void {
             const tables = tm.get(level);
@@ -1069,10 +1094,10 @@ test "CompactionStrategies" {
         var tm = try SSTableStore.init(talloc, dopts);
         defer tm.deinit(talloc);
 
-        const table1 = try createTestSSTable(talloc, "test1", dopts);
+        const table1 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table1, 0);
 
-        const table2 = try createTestSSTable(talloc, "test2", dopts);
+        const table2 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table2, 0);
 
         try tm.compact(0);
@@ -1092,10 +1117,10 @@ test "CompactionStrategies" {
         var tm = try SSTableStore.init(talloc, dopts);
         defer tm.deinit(talloc);
 
-        const table1 = try createTestSSTable(talloc, "test1", dopts);
+        const table1 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table1, 0);
 
-        const table2 = try createTestSSTable(talloc, "test2", dopts);
+        const table2 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table2, 0);
 
         try tm.compact(0);
@@ -1148,10 +1173,10 @@ test "CompactionStrategies" {
         var tm = try SSTableStore.init(talloc, dopts);
         defer tm.deinit(talloc);
 
-        const table1 = try createTestSSTable(talloc, "test1", dopts);
+        const table1 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table1, 0);
 
-        const table2 = try createTestSSTable(talloc, "test2", dopts);
+        const table2 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table2, 0);
 
         const custom_strategy = try talloc.create(CustomCompactionStrategy);
