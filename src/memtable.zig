@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const ba = @import("bump_allocator.zig");
 const file_utils = @import("file.zig");
 const keyvalue = @import("kv.zig");
 const iter = @import("iterator.zig");
@@ -16,8 +17,9 @@ const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
 const Opts = options.Opts;
 const SkipList = skl.SkipList;
+const ThreadSafeBumpAllocator = ba.ThreadSafeBumpAllocator;
 
-const KeyValueSkipList = SkipList([]const u8, keyvalue.decode, keyvalue.encode);
+const KeyValueSkipList = SkipList(KV, keyvalue.decode, keyvalue.encode);
 
 const assert = std.debug.assert;
 const print = std.debug.print;
@@ -26,6 +28,7 @@ var mtx: Mutex = .{};
 
 pub const Memtable = struct {
     init_alloc: Allocator,
+    bump_alloc: *ThreadSafeBumpAllocator,
     cap: usize,
     id: []const u8,
     opts: Opts,
@@ -49,12 +52,21 @@ pub const Memtable = struct {
         const id_copy = try alloc.alloc(u8, id.len);
         @memcpy(id_copy, id);
 
+        const byte_allocator = try alloc.create(ThreadSafeBumpAllocator);
+        errdefer byte_allocator.deinit();
+
+        byte_allocator.* = ThreadSafeBumpAllocator.init(alloc, 1096) catch |err| {
+            std.log.err("unable to init bump allocator {s}", .{@errorName(err)});
+            return err;
+        };
+
         const map = try alloc.create(KeyValueSkipList);
-        map.* = try KeyValueSkipList.init(alloc);
+        map.* = try KeyValueSkipList.init(byte_allocator.allocator());
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
             .init_alloc = alloc,
+            .bump_alloc = byte_allocator,
             .cap = cap,
             .id = id_copy,
             .opts = opts,
@@ -70,6 +82,8 @@ pub const Memtable = struct {
         const data = self.data.load(acquire);
         self.init_alloc.destroy(data);
         self.init_alloc.free(self.id);
+        self.bump_alloc.deinit();
+        self.init_alloc.destroy(self.bump_alloc);
         self.* = undefined;
     }
 
@@ -83,16 +97,12 @@ pub const Memtable = struct {
         }
 
         var data = self.data.load(acquire);
-        try data.put(item.key, item.value);
+        try data.put(item.key, item);
         _ = self.byte_count.fetchAdd(item.len(), release);
     }
 
     pub fn get(self: Self, key: []const u8) ?KV {
-        const value = self.data.load(acquire).get(key) catch |err| {
-            print("key {s} {s}\n", .{ key, @errorName(err) });
-            return null;
-        };
-        return KV.init(key, value);
+        return self.data.load(acquire).get(key) catch return null;
     }
 
     pub fn count(self: Self) usize {
@@ -128,7 +138,7 @@ pub const Memtable = struct {
         pub fn next(ctx: *anyopaque) ?KV {
             const self: *MemtableIterator = @ptrCast(@alignCast(ctx));
             if (self.iter.next()) |nxt| {
-                return KV.init(nxt.key, nxt.value);
+                return nxt.value.*;
             }
             return null;
         }

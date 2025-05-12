@@ -27,7 +27,7 @@ const usage =
 ;
 
 pub const std_options = .{
-    .log_level = .debug,
+    .log_level = .info,
 };
 
 pub fn main() !void {
@@ -303,7 +303,7 @@ const MultiThreadedImpl = struct {
             defer wg.finish();
 
             for (items) |item| {
-                var kv: KV = .{ .key = undefined, .value = undefined };
+                var kv: KV = .{ .key = undefined, .value = undefined, .timestamp = 0 };
                 kv.decode(item) catch |err| {
                     debug.print(
                         "not able to decode kv {s} {any}\n",
@@ -432,7 +432,7 @@ const MultiProcessImpl = struct {
 
                 var count: usize = 0;
                 while (inbox.next()) |item| {
-                    var kv: KV = .{ .key = undefined, .value = undefined };
+                    var kv: KV = .{ .key = undefined, .value = undefined, .timestamp = 0 };
                     kv.decode(item) catch |err| {
                         debug.print(
                             "not able to decode kv {s} {any}\n",

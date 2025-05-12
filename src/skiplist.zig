@@ -63,11 +63,11 @@ pub fn SkipList(
 
         pub fn put(self: *Self, key: []const u8, value: V) !void {
             const v = try encodeFn(self.alloc, value);
-            // defer self.alloc.free(v);
+            defer self.alloc.free(v);
 
             const result = c.skiplist_insert(self.impl, key.ptr, key.len, v.ptr, v.len);
             if (result != 0) {
-                print("not able to insert {d}\n", .{result});
+                std.log.err("not able to insert {d}", .{result});
                 return SkipListError.FailedInsert;
             }
         }
@@ -75,7 +75,7 @@ pub fn SkipList(
         pub const Item = struct {
             data: []const u8,
             key: []const u8,
-            value: V,
+            value: *V,
         };
 
         const SkiplistIterator = struct {
@@ -94,11 +94,12 @@ pub fn SkipList(
 
             pub fn deinit(ctx: *anyopaque) void {
                 const self: *SkiplistIterator = @ptrCast(@alignCast(ctx));
-                c.skiplist_iterator_free(self.impl);
-                for (self.items.items) |item| {
-                    self.alloc.free(item.data);
+                for (self.items.items) |val| {
+                    self.alloc.free(val.data);
+                    self.alloc.destroy(val.value);
                 }
                 self.items.deinit();
+                c.skiplist_iterator_free(self.impl);
                 self.alloc.destroy(self);
             }
 
@@ -122,27 +123,31 @@ pub fn SkipList(
                     // No more elements
                     return null;
                 } else if (result != 0) {
-                    print("skiplist iterator error: {d}\n", .{result});
+                    std.log.err("skiplist iterator error: {d}", .{result});
                     return null;
                 }
 
-                const val = decodeFn(value_buffer[0..value_len]) catch |err| {
-                    print("not able to decode value {s}\n", .{@errorName(err)});
+                const byts = it.alloc.alloc(u8, value_len) catch unreachable;
+                std.mem.copyForwards(u8, byts, value_buffer[0..value_len]);
+
+                const next_val = it.alloc.create(V) catch |err| {
+                    std.log.err("not able to create value {s}", .{@errorName(err)});
                     return null;
                 };
 
-                const byts = it.alloc.alloc(u8, key_len + value_len) catch unreachable;
-                std.mem.copyForwards(u8, byts[0..key_len], key_buffer[0..key_len]);
-                std.mem.copyForwards(u8, byts[key_len..], val);
+                next_val.* = decodeFn(byts) catch |err| {
+                    std.log.err("not able to decode value {s}", .{@errorName(err)});
+                    return null;
+                };
 
                 const item: Item = .{
                     .data = byts,
-                    .key = byts[0..key_len],
-                    .value = byts[key_len..],
+                    .key = next_val.key,
+                    .value = next_val,
                 };
 
                 it.items.append(item) catch |err| {
-                    print("skiplist iterator error: {s}\n", .{@errorName(err)});
+                    std.log.err("skiplist iterator error: {s}", .{@errorName(err)});
                     return null;
                 };
 
@@ -167,7 +172,7 @@ test SkipList {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var skl = try SkipList([]const u8, kv.decode, kv.encode).init(alloc);
+    var skl = try SkipList(KV, kv.decode, kv.encode).init(alloc);
     defer skl.deinit();
 
     const key: []const u8 = "__key__";
@@ -175,22 +180,22 @@ test SkipList {
     {
         const expected = KV.init(key, "__value__");
 
-        try skl.put(key, expected.value);
+        try skl.put(key, expected);
 
         const actual = try skl.get(key);
 
-        try testing.expectEqualStrings(expected.value, actual);
+        try testing.expectEqualStrings(expected.value, actual.value);
     }
 
     {
         const expected = KV.init(key, "__new_value__");
 
-        try skl.put(key, expected.value);
+        try skl.put(key, expected);
 
         const actual = try skl.get(key);
 
         try testing.expectEqual(skl.count(), 1);
-        try testing.expectEqualStrings(expected.value, actual);
+        try testing.expectEqualStrings(expected.value, actual.value);
     }
 }
 
@@ -203,7 +208,7 @@ test "SkipList.Iterator" {
 
     const alloc = arena.allocator();
 
-    var skl = try SkipList([]const u8, kv.decode, kv.encode).init(ta);
+    var skl = try SkipList(KV, kv.decode, kv.encode).init(ta);
     defer skl.deinit();
 
     const entries = [_]KV{
@@ -212,10 +217,10 @@ test "SkipList.Iterator" {
         KV.init("c", "c"),
     };
     for (entries) |entry| {
-        try skl.put(entry.key, entry.value);
+        try skl.put(entry.key, entry);
     }
 
-    var actual = std.ArrayList([]const u8).init(alloc);
+    var actual = std.ArrayList(*KV).init(alloc);
     defer actual.deinit();
 
     var it = try skl.iterator(alloc);
@@ -226,5 +231,5 @@ test "SkipList.Iterator" {
     }
 
     try testing.expectEqual(3, actual.items.len);
-    try testing.expectEqualStrings("a", actual.items[0]);
+    try testing.expectEqualStrings("a", actual.items[0].key);
 }

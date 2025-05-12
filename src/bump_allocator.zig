@@ -46,6 +46,10 @@ pub const ThreadSafeBumpAllocator = struct {
             self.alloc.free(chunk);
         }
         self.chunks.deinit();
+
+        for (self.free_chunks.items) |chunk| {
+            self.alloc.free(chunk);
+        }
         self.free_chunks.deinit();
     }
 

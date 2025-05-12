@@ -82,8 +82,9 @@ pub fn main() !void {
     defer it.deinit();
 
     var count: usize = 0;
-    while (it.next()) |_| {
+    while (it.next()) |kv| {
         count += 1;
+        std.log.info("{s}", .{kv});
     }
 
     std.log.info("total rows {d}", .{count});

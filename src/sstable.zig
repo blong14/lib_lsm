@@ -39,6 +39,7 @@ pub const SSTableStore = struct {
     num_levels: usize,
     compaction_strategy: CompactionStrategy,
     stats: LevelStats,
+    mutex: std.Thread.Mutex = .{},
 
     const Level = struct {
         pub const Error = error{InvalidLevel};
@@ -114,25 +115,55 @@ pub const SSTableStore = struct {
         };
     }
 
-    pub fn setCompactionStrategy(self: *Self, alloc: Allocator, strategy: CompactionStrategy) void {
-        self.compaction_strategy.deinit(alloc);
-        self.compaction_strategy = strategy;
+    pub fn clearAndFree(self: *Self, alloc: Allocator, level: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+
+        const malloc = arena.allocator();
+
+        const level_to_clear = self.levels.items[level];
+
+        for (level_to_clear.items) |table| {
+            const fln = try std.fmt.allocPrint(
+                malloc,
+                "{s}/{s}.dat",
+                .{ table.data_dir, table.id },
+            );
+
+            table.deinit();
+            alloc.destroy(table);
+
+            file_utils.delete(fln) catch |err| {
+                std.log.warn("file deletion failed for {s} {s}", .{ fln, @errorName(err) });
+            };
+        }
+
+        self.levels.items[level].clearAndFree();
+
+        _ = self.stats.files_count[level].store(0, .monotonic);
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        for (self.levels.items) |*level| {
-            for (level.items) |sstable| {
-                sstable.deinit();
-                alloc.destroy(sstable);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            for (self.levels.items) |*level| {
+                for (level.items) |sstable| {
+                    sstable.deinit();
+                    alloc.destroy(sstable);
+                }
+                level.deinit();
             }
-            level.deinit();
         }
 
         self.compaction_strategy.deinit(alloc);
         self.levels.deinit();
         self.stats.printStats();
         self.stats.deinit();
-        self.* = undefined;
     }
 
     pub fn open(self: *Self, alloc: Allocator) !void {
@@ -169,6 +200,11 @@ pub const SSTableStore = struct {
 
             alloc.free(nxt_file);
         }
+    }
+
+    pub fn setCompactionStrategy(self: *Self, alloc: Allocator, strategy: CompactionStrategy) void {
+        self.compaction_strategy.deinit(alloc);
+        self.compaction_strategy = strategy;
     }
 
     // Statistics tracking for each level to support compaction decisions
@@ -586,32 +622,7 @@ pub const SSTableStore = struct {
 
                 try tm.add(new_table, next_level);
 
-                var tables_to_remove = try std.ArrayList(*SSTable).initCapacity(
-                    malloc,
-                    tables.len,
-                );
-                defer tables_to_remove.deinit();
-
-                for (tables) |table| {
-                    try tables_to_remove.append(table);
-                }
-
-                for (tables_to_remove.items) |table| {
-                    const fln = try std.fmt.allocPrint(
-                        malloc,
-                        "{s}/{s}.dat",
-                        .{ table.data_dir, table.id },
-                    );
-
-                    table.deinit();
-                    self.alloc.destroy(table);
-
-                    try file_utils.delete(fln);
-                }
-
-                // TODO: Update thread safety
-                tm.levels.items[level].clearAndFree();
-                _ = tm.stats.files_count[level].store(0, .monotonic);
+                try tm.clearAndFree(self.alloc, level);
 
                 tm.stats.recordBytesRead(level, bytes_read);
 
@@ -622,6 +633,7 @@ pub const SSTableStore = struct {
                     "[simple] compacted {d} keys from level {d} to level {d} {d:.2} ms",
                     .{ count, level, next_level, latency / std.time.ns_per_ms },
                 );
+
                 try tm.stats.setCustomMetric("last_compaction_duration_ns", latency);
             } else {
                 new_table.deinit();
@@ -688,8 +700,12 @@ pub const SSTableStore = struct {
             return error.InvalidLevel;
         }
 
-        // TODO: Update thread safety
-        try self.levels.items[level].append(st);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            try self.levels.items[level].append(st);
+        }
 
         _ = self.stats.files_count[level].fetchAdd(1, .monotonic);
 
@@ -697,11 +713,13 @@ pub const SSTableStore = struct {
         self.stats.recordKeysWritten(level, st.block.count);
     }
 
-    pub fn get(self: Self, level: usize) []const *SSTable {
-        // TODO: Update thread safety
+    pub fn get(self: *Self, level: usize) []const *SSTable {
         if (level >= self.num_levels) {
             return &[_]*SSTable{};
         }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         return self.levels.items[level].items;
     }
@@ -863,15 +881,18 @@ pub const SSTable = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.block.deinit();
-        self.alloc.destroy(self.block);
         if (self.connected) {
             self.stream.deinit();
             self.alloc.destroy(self.stream);
             self.file.close();
         }
-        self.alloc.free(self.id);
-        self.* = undefined;
+
+        self.block.deinit();
+        self.alloc.destroy(self.block);
+
+        if (self.id.len > 0) {
+            self.alloc.free(self.id);
+        }
     }
 
     pub fn open(self: *Self, file: File) !void {

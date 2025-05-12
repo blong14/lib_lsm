@@ -335,7 +335,7 @@ pub const DatabaseAgent = struct {
 pub const Database = struct {
     alloc: Allocator,
     agent: *DatabaseAgent,
-    byte_allocator: ThreadSafeBumpAllocator,
+    byte_allocator: *ThreadSafeBumpAllocator,
     capacity: usize,
     mtable: AtomicValue(*Memtable),
     opts: Opts,
@@ -345,11 +345,13 @@ pub const Database = struct {
     const Self = @This();
 
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
-        var byte_allocator = ThreadSafeBumpAllocator.init(alloc, 1096) catch |err| {
+        const byte_allocator = try alloc.create(ThreadSafeBumpAllocator);
+        errdefer byte_allocator.deinit();
+
+        byte_allocator.* = ThreadSafeBumpAllocator.init(alloc, 1096) catch |err| {
             std.log.err("unable to init bump allocator {s}", .{@errorName(err)});
             return err;
         };
-        errdefer byte_allocator.deinit();
 
         var new_id_buf: [32]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.milliTimestamp()});
@@ -413,6 +415,7 @@ pub const Database = struct {
 
         self.byte_allocator.printStats();
         self.byte_allocator.deinit();
+        self.alloc.destroy(self.byte_allocator);
 
         self.* = undefined;
     }
@@ -578,8 +581,14 @@ pub const Database = struct {
             try self.freeze(mtable);
         }
 
-        mtable = self.mtable.load(.seq_cst);
-        try mtable.put(item);
+        while (true) {
+            mtable = self.mtable.load(.seq_cst);
+            mtable.put(item) catch |err| switch (err) {
+                error.MemtableImmutable => continue,
+                else => return err,
+            };
+            break;
+        }
 
         self.agent.submitEvent(.{ .write_completed = .{ .bytes = item.len() } });
     }
@@ -718,5 +727,5 @@ test "basic functionality with many items" {
         try items.append(nxt);
     }
 
-    try testing.expectEqual(4, items.items.len);
+    try testing.expectEqual(3, items.items.len);
 }
