@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const mem = std.mem;
-
 const blk = @import("block.zig");
 const iter = @import("iterator.zig");
 const keyvalue = @import("kv.zig");
@@ -13,6 +11,7 @@ const file_utils = @import("file.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const File = std.fs.File;
+const AtomicU32 = std.atomic.Value(u32);
 
 const Block = blk.Block;
 const Iterator = iter.Iterator;
@@ -23,7 +22,6 @@ const MMap = mmap.AppendOnlyMMap;
 const Opts = options.Opts;
 
 const Endian = std.builtin.Endian.little;
-const PageSize = std.mem.page_size;
 
 const assert = std.debug.assert;
 const bufPrint = std.fmt.bufPrint;
@@ -116,32 +114,37 @@ pub const SSTableStore = struct {
     }
 
     pub fn clearAndFree(self: *Self, alloc: Allocator, level: usize) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
 
         const malloc = arena.allocator();
 
-        const level_to_clear = self.levels.items[level];
+        var tables_to_release = ArrayList(*SSTable).init(malloc);
+        defer tables_to_release.deinit();
 
-        for (level_to_clear.items) |table| {
-            const fln = try std.fmt.allocPrint(
-                malloc,
-                "{s}/{s}.dat",
-                .{ table.data_dir, table.id },
-            );
+        try tables_to_release.appendSlice(self.get(level));
 
-            table.deinit();
-            alloc.destroy(table);
+        std.log.debug("releasing {d} tables", .{tables_to_release.items.len});
+        for (tables_to_release.items) |table| {
+            if (table.release()) {
+                const fln = try std.fmt.allocPrint(
+                    malloc,
+                    "{s}/{s}.dat",
+                    .{ table.data_dir, table.id },
+                );
 
-            file_utils.delete(fln) catch |err| {
-                std.log.warn("file deletion failed for {s} {s}", .{ fln, @errorName(err) });
-            };
+                table.deinit();
+                alloc.destroy(table);
+
+                file_utils.delete(fln) catch |err| {
+                    std.log.warn("file deletion failed for {s} {s}", .{ fln, @errorName(err) });
+                };
+            }
         }
 
-        self.levels.items[level].clearAndFree();
+        self.mutex.lock();
+        self.levels.items[level].clearRetainingCapacity();
+        self.mutex.unlock();
 
         _ = self.stats.files_count[level].store(0, .monotonic);
     }
@@ -153,8 +156,11 @@ pub const SSTableStore = struct {
 
             for (self.levels.items) |*level| {
                 for (level.items) |sstable| {
-                    sstable.deinit();
-                    alloc.destroy(sstable);
+                    // Release our reference and only destroy if it was the last one
+                    if (sstable.release()) {
+                        sstable.deinit();
+                        alloc.destroy(sstable);
+                    }
                 }
                 level.deinit();
             }
@@ -189,13 +195,14 @@ pub const SSTableStore = struct {
                 else => return err,
             };
 
-            var filename_parts = mem.split(u8, f.basename, "_");
+            var filename_parts = std.mem.split(u8, f.basename, "_");
             const level_name = filename_parts.first();
             const level = try Level.fromString(level_name);
 
             var sstable = try SSTable.init(alloc, level, self.opts);
             try sstable.open(data_file);
 
+            _ = sstable.release();
             try self.add(sstable, level);
 
             alloc.free(nxt_file);
@@ -582,6 +589,11 @@ pub const SSTableStore = struct {
             var bytes_read: u64 = 0;
 
             for (tables) |table| {
+                table.retain();
+                defer {
+                    _ = table.release();
+                }
+
                 bytes_read += table.block.size();
 
                 var it = try table.iterator(self.alloc);
@@ -613,13 +625,24 @@ pub const SSTableStore = struct {
                 try new_table.open(out_file);
 
                 _ = new_table.block.flush(&new_table.stream.buf) catch |err| {
-                    @panic(@errorName(err));
+                    std.log.err(
+                        "not able to flush block {s} for file {s}",
+                        .{ @errorName(err), filename },
+                    );
+                    return err;
                 };
 
-                new_table.file.sync() catch |err| @panic(@errorName(err));
+                new_table.file.sync() catch |err| {
+                    std.log.err(
+                        "not able to file sync {s} for file {s}",
+                        .{ @errorName(err), filename },
+                    );
+                    return err;
+                };
 
                 new_table.mutable = false;
 
+                _ = new_table.release();
                 try tm.add(new_table, next_level);
 
                 try tm.clearAndFree(self.alloc, level);
@@ -704,6 +727,8 @@ pub const SSTableStore = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
 
+            // Increment reference count when adding to a level
+            st.retain();
             try self.levels.items[level].append(st);
         }
 
@@ -724,14 +749,39 @@ pub const SSTableStore = struct {
         return self.levels.items[level].items;
     }
 
+    pub fn read(self: *Self, key: []const u8, kv: *KV) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (0..self.num_levels) |level| {
+            for (self.levels.items[level].items) |sstable| {
+                sstable.read(key, kv) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                return;
+            }
+        }
+
+        return error.NotFound;
+    }
+
     const LevelIterator = struct {
         alloc: Allocator,
         iter: Iterator(KV),
         merger: *MergeIterator(KV, keyvalue.compare),
+        used_tables: ArrayList(*SSTable),
 
         pub fn deinit(ctx: *anyopaque) void {
             const self: *LevelIterator = @ptrCast(@alignCast(ctx));
             self.iter.deinit();
+
+            // Release all tables we were using
+            for (self.used_tables.items) |table| {
+                _ = table.release();
+            }
+            self.used_tables.deinit();
+
             self.alloc.destroy(self.merger);
             self.alloc.destroy(self);
         }
@@ -746,16 +796,29 @@ pub const SSTableStore = struct {
         var merger = try alloc.create(MergeIterator(KV, keyvalue.compare));
         merger.* = try MergeIterator(KV, keyvalue.compare).init(alloc);
 
+        // Create a list to track all tables we're using
+        var used_tables = ArrayList(*SSTable).init(alloc);
+        errdefer used_tables.deinit();
+
         var level_idx: usize = 0;
         while (level_idx < self.num_levels) : (level_idx += 1) {
             for (self.get(level_idx)) |sstable| {
+                // Retain the table while the iterator is active
+                sstable.retain();
+                try used_tables.append(sstable);
+
                 const siter = try sstable.iterator(alloc);
                 try merger.add(siter);
             }
         }
 
         const it = try alloc.create(LevelIterator);
-        it.* = .{ .alloc = alloc, .merger = merger, .iter = merger.iterator() };
+        it.* = .{
+            .alloc = alloc,
+            .merger = merger,
+            .iter = merger.iterator(),
+            .used_tables = used_tables,
+        };
 
         return Iterator(KV).init(it, LevelIterator.next, LevelIterator.deinit);
     }
@@ -777,8 +840,8 @@ pub const SSTableStore = struct {
             _ = sstable.write(nxt) catch |err| switch (err) {
                 error.DuplicateError => continue,
                 else => {
-                    print(
-                        "memtable not able to write to sstable for key {s}: {s}\n",
+                    std.log.err(
+                        "memtable not able to write to sstable for key {s}: {s}",
                         .{ nxt.key, @errorName(err) },
                     );
                     return err;
@@ -803,16 +866,27 @@ pub const SSTableStore = struct {
             try sstable.open(out_file);
 
             _ = sstable.block.flush(&sstable.stream.buf) catch |err| {
-                @panic(@errorName(err));
+                std.log.err(
+                    "block flush failed {s} {s}",
+                    .{ sstable.id, @errorName(err) },
+                );
+                return err;
             };
 
-            sstable.file.sync() catch |err| @panic(@errorName(err));
+            sstable.file.sync() catch |err| {
+                std.log.err(
+                    "file synced failed {s} {s}",
+                    .{ sstable.id, @errorName(err) },
+                );
+                return err;
+            };
 
             sstable.mutable = false;
         }
 
         mtable.isFlushed.store(true, .release);
 
+        _ = sstable.release();
         try self.add(sstable, 0);
 
         const end_time = std.time.nanoTimestamp();
@@ -834,6 +908,7 @@ pub const SSTable = struct {
     id: []const u8,
     mutable: bool,
     stream: *MMap,
+    ref_count: AtomicU32,
 
     const Self = @This();
 
@@ -875,6 +950,7 @@ pub const SSTable = struct {
             .connected = false,
             .file = undefined,
             .stream = undefined,
+            .ref_count = AtomicU32.init(1), // Initialize with 1 reference
         };
 
         return st;
@@ -893,6 +969,20 @@ pub const SSTable = struct {
         if (self.id.len > 0) {
             self.alloc.free(self.id);
         }
+    }
+
+    pub fn retain(self: *Self) void {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+    }
+
+    pub fn release(self: *Self) bool {
+        const prev = self.ref_count.fetchSub(1, .monotonic);
+        // Return true if this was the last reference
+        return prev == 1;
+    }
+
+    pub fn getRefCount(self: *Self) u32 {
+        return self.ref_count.load(.monotonic);
     }
 
     pub fn open(self: *Self, file: File) !void {
@@ -935,8 +1025,8 @@ pub const SSTable = struct {
             const idx = try stream_reader.readInt(u64, Endian);
 
             const value = self.block.read(idx) catch |err| {
-                print(
-                    "sstable not able to read from block @ offset {d}: {s}\n",
+                std.log.err(
+                    "sstable not able to read from block @ offset {d}: {s}",
                     .{ idx, @errorName(err) },
                 );
                 return err;
@@ -955,13 +1045,15 @@ pub const SSTable = struct {
                 return;
             }
         }
+
+        return error.NotFound;
     }
 
     pub fn write(self: *Self, value: KV) !usize {
         if (self.mutable) {
             const idx = self.block.write(value) catch |err| {
-                print(
-                    "sstable not able to write to block for key {s}: {s}\n",
+                std.log.err(
+                    "sstable not able to write to block for key {s}: {s}",
                     .{ value.key, @errorName(err) },
                 );
                 return err;
@@ -995,7 +1087,7 @@ pub const SSTable = struct {
                 const nxt_offset = readInt(u64, &nxt_offset_byts, Endian);
 
                 kv = self.block.read(nxt_offset) catch |err| {
-                    print("sstable iter error {s}\n", .{@errorName(err)});
+                    std.log.err("sstable iter error {s}", .{@errorName(err)});
                     return null;
                 };
 
@@ -1115,11 +1207,15 @@ test "CompactionStrategies" {
         var tm = try SSTableStore.init(talloc, dopts);
         defer tm.deinit(talloc);
 
-        const table1 = try createTestSSTable(talloc, 0, dopts);
+        // Create tables and add them to the store
+        // The tables are now managed by the store with reference counting
+        var table1 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table1, 0);
+        _ = table1.release();
 
-        const table2 = try createTestSSTable(talloc, 0, dopts);
+        var table2 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table2, 0);
+        _ = table2.release();
 
         try tm.compact(0);
 
@@ -1138,11 +1234,15 @@ test "CompactionStrategies" {
         var tm = try SSTableStore.init(talloc, dopts);
         defer tm.deinit(talloc);
 
-        const table1 = try createTestSSTable(talloc, 0, dopts);
+        var table1 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table1, 0);
+        // Release our reference since the store now has one
+        _ = table1.release();
 
-        const table2 = try createTestSSTable(talloc, 0, dopts);
+        var table2 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table2, 0);
+        // Release our reference since the store now has one
+        _ = table2.release();
 
         try tm.compact(0);
 
@@ -1180,6 +1280,7 @@ test "CompactionStrategies" {
                 // Move all tables to the next level
                 const next_level = level + 1;
                 for (tables) |table| {
+                    _ = table.release();
                     try tm.add(table, next_level);
                 }
 
@@ -1194,11 +1295,13 @@ test "CompactionStrategies" {
         var tm = try SSTableStore.init(talloc, dopts);
         defer tm.deinit(talloc);
 
-        const table1 = try createTestSSTable(talloc, 0, dopts);
+        var table1 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table1, 0);
+        _ = table1.release();
 
-        const table2 = try createTestSSTable(talloc, 0, dopts);
+        var table2 = try createTestSSTable(talloc, 0, dopts);
         try tm.add(table2, 0);
+        _ = table2.release();
 
         const custom_strategy = try talloc.create(CustomCompactionStrategy);
         custom_strategy.* = CustomCompactionStrategy.init(talloc);
