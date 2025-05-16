@@ -1,17 +1,13 @@
 const std = @import("std");
 
 const ba = @import("bump_allocator.zig");
-const file_utils = @import("file.zig");
 const keyvalue = @import("kv.zig");
 const iter = @import("iterator.zig");
 const options = @import("opts.zig");
-const tbm = @import("tablemap.zig");
 const skl = @import("skiplist.zig");
 
 const Allocator = std.mem.Allocator;
 const AtomicValue = std.atomic.Value;
-const File = std.fs.File;
-const Mutex = std.Thread.Mutex;
 
 const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
@@ -20,11 +16,6 @@ const SkipList = skl.SkipList;
 const ThreadSafeBumpAllocator = ba.ThreadSafeBumpAllocator;
 
 const KeyValueSkipList = SkipList(KV, keyvalue.decode, keyvalue.encode);
-
-const assert = std.debug.assert;
-const print = std.debug.print;
-
-var mtx: Mutex = .{};
 
 pub const Memtable = struct {
     init_alloc: Allocator,
@@ -38,35 +29,21 @@ pub const Memtable = struct {
     mutable: AtomicValue(bool),
     isFlushed: AtomicValue(bool),
 
-    // Memory ordering constants for better readability
-    const relaxed = .monotonic;
-    const acquire = .acquire;
-    const release = .release;
-    const seq_cst = .seq_cst;
-
     const Self = @This();
 
-    pub fn init(alloc: Allocator, id: []const u8, opts: Opts) !*Self {
+    pub fn init(alloc: Allocator, byte_alloc: *ThreadSafeBumpAllocator, id: []const u8, opts: Opts) !*Self {
         const cap = opts.sst_capacity;
 
         const id_copy = try alloc.alloc(u8, id.len);
         @memcpy(id_copy, id);
 
-        const byte_allocator = try alloc.create(ThreadSafeBumpAllocator);
-        errdefer byte_allocator.deinit();
-
-        byte_allocator.* = ThreadSafeBumpAllocator.init(alloc, 1096) catch |err| {
-            std.log.err("unable to init bump allocator {s}", .{@errorName(err)});
-            return err;
-        };
-
         const map = try alloc.create(KeyValueSkipList);
-        map.* = try KeyValueSkipList.init(byte_allocator.allocator());
+        map.* = try KeyValueSkipList.init(byte_alloc.allocator());
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
             .init_alloc = alloc,
-            .bump_alloc = byte_allocator,
+            .bump_alloc = byte_alloc,
             .cap = cap,
             .id = id_copy,
             .opts = opts,
@@ -79,11 +56,9 @@ pub const Memtable = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        const data = self.data.load(acquire);
+        const data = self.data.load(.acquire);
         self.init_alloc.destroy(data);
         self.init_alloc.free(self.id);
-        self.bump_alloc.deinit();
-        self.init_alloc.destroy(self.bump_alloc);
         self.* = undefined;
     }
 
@@ -92,37 +67,38 @@ pub const Memtable = struct {
     }
 
     pub fn put(self: *Self, item: KV) !void {
-        if (!self.mutable.load(acquire)) {
+        if (!self.mutable.load(.acquire)) {
             return error.MemtableImmutable;
         }
 
-        var data = self.data.load(acquire);
+        var data = self.data.load(.acquire);
         try data.put(item.key, item);
-        _ = self.byte_count.fetchAdd(item.len(), release);
+
+        _ = self.byte_count.fetchAdd(item.len(), .release);
     }
 
     pub fn get(self: Self, key: []const u8) ?KV {
-        return self.data.load(acquire).get(key) catch return null;
+        return self.data.load(.acquire).get(key) catch return null;
     }
 
     pub fn count(self: Self) usize {
-        return self.data.load(acquire).count();
+        return self.data.load(.acquire).count();
     }
 
     pub fn freeze(self: *Self) void {
-        self.mutable.store(false, release);
+        self.mutable.store(false, .release);
     }
 
     pub fn frozen(self: Self) bool {
-        return !self.mutable.load(acquire);
+        return !self.mutable.load(.acquire);
     }
 
     pub fn flushed(self: Self) bool {
-        return self.isFlushed.load(acquire);
+        return self.isFlushed.load(.acquire);
     }
 
     pub fn size(self: Self) usize {
-        return self.byte_count.load(acquire);
+        return self.byte_count.load(.acquire);
     }
 
     const MemtableIterator = struct {
@@ -146,7 +122,7 @@ pub const Memtable = struct {
 
     pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
         const it = try alloc.create(MemtableIterator);
-        it.* = .{ .alloc = alloc, .iter = try self.data.load(acquire).iterator(alloc) };
+        it.* = .{ .alloc = alloc, .iter = try self.data.load(.acquire).iterator(alloc) };
         return Iterator(KV).init(it, MemtableIterator.next, MemtableIterator.deinit);
     }
 };
@@ -154,14 +130,18 @@ pub const Memtable = struct {
 test Memtable {
     const testing = std.testing;
     const alloc = testing.allocator;
-    const testDir = testing.tmpDir(.{});
 
-    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir_name);
-    defer testDir.dir.deleteTree(dir_name) catch {};
+    const byte_allocator = try alloc.create(ThreadSafeBumpAllocator);
+    defer alloc.destroy(byte_allocator);
+    defer byte_allocator.deinit();
+
+    byte_allocator.* = ThreadSafeBumpAllocator.init(alloc, std.mem.page_size) catch |err| {
+        std.log.err("unable to init bump allocator {s}", .{@errorName(err)});
+        return err;
+    };
 
     // given
-    var mtable = try Memtable.init(alloc, "0", options.withDataDirOpts(dir_name));
+    var mtable = try Memtable.init(alloc, byte_allocator, "0", options.defaultOpts());
     defer alloc.destroy(mtable);
     defer mtable.deinit();
 
