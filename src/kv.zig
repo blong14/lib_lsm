@@ -31,6 +31,12 @@ pub const KV = struct {
         self.* = undefined;
     }
 
+    pub fn internalKey(self: Self, alloc: Allocator) ![]const u8 {
+        const internal_key_buf = try alloc.alloc(u8, std.mem.page_size);
+        const internal_key = try std.fmt.bufPrint(internal_key_buf, "{s}{d}", .{ self.key, self.timestamp });
+        return internal_key;
+    }
+
     pub fn len(self: Self) u64 {
         return @sizeOf(u64) + self.key.len + @sizeOf(u64) + self.value.len + @sizeOf(i64);
     }
@@ -126,10 +132,10 @@ pub const KV = struct {
         _ = fmt;
         _ = options;
 
-        try writer.print("{s}\t{s}\t{d}\t{d}", .{
+        try writer.print("{s}{d}\t{d}\t{d}", .{
             self.key,
-            self.value,
             self.timestamp,
+            self.value,
             self.len(),
         });
     }
