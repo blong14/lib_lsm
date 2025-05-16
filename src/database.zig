@@ -11,7 +11,6 @@ const sst = @import("sstable.zig");
 const tm = @import("tablemap.zig");
 
 const atomic = std.atomic;
-const debug = std.debug;
 const math = std.math;
 const mem = std.mem;
 const testing = std.testing;
@@ -34,8 +33,8 @@ const SSTableStore = sst.SSTableStore;
 
 var mtx: Mutex = .{};
 
+/// Events that can trigger agent decisions
 pub const DatabaseEvent = union(enum) {
-    // Events that can trigger agent decisions
     write_completed: struct { bytes: u64 },
     read_completed: struct { bytes: u64 },
     memtable_frozen: struct { id: []const u8 },
@@ -44,17 +43,17 @@ pub const DatabaseEvent = union(enum) {
     system_idle: struct { duration_ms: u64 },
 };
 
+/// Actions the agent can decide to take
 pub const AgentAction = union(enum) {
-    // Actions the agent can decide to take
     flush_memtable: struct { id: []const u8 },
     compact_level: struct { level: usize },
     no_action: void,
 };
 
+/// Configurable policy parameters
 pub const AgentPolicy = struct {
-    // Configurable policy parameters
     max_level0_files: u32 = 16,
-    max_unflushed_memtables: usize = 2,
+    max_unflushed_memtables: usize = 4,
     min_write_cooldown_ms: u64 = 500,
     compaction_level_threshold: f64 = 0.8,
     idle_compact_threshold_ms: u64 = 5000,
@@ -170,24 +169,34 @@ pub const DatabaseAgent = struct {
         self.action_mutex.lock();
         defer self.action_mutex.unlock();
 
-        while (self.action_queue.readItem()) |action| {
+        if (self.action_queue.readItem()) |action| {
             switch (action) {
                 .flush_memtable => |_| {
                     std.log.debug("flush_memtable", .{});
 
                     self.db.xflush() catch |err| switch (err) {
-                        error.NothingToFlush => continue,
-                        else => @panic(@errorName(err)),
+                        error.NothingToFlush => return,
+                        else => {
+                            std.log.err(
+                                "agent not able to flush memtable {s}",
+                                .{@errorName(err)},
+                            );
+                            return;
+                        },
                     };
                 },
                 .compact_level => |data| {
                     std.log.debug("compact_level {d}", .{data.level});
 
                     self.db.sstables.compact(data.level) catch |err| {
-                        @panic(@errorName(err));
+                        std.log.err(
+                            "agent not able to compact level {d} {s}",
+                            .{ data.level, @errorName(err) },
+                        );
+                        return;
                     };
                 },
-                .no_action => continue,
+                .no_action => return,
             }
         }
     }
@@ -348,15 +357,15 @@ pub const Database = struct {
         const byte_allocator = try alloc.create(ThreadSafeBumpAllocator);
         errdefer byte_allocator.deinit();
 
-        byte_allocator.* = ThreadSafeBumpAllocator.init(alloc, 1096) catch |err| {
+        byte_allocator.* = ThreadSafeBumpAllocator.init(alloc, std.mem.page_size) catch |err| {
             std.log.err("unable to init bump allocator {s}", .{@errorName(err)});
             return err;
         };
 
-        var new_id_buf: [32]u8 = undefined;
-        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.milliTimestamp()});
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        const mtable = Memtable.init(alloc, new_id, opts) catch |err| {
+        const mtable = Memtable.init(alloc, byte_allocator, new_id, opts) catch |err| {
             std.log.err("unable to init memtable {s}", .{@errorName(err)});
             return err;
         };
@@ -430,13 +439,22 @@ pub const Database = struct {
             var siter = try sstable.iterator(self.alloc);
             defer siter.deinit();
 
+            var mtable = self.mtable.load(.seq_cst);
             while (siter.next()) |nxt| {
-                try self.write(nxt.key, nxt.value);
+                try mtable.put(nxt);
             }
 
-            const mtable = self.mtable.load(.seq_cst);
             mtable.isFlushed.store(true, .seq_cst);
-            try self.freeze(mtable);
+            mtable.mutable.store(false, .seq_cst);
+
+            try self.mtables.append(mtable);
+
+            var new_id_buf: [64]u8 = undefined;
+            const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
+
+            const nxt_table = try Memtable.init(self.alloc, self.byte_allocator, new_id, self.opts);
+
+            self.mtable.store(nxt_table, .seq_cst);
         }
 
         std.log.info("database opened @ {s} w/ {d} warm tables", .{ self.opts.data_dir, self.mtables.items.len });
@@ -447,22 +465,26 @@ pub const Database = struct {
             return value;
         }
 
-        mtx.lock();
-        defer mtx.unlock();
+        {
+            mtx.lock();
+            defer mtx.unlock();
 
-        if (self.mtables.items.len > 0) {
-            var idx: usize = self.mtables.items.len - 1;
-            while (idx > 0) {
-                var table = self.mtables.items[idx];
-                if (table.get(key)) |value| {
-                    return value;
+            if (self.mtables.items.len > 0) {
+                var idx: usize = self.mtables.items.len - 1;
+                while (idx > 0) {
+                    var table = self.mtables.items[idx];
+                    if (table.get(key)) |value| {
+                        return value;
+                    }
+                    idx -= 1;
                 }
-                idx -= 1;
             }
-            return error.NotFound;
-        } else {
-            return error.NotFound;
         }
+
+        var kv: KV = undefined;
+        try self.sstables.read(key, &kv);
+
+        return kv;
     }
 
     const MergeIteratorWrapper = struct {
@@ -596,7 +618,15 @@ pub const Database = struct {
     fn memtableCount(self: Self) usize {
         mtx.lock();
         defer mtx.unlock();
-        return self.mtables.items.len;
+
+        var count: usize = 0;
+        for (self.mtables.items) |table| {
+            if (!table.flushed()) {
+                count += 1;
+            }
+        }
+
+        return count;
     }
 
     pub fn flush(self: *Self) void {
@@ -611,37 +641,33 @@ pub const Database = struct {
         defer mtx.unlock();
 
         if (self.mtables.items.len == 0) {
+            std.log.debug("nothing to flush", .{});
             return error.NothingToFlush;
         }
 
-        const hot_table = self.mtable.load(.seq_cst);
-
-        try self.freeze(hot_table);
-
-        for (self.mtables.items) |mtable| {
-            if (!mtable.flushed()) {
-                try self.sstables.flush(self.alloc, mtable);
+        for (self.mtables.items) |table| {
+            if (!table.flushed()) {
+                self.sstables.flush(self.alloc, table) catch |err| {
+                    std.log.err(
+                        "sstables not able to flush mtable {s} {s}",
+                        .{ table.getId(), @errorName(err) },
+                    );
+                    return error.FlushFailed;
+                };
             }
-            mtable.deinit();
-            self.alloc.destroy(mtable);
         }
-
-        self.mtables.clearAndFree();
     }
 
     fn freeze(self: *Self, mtable: *Memtable) !void {
-        if (mtable.frozen()) {
-            return;
-        }
+        if (mtable.frozen()) return;
 
         mtable.freeze();
-
         self.agent.submitEvent(.{ .memtable_frozen = .{ .id = mtable.getId() } });
-        // Generate a new ID that is lexicographically greater than the current one
-        var new_id_buf: [32]u8 = undefined;
-        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.milliTimestamp()});
 
-        const nxt_table = try Memtable.init(self.alloc, new_id, self.opts);
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
+
+        const nxt_table = try Memtable.init(self.alloc, self.byte_allocator, new_id, self.opts);
 
         try self.mtables.append(mtable);
 
