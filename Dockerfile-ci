@@ -11,7 +11,6 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     git \
-    kcov \
     libzmq5-dev \
     libjemalloc-dev \
     pkg-config \
@@ -48,6 +47,9 @@ RUN . /etc/environment && \
     && mkdir -p /usr/local/zig \
     && tar -xf zig.tar.xz -C /usr/local/zig --strip-components=1 \
     && rm zig.tar.xz
+
+COPY --from=kcov/kcov:latest /usr/local/bin/kcov* /usr/local/bin/
+
 ENV PATH="/usr/local/zig:${PATH}"
 
 WORKDIR /app
