@@ -11,9 +11,9 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     git \
-    kcov \
     libzmq5-dev \
     libjemalloc-dev \
+    libdw1 \
     pkg-config \
     wget \
     xz-utils \
@@ -34,6 +34,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
 
 RUN . /etc/environment && \
     curl -sSL "https://golang.org/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" | tar -C /usr/local -xz
+
 ENV PATH="/usr/local/go/bin:${PATH}"
 ENV GOPATH="/go"
 ENV PATH="${GOPATH}/bin:${PATH}"
@@ -48,28 +49,12 @@ RUN . /etc/environment && \
     && mkdir -p /usr/local/zig \
     && tar -xf zig.tar.xz -C /usr/local/zig --strip-components=1 \
     && rm zig.tar.xz
+
+COPY --from=kcov/kcov:latest /usr/local/bin/kcov* /usr/local/bin/
+
 ENV PATH="/usr/local/zig:${PATH}"
 
 WORKDIR /app
 
 COPY . .
 
-RUN zig build -Dcpu=native -Doptimize=ReleaseFast --summary all --verbose go 
-
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y \
-    libzmq5 \
-    libjemalloc2 \
-    --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
-
-ARG TARGETARCH
-LABEL architecture="${TARGETARCH}"
-
-WORKDIR /app
-
-COPY --from=builder /app/zig-out/bin/gopg /usr/local/bin/
-COPY --from=builder /app/zig-out /app/zig-out
-
-ENTRYPOINT ["ls", "/app/zig-out/"]

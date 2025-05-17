@@ -89,6 +89,18 @@ pub fn rust_build(b: *std.Build) *std.Build.Step.Run {
     return cmd;
 }
 
+pub fn kcov(b: *std.Build) *std.Build.Step.Run {
+    const cmd = b.addSystemCommand(
+        &[_][]const u8{
+            "kcov",
+            "--clean",
+            "--include-pattern=src/",
+            b.pathJoin(&.{ b.install_path, "cover" }),
+        },
+    );
+    return cmd;
+}
+
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
@@ -190,6 +202,11 @@ pub fn build(b: *std.Build) void {
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_main_tests.step);
+
+    var run_main_cover = kcov(b);
+    run_main_cover.addArtifactArg(main_tests);
+    const cover_step = b.step("cover", "Generate test coverage report");
+    cover_step.dependOn(&run_main_cover.step);
 
     // make build-integration-tests
     const lsmx = cmds.buildLsm(b, target, optimize);

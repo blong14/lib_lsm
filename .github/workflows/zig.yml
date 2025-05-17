@@ -1,0 +1,38 @@
+name: LSM CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+env:
+  DOCKER_IMAGE_NAME: lsm
+jobs:
+  test:
+    name: Build and Test 
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Environment 
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile-ci
+          push: false
+          load: true
+          tags: ${{ env.DOCKER_IMAGE_NAME }}:latest
+      - name: Run Tests
+        run: |
+          docker run --rm --security-opt seccomp=unconfined \
+            -v ./zig-out/cover:/app/zig-out/cover \
+            ${{ env.DOCKER_IMAGE_NAME }}:latest \
+            make coverage
+      - name: Upload Coverage Report
+        uses: codecov/codecov-action@v5
+        with:
+          directory: zig-out/cover
+          token: ${{ secrets.CODECOV_TOKEN }}
