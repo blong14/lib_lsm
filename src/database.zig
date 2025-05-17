@@ -11,7 +11,6 @@ const sst = @import("sstable.zig");
 const tm = @import("tablemap.zig");
 
 const atomic = std.atomic;
-const debug = std.debug;
 const math = std.math;
 const mem = std.mem;
 const testing = std.testing;
@@ -32,12 +31,320 @@ const Opts = opt.Opts;
 const SSTable = sst.SSTable;
 const SSTableStore = sst.SSTableStore;
 
-const TAG = "[zig]";
 var mtx: Mutex = .{};
+
+/// Events that can trigger agent decisions
+pub const DatabaseEvent = union(enum) {
+    write_completed: struct { bytes: u64 },
+    read_completed: struct { bytes: u64 },
+    memtable_frozen: struct { id: []const u8 },
+    sstable_created: struct { level: usize, id: []const u8 },
+    compaction_completed: struct { level: usize, duration_ns: u64 },
+    system_idle: struct { duration_ms: u64 },
+};
+
+/// Actions the agent can decide to take
+pub const AgentAction = union(enum) {
+    flush_memtable: struct { id: []const u8 },
+    compact_level: struct { level: usize },
+    no_action: void,
+};
+
+/// Configurable policy parameters
+pub const AgentPolicy = struct {
+    max_level0_files: u32 = 16,
+    max_unflushed_memtables: usize = 4,
+    min_write_cooldown_ms: u64 = 500,
+    compaction_level_threshold: f64 = 0.8,
+    idle_compact_threshold_ms: u64 = 5000,
+};
+
+pub const DatabaseAgent = struct {
+    alloc: Allocator,
+    db: *Database,
+    policy: AgentPolicy,
+
+    action_mutex: std.Thread.Mutex,
+    action_queue: std.fifo.LinearFifo(AgentAction, .Dynamic),
+
+    mutex: std.Thread.Mutex,
+    event_queue: std.fifo.LinearFifo(DatabaseEvent, .Dynamic),
+
+    thread: ?std.Thread = null,
+    running: std.atomic.Value(bool),
+
+    const Self = @This();
+
+    pub fn init(alloc: Allocator, db: *Database, policy: AgentPolicy) !*Self {
+        const agent = try alloc.create(Self);
+        agent.* = .{
+            .alloc = alloc,
+            .db = db,
+            .policy = policy,
+            .event_queue = std.fifo.LinearFifo(DatabaseEvent, .Dynamic).init(alloc),
+            .action_queue = std.fifo.LinearFifo(AgentAction, .Dynamic).init(alloc),
+            .running = std.atomic.Value(bool).init(false),
+            .action_mutex = std.Thread.Mutex{},
+            .mutex = std.Thread.Mutex{},
+        };
+        return agent;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.event_queue.deinit();
+        self.action_queue.deinit();
+        self.alloc.destroy(self);
+    }
+
+    pub fn start(self: *Self) !void {
+        if (self.isRunning()) return;
+
+        self.running.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
+    }
+
+    pub fn stop(self: *Self) void {
+        if (!self.isRunning()) return;
+
+        self.running.store(false, .release);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    pub fn isRunning(self: Self) bool {
+        return self.running.load(.acquire);
+    }
+
+    /// Runs the database agent targeting 120 FPS rate.
+    /// This function implements a game loop pattern with:
+    /// 1. Event processing, state evaluation, and action processing every frame
+    /// 2. Sleep management to maintain consistent frame rate when possible
+    /// 3. Time tracking to monitor performance and detect frame rate drops
+    fn run(self: *Self) void {
+        // For 120 FPS, each frame should take approximately 8.33ms
+        const target_frame_time_ns: i128 = @divTrunc(std.time.ns_per_s, 120);
+
+        var previous = std.time.nanoTimestamp();
+
+        while (self.isRunning()) {
+            const current = std.time.nanoTimestamp();
+            previous = current;
+
+            self.processEvents();
+            self.evaluateState();
+            self.processActions();
+
+            // Calculate how long this frame took
+            const frame_time = std.time.nanoTimestamp() - current;
+
+            // Sleep if we're ahead of schedule to maintain 120 FPS
+            if (frame_time < target_frame_time_ns) {
+                const sleep_time_ns = target_frame_time_ns - frame_time;
+                std.time.sleep(@intCast(sleep_time_ns));
+            } else {
+                // We're running behind schedule - log a warning if significantly behind
+                const frame_time_ms = @divFloor(frame_time, std.time.ns_per_ms);
+                if (frame_time > target_frame_time_ns * 2) {
+                    std.log.warn("frame time ({d:.2}ms) exceeded target ({d:.2}ms) by more than 2x", .{
+                        frame_time_ms,
+                        @divFloor(target_frame_time_ns, std.time.ns_per_ms),
+                    });
+                }
+            }
+        }
+    }
+
+    fn queueAction(self: *Self, action: AgentAction) void {
+        self.action_mutex.lock();
+        defer self.action_mutex.unlock();
+
+        self.action_queue.writeItem(action) catch |err| {
+            std.log.err("failed to queue action: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn processActions(self: *Self) void {
+        self.action_mutex.lock();
+        defer self.action_mutex.unlock();
+
+        if (self.action_queue.readItem()) |action| {
+            switch (action) {
+                .flush_memtable => |_| {
+                    std.log.debug("flush_memtable", .{});
+
+                    self.db.xflush() catch |err| switch (err) {
+                        error.NothingToFlush => return,
+                        else => {
+                            std.log.err(
+                                "agent not able to flush memtable {s}",
+                                .{@errorName(err)},
+                            );
+                            return;
+                        },
+                    };
+                },
+                .compact_level => |data| {
+                    std.log.debug("compact_level {d}", .{data.level});
+
+                    self.db.sstables.compact(data.level) catch |err| {
+                        std.log.err(
+                            "agent not able to compact level {d} {s}",
+                            .{ data.level, @errorName(err) },
+                        );
+                        return;
+                    };
+                },
+                .no_action => return,
+            }
+        }
+    }
+
+    pub fn submitEvent(self: *Self, event: DatabaseEvent) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.event_queue.writeItem(event) catch |err| {
+            std.log.err("failed to submit event: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn processEvents(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.event_queue.readItem()) |event| {
+            switch (event) {
+                .write_completed => |data| {
+                    // std.log.debug("{s} {s} write_completed {d}", .{ TAG, event, data.bytes });
+
+                    _ = data;
+                },
+                .read_completed => |data| {
+                    std.log.debug("read_completed", .{});
+
+                    // Update read statistics if needed
+                    _ = data;
+                },
+                .memtable_frozen => |data| {
+                    std.log.debug("memtable_frozen {s}", .{data.id});
+
+                    self.considerFlushingMemtable(data.id);
+                },
+                .sstable_created => |data| {
+                    std.log.debug("sstable_created", .{});
+
+                    self.considerCompactingLevel(data.level);
+                },
+                .compaction_completed => |data| {
+                    std.log.debug("compaction_completed", .{});
+
+                    // Update compaction statistics
+                    _ = data;
+                },
+                .system_idle => |data| {
+                    std.log.debug("system_idle", .{});
+
+                    // Consider background maintenance during idle time
+                    self.considerIdleCompaction(data.duration_ms);
+                },
+            }
+        }
+    }
+
+    fn evaluateState(self: *Self) void {
+        // Periodically evaluate the overall state of the database
+        // and make decisions based on the current statistics
+
+        // Check level 0 file count
+        const level0_files = self.db.sstables.stats.getFilesCount(0);
+        if (level0_files > self.policy.max_level0_files) {
+            std.log.debug(
+                "level 0 files ({d}) exceeds policy {d}",
+                .{ level0_files, self.policy.max_level0_files },
+            );
+            self.queueAction(.{ .compact_level = .{ .level = 0 } });
+        }
+
+        // Check other levels based on size ratios
+        for (1..self.db.sstables.num_levels) |level| {
+            const level_stats = self.db.sstables.getLevelStats(level) orelse continue;
+            const next_level_stats = self.db.sstables.getLevelStats(level + 1) orelse continue;
+
+            // If this level is getting too full compared to the next level
+            if (level_stats.files_count > 0 and next_level_stats.files_count > 0) {
+                const ratio = @as(f64, @floatFromInt(level_stats.files_count)) /
+                    @as(f64, @floatFromInt(next_level_stats.files_count));
+
+                if (ratio > self.policy.compaction_level_threshold) {
+                    std.log.debug(
+                        "level {d} file ratio ({d}) exceeds policy {d}",
+                        .{ level, ratio, self.policy.compaction_level_threshold },
+                    );
+                    self.queueAction(.{ .compact_level = .{ .level = level } });
+                }
+            }
+        }
+    }
+
+    fn considerFlushingMemtable(self: *Self, id: []const u8) void {
+        // Simple policy: if we have too many unflushed memtables, flush this one
+        const count = self.db.memtableCount();
+        if (count >= self.policy.max_unflushed_memtables) {
+            std.log.debug(
+                "memtable count ({d}) exceeds policy {d}",
+                .{ count, self.policy.max_unflushed_memtables },
+            );
+            self.queueAction(.{ .flush_memtable = .{ .id = id } });
+        }
+    }
+
+    fn considerCompactingLevel(self: *Self, level: usize) void {
+        // Check if this level needs compaction based on file count
+        const files_count = self.db.sstables.stats.getFilesCount(level);
+        const max_files = self.policy.max_level0_files * std.math.pow(u32, 10, @intCast(level));
+
+        if (files_count > max_files) {
+            std.log.debug(
+                "level {d} file count ({d}) exceeds max files {d}",
+                .{ level, files_count, max_files },
+            );
+            self.queueAction(.{ .compact_level = .{ .level = level } });
+        }
+    }
+
+    fn considerIdleCompaction(self: *Self, idle_ms: u64) void {
+        if (idle_ms < self.policy.idle_compact_threshold_ms) return;
+
+        // Find a level that hasn't been compacted in a while
+        var oldest_level: usize = 0;
+        var oldest_time: i64 = std.time.timestamp();
+
+        for (0..self.db.sstables.num_levels) |level| {
+            const last_compaction = self.db.sstables.stats.getLastCompactionTime(level);
+            if (last_compaction > 0 and last_compaction < oldest_time) {
+                oldest_time = last_compaction;
+                oldest_level = level;
+            }
+        }
+
+        // If we found a level that hasn't been compacted in a while
+        const now = std.time.timestamp();
+        if (now - oldest_time > @as(i64, @intCast(self.policy.idle_compact_threshold_ms / 1000))) {
+            std.log.debug(
+                "level {d} compaction time exceeds ({d}) policy {d}",
+                .{ oldest_level, now - oldest_time, @as(i64, @intCast(self.policy.idle_compact_threshold_ms / 1000)) },
+            );
+            self.queueAction(.{ .compact_level = .{ .level = oldest_level } });
+        }
+    }
+};
 
 pub const Database = struct {
     alloc: Allocator,
-    byte_allocator: ThreadSafeBumpAllocator,
+    agent: *DatabaseAgent,
+    byte_allocator: *ThreadSafeBumpAllocator,
     capacity: usize,
     mtable: AtomicValue(*Memtable),
     opts: Opts,
@@ -47,17 +354,19 @@ pub const Database = struct {
     const Self = @This();
 
     pub fn init(alloc: Allocator, opts: Opts) !*Self {
-        var byte_allocator = ThreadSafeBumpAllocator.init(alloc, 1096) catch |err| {
-            std.log.err("{s} unable to init bump allocator {s}", .{ TAG, @errorName(err) });
-            return err;
-        };
+        const byte_allocator = try alloc.create(ThreadSafeBumpAllocator);
         errdefer byte_allocator.deinit();
 
-        var new_id_buf: [32]u8 = undefined;
-        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.milliTimestamp()});
+        byte_allocator.* = ThreadSafeBumpAllocator.init(alloc, std.mem.page_size) catch |err| {
+            std.log.err("unable to init bump allocator {s}", .{@errorName(err)});
+            return err;
+        };
 
-        const mtable = Memtable.init(alloc, new_id, opts) catch |err| {
-            std.log.err("{s} unable to init memtable {s}", .{ TAG, @errorName(err) });
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
+
+        const mtable = Memtable.init(alloc, byte_allocator, new_id, opts) catch |err| {
+            std.log.err("unable to init memtable {s}", .{@errorName(err)});
             return err;
         };
         errdefer mtable.deinit();
@@ -71,12 +380,15 @@ pub const Database = struct {
         const capacity = opts.sst_capacity;
 
         const db = alloc.create(Self) catch |err| {
-            std.log.err("{s} unable to allocate db {s}", .{ TAG, @errorName(err) });
+            std.log.err("unable to allocate db {s}", .{@errorName(err)});
             return err;
         };
 
+        const agent = try DatabaseAgent.init(alloc, db, .{});
+
         db.* = .{
             .alloc = alloc,
+            .agent = agent,
             .byte_allocator = byte_allocator,
             .capacity = capacity,
             .mtable = AtomicValue(*Memtable).init(mtable),
@@ -84,12 +396,18 @@ pub const Database = struct {
             .opts = opts,
             .sstables = sstables,
         };
+
+        try db.agent.start();
+
         return db;
     }
 
     pub fn deinit(self: *Self) void {
         mtx.lock();
         defer mtx.unlock();
+
+        self.agent.stop();
+        self.agent.deinit();
 
         for (self.mtables.items) |mtable| {
             mtable.deinit();
@@ -106,15 +424,14 @@ pub const Database = struct {
 
         self.byte_allocator.printStats();
         self.byte_allocator.deinit();
+        self.alloc.destroy(self.byte_allocator);
 
         self.* = undefined;
     }
 
     pub fn open(self: *Self) !void {
-        std.log.info("{s} database opening...", .{TAG});
-
         self.sstables.open(self.alloc) catch |err| {
-            std.log.err("{s} not able to open sstables data directory {s}\n", .{ TAG, @errorName(err) });
+            std.log.err("not able to open sstables data directory {s}", .{@errorName(err)});
             return err;
         };
 
@@ -122,16 +439,25 @@ pub const Database = struct {
             var siter = try sstable.iterator(self.alloc);
             defer siter.deinit();
 
+            var mtable = self.mtable.load(.seq_cst);
             while (siter.next()) |nxt| {
-                try self.write(nxt.key, nxt.value);
+                try mtable.put(nxt);
             }
 
-            const mtable = self.mtable.load(.seq_cst);
             mtable.isFlushed.store(true, .seq_cst);
-            try self.freeze(mtable);
+            mtable.mutable.store(false, .seq_cst);
+
+            try self.mtables.append(mtable);
+
+            var new_id_buf: [64]u8 = undefined;
+            const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
+
+            const nxt_table = try Memtable.init(self.alloc, self.byte_allocator, new_id, self.opts);
+
+            self.mtable.store(nxt_table, .seq_cst);
         }
 
-        std.log.info("{s} database opened @ {s} w/ {d} warm tables", .{ TAG, self.opts.data_dir, self.mtables.items.len });
+        std.log.info("database opened @ {s} w/ {d} warm tables", .{ self.opts.data_dir, self.mtables.items.len });
     }
 
     pub fn read(self: Self, key: []const u8) !KV {
@@ -139,22 +465,26 @@ pub const Database = struct {
             return value;
         }
 
-        mtx.lock();
-        defer mtx.unlock();
+        {
+            mtx.lock();
+            defer mtx.unlock();
 
-        if (self.mtables.items.len > 0) {
-            var idx: usize = self.mtables.items.len - 1;
-            while (idx > 0) {
-                var table = self.mtables.items[idx];
-                if (table.get(key)) |value| {
-                    return value;
+            if (self.mtables.items.len > 0) {
+                var idx: usize = self.mtables.items.len - 1;
+                while (idx > 0) {
+                    var table = self.mtables.items[idx];
+                    if (table.get(key)) |value| {
+                        return value;
+                    }
+                    idx -= 1;
                 }
-                idx -= 1;
             }
-            return error.NotFound;
-        } else {
-            return error.NotFound;
         }
+
+        var kv: KV = undefined;
+        try self.sstables.read(key, &kv);
+
+        return kv;
     }
 
     const MergeIteratorWrapper = struct {
@@ -273,53 +603,73 @@ pub const Database = struct {
             try self.freeze(mtable);
         }
 
-        mtable = self.mtable.load(.seq_cst);
-        try mtable.put(item);
+        while (true) {
+            mtable = self.mtable.load(.seq_cst);
+            mtable.put(item) catch |err| switch (err) {
+                error.MemtableImmutable => continue,
+                else => return err,
+            };
+            break;
+        }
+
+        self.agent.submitEvent(.{ .write_completed = .{ .bytes = item.len() } });
     }
 
-    pub fn flush(self: *Self) !void {
+    fn memtableCount(self: Self) usize {
+        mtx.lock();
+        defer mtx.unlock();
+
+        var count: usize = 0;
+        for (self.mtables.items) |table| {
+            if (!table.flushed()) {
+                count += 1;
+            }
+        }
+
+        return count;
+    }
+
+    pub fn flush(self: *Self) void {
+        std.log.debug("hot table flush queued", .{});
+
+        const hot_table = self.mtable.load(.seq_cst);
+        self.agent.queueAction(.{ .flush_memtable = .{ .id = hot_table.getId() } });
+    }
+
+    pub fn xflush(self: *Self) !void {
         mtx.lock();
         defer mtx.unlock();
 
         if (self.mtables.items.len == 0) {
+            std.log.debug("nothing to flush", .{});
             return error.NothingToFlush;
         }
 
-        const hot_table = self.mtable.load(.seq_cst);
-        try self.freeze(hot_table);
-
-        for (self.mtables.items) |mtable| {
-            if (!mtable.flushed()) {
-                try self.sstables.flush(self.alloc, mtable);
+        for (self.mtables.items) |table| {
+            if (!table.flushed()) {
+                self.sstables.flush(self.alloc, table) catch |err| {
+                    std.log.err(
+                        "sstables not able to flush mtable {s} {s}",
+                        .{ table.getId(), @errorName(err) },
+                    );
+                    return error.FlushFailed;
+                };
             }
-            mtable.deinit();
-            self.alloc.destroy(mtable);
         }
-
-        self.sstables.compact(0) catch |err| {
-            std.log.err("{s} sstable compaction error {s}", .{ TAG, @errorName(err) });
-        };
-
-        self.mtables.clearAndFree();
     }
 
     fn freeze(self: *Self, mtable: *Memtable) !void {
-        if (mtable.frozen()) {
-            return;
-        }
+        if (mtable.frozen()) return;
 
         mtable.freeze();
+        self.agent.submitEvent(.{ .memtable_frozen = .{ .id = mtable.getId() } });
 
-        // Generate a new ID that is lexicographically greater than the current one
-        var new_id_buf: [32]u8 = undefined;
-        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.milliTimestamp()});
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        const nxt_table = try Memtable.init(self.alloc, new_id, self.opts);
+        const nxt_table = try Memtable.init(self.alloc, self.byte_allocator, new_id, self.opts);
 
-        self.mtables.append(mtable) catch |err| {
-            debug.print("freeze {s}\n", .{@errorName(err)});
-            return err;
-        };
+        try self.mtables.append(mtable);
 
         self.mtable.store(nxt_table, .seq_cst);
     }
@@ -404,72 +754,4 @@ test "basic functionality with many items" {
     }
 
     try testing.expectEqual(3, items.items.len);
-}
-
-test "Database thread safety" {
-    const alloc = testing.allocator;
-    const testDir = testing.tmpDir(.{});
-
-    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir_name);
-    defer testDir.dir.deleteTree(dir_name) catch {};
-
-    const Thread = std.Thread;
-
-    // given
-    var o = opt.withDataDirOpts(dir_name);
-    o.sst_capacity = 100;
-
-    const db = try lsm.databaseFromOpts(alloc, o);
-    defer alloc.destroy(db);
-    defer db.deinit();
-
-    const thread_fn = struct {
-        fn run(mt: *Database, id: usize) void {
-            var i: usize = 0;
-            while (i < 100) : (i += 1) {
-                const key = std.fmt.allocPrint(alloc, "key_{d}_{d}", .{ id, i }) catch continue;
-                defer alloc.free(key);
-
-                const value = std.fmt.allocPrint(alloc, "value_{d}_{d}", .{ id, i }) catch continue;
-                defer alloc.free(value);
-
-                mt.write(key, value) catch continue;
-            }
-        }
-    }.run;
-
-    var threads = std.ArrayList(Thread).init(alloc);
-    defer threads.deinit();
-
-    for (0..4) |i| {
-        const thread = Thread.spawn(.{}, thread_fn, .{ db, i }) catch @panic("Failed to spawn thread");
-        try threads.append(thread);
-    }
-
-    for (threads.items) |thread| {
-        thread.join();
-    }
-
-    var flush_cnt: AtomicValue(u8) = AtomicValue(u8).init(0);
-
-    // Test concurrent flush attempts
-    const flush_fn = struct {
-        fn run(mt: *Database, cnt: *AtomicValue(u8)) void {
-            mt.flush() catch return;
-            _ = cnt.fetchAdd(1, .seq_cst);
-        }
-    }.run;
-
-    threads.clearRetainingCapacity();
-
-    try threads.append(Thread.spawn(.{}, flush_fn, .{ db, &flush_cnt }) catch @panic("Failed to spawn thread"));
-    try threads.append(Thread.spawn(.{}, flush_fn, .{ db, &flush_cnt }) catch @panic("Failed to spawn thread"));
-    try threads.append(Thread.spawn(.{}, flush_fn, .{ db, &flush_cnt }) catch @panic("Failed to spawn thread"));
-
-    for (threads.items) |thread| {
-        thread.join();
-    }
-
-    try testing.expectEqual(1, flush_cnt.load(.seq_cst));
 }

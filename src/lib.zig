@@ -63,7 +63,6 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 }
 
 // Public C Interface
-
 const jemalloc = @import("jemalloc");
 const allocator = jemalloc.allocator;
 
@@ -113,7 +112,6 @@ export fn lsm_iter_deinit(addr: *anyopaque) bool {
 
 export fn lsm_deinit(addr: *anyopaque) bool {
     const db: *Database = @ptrCast(@alignCast(addr));
-    db.flush() catch return false;
     db.deinit();
     allocator.destroy(db);
     return true;

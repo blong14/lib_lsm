@@ -17,3 +17,8 @@ pub fn openAndTruncate(path: []const u8, capacity: usize) !File {
     try file.setEndPos(capacity);
     return file;
 }
+
+pub fn delete(path: []const u8) !void {
+    std.log.debug("deleting file {s}", .{path});
+    return std.fs.cwd().deleteFile(path);
+}

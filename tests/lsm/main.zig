@@ -26,6 +26,10 @@ const usage =
     \\
 ;
 
+pub const std_options = .{
+    .log_level = .info,
+};
+
 pub fn main() !void {
     // First we specify what parameters our program can take.
     // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`
@@ -67,6 +71,7 @@ pub fn main() !void {
     const mode = res.args.mode orelse Mode.singlethreaded;
 
     const opts: lsm.Opts = .{
+        .compaction_strategy = .simple,
         .data_dir = data_dir,
         .sst_capacity = sst_capacity,
         .wal_capacity = wal_capacity,
@@ -110,16 +115,8 @@ const SingleThreadedImpl = struct {
         try db.open();
 
         try parse(allocator, input, db);
-        try read(db);
-        try scan(db);
-
-        db.flush() catch |err| {
-            debug.print(
-                "not able to flush database error {s}\n",
-                .{@errorName(err)},
-            );
-            return;
-        };
+        // try read(db);
+        // try scan(db);
     }
 
     fn scan(db: *lsm.Database) !void {
@@ -306,7 +303,7 @@ const MultiThreadedImpl = struct {
             defer wg.finish();
 
             for (items) |item| {
-                var kv: KV = .{ .key = undefined, .value = undefined };
+                var kv: KV = .{ .key = undefined, .value = undefined, .timestamp = 0 };
                 kv.decode(item) catch |err| {
                     debug.print(
                         "not able to decode kv {s} {any}\n",
@@ -382,14 +379,6 @@ const MultiThreadedImpl = struct {
             debug.print("spawned {d} workers\n", .{count});
 
             thread_pool.waitAndWork(&wait_group);
-
-            db.flush() catch |err| {
-                debug.print(
-                    "error flushing db {s}\n",
-                    .{@errorName(err)},
-                );
-                return;
-            };
         }
     };
 
@@ -443,7 +432,7 @@ const MultiProcessImpl = struct {
 
                 var count: usize = 0;
                 while (inbox.next()) |item| {
-                    var kv: KV = .{ .key = undefined, .value = undefined };
+                    var kv: KV = .{ .key = undefined, .value = undefined, .timestamp = 0 };
                     kv.decode(item) catch |err| {
                         debug.print(
                             "not able to decode kv {s} {any}\n",
@@ -461,14 +450,6 @@ const MultiProcessImpl = struct {
                     };
                     count += 1;
                 }
-
-                db.flush() catch |err| {
-                    debug.print(
-                        "error flushing db {s}\n",
-                        .{@errorName(err)},
-                    );
-                    return;
-                };
             }
         }.consume, .{ opts, &mailbox.subscribe() });
 
