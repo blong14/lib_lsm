@@ -1,0 +1,25 @@
+name: LSM CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Build and Test
+    strategy:
+      max-parallel: 4
+      matrix:
+        zig-version: ['0.13.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig-version }}
+      - run: make coverage
+      - name: Produce coverage report
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+

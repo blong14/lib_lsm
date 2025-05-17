@@ -99,6 +99,9 @@ run:
 test:
 	$(ZIG) build test $(ZIG_COMMON_FLAGS)
 
+coverage:
+	$(ZIG) build cover $(ZIG_COMMON_FLAGS)
+
 # Debug notes:
 # gdb --tui zig-out/bin/lsm
 # b src/tablemap.zig:76
