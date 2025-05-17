@@ -54,22 +54,3 @@ WORKDIR /app
 
 COPY . .
 
-RUN zig build -Dcpu=native -Doptimize=ReleaseFast --summary all --verbose go 
-
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y \
-    libzmq5 \
-    libjemalloc2 \
-    --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
-
-ARG TARGETARCH
-LABEL architecture="${TARGETARCH}"
-
-WORKDIR /app
-
-COPY --from=builder /app/zig-out/bin/gopg /usr/local/bin/
-COPY --from=builder /app/zig-out /app/zig-out
-
-ENTRYPOINT ["ls", "/app/zig-out/"]
