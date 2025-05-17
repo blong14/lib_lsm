@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     git \
     libzmq5-dev \
     libjemalloc-dev \
+    libdw1 \
     pkg-config \
     wget \
     xz-utils \
@@ -33,6 +34,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
 
 RUN . /etc/environment && \
     curl -sSL "https://golang.org/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" | tar -C /usr/local -xz
+
 ENV PATH="/usr/local/go/bin:${PATH}"
 ENV GOPATH="/go"
 ENV PATH="${GOPATH}/bin:${PATH}"
