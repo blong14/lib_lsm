@@ -27,7 +27,7 @@ jobs:
           tags: ${{ env.DOCKER_IMAGE_NAME }}:latest
       - name: Run Tests
         run: |
-          docker run -it --rm --security-opt seccomp=unconfined \
+          docker run --rm --security-opt seccomp=unconfined \
             -v ./zig-out/cover:/app/zig-out/cover \
             ${{ env.DOCKER_IMAGE_NAME }}:latest \
             make coverage
