@@ -17,7 +17,7 @@ jobs:
           fetch-depth: 0
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Build Image 
+      - name: Build Environment 
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -25,6 +25,14 @@ jobs:
           push: false
           load: true
           tags: ${{ env.DOCKER_IMAGE_NAME }}:latest
-      - name: Test Image
-        run: docker run --rm ${{ env.DOCKER_IMAGE_NAME }}:latest make coverage
-
+      - name: Run Tests
+        run: |
+          docker run -it --rm --security-opt seccomp=unconfined \
+            -v ./zig-out/cover:/app/zig-out/cover \
+            ${{ env.DOCKER_IMAGE_NAME }}:latest \
+            make coverage
+      - name: Upload Coverage Report
+        uses: codecov/codecov-action@v5
+        with:
+          directory: zig-out/cover
+          token: ${{ secrets.CODECOV_TOKEN }}
