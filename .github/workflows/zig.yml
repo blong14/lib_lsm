@@ -23,6 +23,7 @@ jobs:
           context: .
           file: ./Dockerfile-ci
           push: false
+          load: true
           tags: ${{ env.DOCKER_IMAGE_NAME }}:latest
       - name: Test Image
         run: docker run --rm ${{ env.DOCKER_IMAGE_NAME }}:latest make coverage
