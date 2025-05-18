@@ -33,6 +33,7 @@ help:
 	@echo "make rust           - Build Rust bindings"
 	@echo "make go             - Build Go bindings"
 	@echo "make clean          - Remove build artifacts"
+	@echo "make bench          - Run benchmarks"
 	@echo "make fmt            - Format code"
 	@echo "make test           - Run tests"
 	@echo "make run            - Run lsmctl with default options"
@@ -78,7 +79,6 @@ fmt:
 
 perf:
 	perf record -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) xlsm -- \
-		--mode $(MODE) \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
@@ -96,6 +96,12 @@ run:
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 
+bench:
+	rm -rf .tmp/data/*.dat
+	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+		--bench \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
 test:
 	$(ZIG) build test $(ZIG_COMMON_FLAGS)
 
