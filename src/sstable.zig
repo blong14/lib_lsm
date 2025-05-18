@@ -1345,21 +1345,21 @@ test "SSTableStore open" {
         for (0..2) |level| {
             for (store.get(level)) |table| {
                 try table.block.freeze();
-                
+
                 const filename = try std.fmt.allocPrint(
                     alloc,
                     "{s}/{s}.dat",
                     .{ table.data_dir, table.id },
                 );
                 defer alloc.free(filename);
-                
+
                 const sz = table.block.size();
                 const out_file = try file_utils.openAndTruncate(filename, sz);
                 try table.open(out_file);
-                
+
                 _ = try table.block.flush(&table.stream.buf);
                 try table.file.sync();
-                
+
                 table.mutable = false;
             }
         }
@@ -1369,19 +1369,19 @@ test "SSTableStore open" {
     {
         var store = try SSTableStore.init(alloc, dopts);
         defer store.deinit(alloc);
-        
+
         // Open the store to load tables from disk
         try store.open(alloc);
-        
+
         // Verify tables were loaded correctly
         try testing.expectEqual(@as(usize, 1), store.get(0).len);
         try testing.expectEqual(@as(usize, 1), store.get(1).len);
-        
+
         // Verify data in the tables
         var kv: KV = undefined;
         try store.read("key0", &kv);
         try testing.expectEqualStrings("value0", kv.value);
-        
+
         try store.read("key1", &kv);
         try testing.expectEqualStrings("value1", kv.value);
     }
