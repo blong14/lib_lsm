@@ -27,7 +27,7 @@ const usage =
 ;
 
 pub const std_options = .{
-    .log_level = .info,
+    .log_level = .err,
 };
 
 pub fn main() !void {

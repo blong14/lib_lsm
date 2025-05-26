@@ -8,9 +8,12 @@ const ResolvedTarget = std.Build.ResolvedTarget;
 pub fn buildLsm(b: *Build, target: ResolvedTarget, optimize: OptimizeMode) *CompileStep {
     const exe = b.addExecutable(.{
         .name = "xlsm",
+        .optimize = optimize,
         .root_source_file = b.path("tests/lsm/main.zig"),
         .target = target,
-        .optimize = optimize,
+        // .sanitize_thread = true,
+        .error_tracing = true,
+        .unwind_tables = true,
     });
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
