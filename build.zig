@@ -127,9 +127,6 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&zigfmt.step);
 
     // Add lib specific deps (check zig cacheing)
-    // TODO: Add rust dependency install
-    // TODO: Add go dependency install
-    // TODO: Add zig dependency install
     const clap = b.dependency("clap", .{
         .target = target,
         .optimize = optimize,
@@ -224,6 +221,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        // .sanitize_thread = true,
+        .error_tracing = true,
+        .unwind_tables = true,
     });
     exe.step.dependOn(&rust.step);
     exe.step.dependOn(&lsm_headers.step);

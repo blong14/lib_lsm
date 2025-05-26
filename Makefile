@@ -19,8 +19,8 @@ ZIG_DEBUG_OPTS := -Dcpu=x86_64 -Doptimize=Debug
 
 # Runtime options
 DATA_DIR := /home/blong14/Developer/git/lib_lsm/.tmp/data
-MODE := singlethreaded
-# MODE := multithreaded
+# MODE := singlethreaded
+MODE := multithreaded
 SST_CAPACITY := 1000000
 
 # Help command
@@ -71,7 +71,7 @@ clean:
 
 debug:
 	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
-		--mode $(MODE) \
+		--bench \
 		--data_dir $(DATA_DIR)
 
 fmt:
@@ -107,6 +107,11 @@ test:
 
 coverage:
 	$(ZIG) build cover $(ZIG_COMMON_FLAGS)
+
+poop: build 
+	./bin/poop \
+		'./$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./data/measurements.txt --sst_capacity 1_000_000' \
+		'./$(EXEC) --data_dir ./.tmp/data/data2 --mode multithreaded --input ./data/measurements.txt --sst_capacity 1_000_000'
 
 # Debug notes:
 # gdb --tui zig-out/bin/lsm
