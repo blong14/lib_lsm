@@ -225,15 +225,12 @@ pub fn ScanIterator(
             if (!self.started) {
                 self.started = true;
 
-                // If no start key is provided, just begin from the current position
-                if (self.start == null) {
-                    // Continue to the first item check below
-                } else {
+                if (self.start) |start| {
                     // Skip items until we find one greater than start
                     while (self.source.next()) |item| {
-                        const order = compareFn(item, self.start.?);
-                        if (order == .gt) {
-                            return item; // Found first item > start
+                        const order = compareFn(item, start);
+                        if (order == .eq or order == .gt) {
+                            return item;
                         }
                     }
                     return null; // No items found > start
@@ -243,8 +240,8 @@ pub fn ScanIterator(
             // For subsequent calls, get the next item and check against end bound
             if (self.source.next()) |item| {
                 // If we have an end bound, check if the item is <= end
-                if (self.end != null) {
-                    const order = compareFn(item, self.end.?);
+                if (self.end) |end| {
+                    const order = compareFn(item, end);
                     if (order == .gt) {
                         return null; // Item is > end, we're done
                     }
@@ -456,12 +453,13 @@ test "ScanIterator" {
             try actual.append(n);
         }
 
-        // Should include 4,5,6,7 (values > 3 and <= 7)
-        try testing.expectEqual(@as(usize, 4), actual.items.len);
-        try testing.expectEqual(@as(u32, 4), actual.items[0]);
-        try testing.expectEqual(@as(u32, 5), actual.items[1]);
-        try testing.expectEqual(@as(u32, 6), actual.items[2]);
-        try testing.expectEqual(@as(u32, 7), actual.items[3]);
+        // Should include 3,4,5,6,7 (values >= 3 and <= 7)
+        try testing.expectEqual(@as(usize, 5), actual.items.len);
+        try testing.expectEqual(@as(u32, 3), actual.items[0]);
+        try testing.expectEqual(@as(u32, 4), actual.items[1]);
+        try testing.expectEqual(@as(u32, 5), actual.items[2]);
+        try testing.expectEqual(@as(u32, 6), actual.items[3]);
+        try testing.expectEqual(@as(u32, 7), actual.items[4]);
     }
 
     // Reset for another test
@@ -508,9 +506,10 @@ test "ScanIterator" {
             try actual.append(n);
         }
 
-        // Should include 8,9
-        try testing.expectEqual(@as(usize, 2), actual.items.len);
-        try testing.expectEqual(@as(u32, 8), actual.items[0]);
-        try testing.expectEqual(@as(u32, 9), actual.items[1]);
+        // Should include 7,8,9
+        try testing.expectEqual(@as(usize, 3), actual.items.len);
+        try testing.expectEqual(@as(u32, 7), actual.items[0]);
+        try testing.expectEqual(@as(u32, 8), actual.items[1]);
+        try testing.expectEqual(@as(u32, 9), actual.items[2]);
     }
 }

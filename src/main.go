@@ -53,6 +53,7 @@ func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("%#v -- key not found %s", pe.db, keyBytes)
 	}
+	defer C.lsm_value_deinit(resp)
 
 	valBytes := []byte(C.GoString((*C.char)(unsafe.Pointer(resp))))
 

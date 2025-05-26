@@ -136,10 +136,11 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
         defer alloc.free(key);
 
         count += 1;
-        _ = db.read(key) catch {
+        var nxt = db.read(alloc, key) catch {
             missed += 1;
             continue;
         };
+        defer nxt.deinit(alloc);
 
         // Periodically log progress
         if (i % (num_ops / 10) == 0 and i > 0) {

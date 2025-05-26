@@ -460,31 +460,32 @@ pub const Database = struct {
         std.log.info("database opened @ {s} w/ {d} warm tables", .{ self.opts.data_dir, self.mtables.items.len });
     }
 
-    pub fn read(self: Self, key: []const u8) !KV {
-        if (self.mtable.load(.seq_cst).get(key)) |value| {
-            return value;
-        }
+    pub fn read(self: *Self, alloc: Allocator, key: []const u8) !KV {
+        const internal_key = try keyvalue.encodeInternalKey(alloc, key, null);
+        defer alloc.free(internal_key);
 
-        {
-            mtx.lock();
-            defer mtx.unlock();
+        var scan_iter = try self.scan(alloc, key, internal_key);
+        defer scan_iter.deinit();
 
-            if (self.mtables.items.len > 0) {
-                var idx: usize = self.mtables.items.len - 1;
-                while (idx > 0) {
-                    var table = self.mtables.items[idx];
-                    if (table.get(key)) |value| {
-                        return value;
-                    }
-                    idx -= 1;
-                }
-            }
-        }
+        const nxt_kv = scan_iter.next() orelse return error.NotFound;
 
-        var kv: KV = undefined;
-        try self.sstables.read(key, &kv);
+        const key_copy = alloc.dupe(u8, nxt_kv.key) catch |err| {
+            std.log.err("not able to copy key {s}", .{@errorName(err)});
+            return err;
+        };
+        errdefer alloc.free(key_copy);
 
-        return kv;
+        const value_copy = alloc.dupe(u8, nxt_kv.value) catch |err| {
+            std.log.err("not able to copy value {s}", .{@errorName(err)});
+            return err;
+        };
+        errdefer alloc.free(value_copy);
+
+        return .{
+            .key = key_copy,
+            .value = value_copy,
+            .timestamp = nxt_kv.timestamp,
+        };
     }
 
     const MergeIteratorWrapper = struct {
@@ -662,7 +663,6 @@ pub const Database = struct {
         if (mtable.frozen()) return;
 
         mtable.freeze();
-        self.agent.submitEvent(.{ .memtable_frozen = .{ .id = mtable.getId() } });
 
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
@@ -672,6 +672,8 @@ pub const Database = struct {
         try self.mtables.append(mtable);
 
         self.mtable.store(nxt_table, .seq_cst);
+
+        self.agent.submitEvent(.{ .memtable_frozen = .{ .id = mtable.getId() } });
     }
 };
 
@@ -696,7 +698,7 @@ test Database {
     try db.write(key, value);
 
     // then
-    const actual = try db.read(key);
+    const actual = try db.read(alloc, key);
     try testing.expectEqualStrings(value, actual.value);
 }
 
@@ -728,7 +730,9 @@ test "basic functionality with many items" {
 
     // then
     for (kvs) |kv| {
-        const actual = try db.read(kv.key);
+        var actual = try db.read(alloc, kv.key);
+        defer actual.deinit(alloc);
+
         try testing.expectEqualStrings(kv.value, actual.value);
     }
 
@@ -746,7 +750,7 @@ test "basic functionality with many items" {
     var items = std.ArrayList(KV).init(alloc);
     defer items.deinit();
 
-    var scan_iter = try db.scan(alloc, "__key_b__", "__key_e__");
+    var scan_iter = try db.scan(alloc, "__key_b__", "__key_d__");
     defer scan_iter.deinit();
 
     while (scan_iter.next()) |nxt| {

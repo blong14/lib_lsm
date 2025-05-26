@@ -38,7 +38,7 @@ pub const Memtable = struct {
         @memcpy(id_copy, id);
 
         const map = try alloc.create(KeyValueSkipList);
-        map.* = try KeyValueSkipList.init(byte_alloc.allocator());
+        map.* = try KeyValueSkipList.init(alloc);
 
         const mtable = try alloc.create(Self);
         mtable.* = .{
@@ -71,8 +71,11 @@ pub const Memtable = struct {
             return error.MemtableImmutable;
         }
 
+        const key = try item.internalKey(self.init_alloc);
+        defer self.init_alloc.free(key);
+
         var data = self.data.load(.acquire);
-        try data.put(item.key, item);
+        try data.put(key, item);
 
         _ = self.byte_count.fetchAdd(item.len(), .release);
     }
@@ -149,7 +152,11 @@ test Memtable {
     const kv = KV.init("__key__", "__value__");
 
     try mtable.put(kv);
-    const actual = mtable.get(kv.key);
+
+    const ikv = try kv.internalKey(alloc);
+    defer alloc.free(ikv);
+
+    const actual = mtable.get(ikv);
 
     // then
     try testing.expectEqualStrings(kv.value, actual.?.value);
