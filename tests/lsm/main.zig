@@ -4,24 +4,20 @@ const clap = @import("clap");
 const jemalloc = @import("jemalloc");
 const lsm = @import("lsm");
 
-const atomic = std.atomic;
 const debug = std.debug;
-const fs = std.fs;
-const heap = std.heap;
 const io = std.io;
 const mem = std.mem;
 
 const Allocator = mem.Allocator;
 
 const KV = lsm.KV;
-const ThreadSafeBumpAllocator = lsm.ThreadSafeBumpAllocator;
 
 const allocator = jemalloc.allocator;
 const usage =
     \\-h, --help             Display this help and exit.
     \\-d, --data_dir <str>   The data directory to save files on disk.
     \\-i, --input    <str>   An input file to import. Only supports csv.
-    \\-m, --mode     <mode>  Execution mode. Can be one of singlethreaded, multithreaded, or multiprocess
+    \\-m, --mode     <mode>  Execution mode. Can be one of singlethreaded or multithreaded
     \\--sst_capacity <usize> Max capacity for an SST block.
     \\
 ;
@@ -35,7 +31,7 @@ pub fn main() !void {
     // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`
     const params = comptime clap.parseParamsComptime(usage);
 
-    const Mode = enum { singlethreaded, multithreaded, multiprocess };
+    const Mode = enum { singlethreaded, multithreaded };
     const parsers = comptime .{
         .str = clap.parsers.string,
         .usize = clap.parsers.int(usize, 10),
@@ -81,7 +77,6 @@ pub fn main() !void {
     const impl: Runnable = switch (mode) {
         .singlethreaded => try SingleThreadedImpl.init(),
         .multithreaded => try MultiThreadedImpl.init(),
-        .multiprocess => try MultiProcessImpl.init(),
     };
 
     try impl.run(input, opts);
@@ -110,34 +105,8 @@ const SingleThreadedImpl = struct {
             return err;
         };
         defer allocator.destroy(db);
-        defer db.deinit();
+        defer db.deinit(allocator);
 
-        try db.open();
-
-        try parse(allocator, input, db);
-        // try read(db);
-        // try scan(db);
-    }
-
-    fn scan(db: *lsm.Database) !void {
-        var iter = try db.scan(allocator, "Atlanta", "Berlin");
-        defer iter.deinit();
-
-        while (iter.next()) |nxt| {
-            debug.print("{}\n", .{nxt});
-        }
-    }
-
-    fn read(db: *lsm.Database) !void {
-        var iter = try db.iterator(allocator);
-        defer iter.deinit();
-
-        while (iter.next()) |nxt| {
-            debug.print("{}\n", .{nxt});
-        }
-    }
-
-    fn parse(alloc: Allocator, input: []const u8, db: *lsm.Database) !void {
         var idx: usize = 0;
         var data = [2][]const u8{ undefined, undefined };
 
@@ -155,12 +124,12 @@ const SingleThreadedImpl = struct {
                     const key_len = data[0].len;
                     const value_len = data[1].len;
 
-                    const byts = try alloc.alloc(u8, key_len + value_len);
+                    const byts = try allocator.alloc(u8, key_len + value_len);
 
                     mem.copyForwards(u8, byts[0..key_len], data[0]);
                     mem.copyForwards(u8, byts[key_len..], data[1]);
 
-                    db.write(byts[0..key_len], byts[key_len..]) catch |err| {
+                    db.write(allocator, byts[0..key_len], byts[key_len..]) catch |err| {
                         debug.print(
                             "database write error: key {s} value {s} error {s}\n",
                             .{ data[0], data[1], @errorName(err) },
@@ -173,6 +142,7 @@ const SingleThreadedImpl = struct {
                 }
             }
         }
+
         debug.print("total keys written {}\n", .{cnt});
     }
 };
@@ -226,7 +196,7 @@ const MultiThreadedImpl = struct {
 
                         kvs.append(data) catch return;
 
-                        if (kvs.items.len >= mem.page_size) {
+                        if (kvs.items.len >= 100_000) {
                             const msg = kvs.toOwnedSlice() catch |err| {
                                 debug.print(
                                     "not able to publish items {s}\n",
@@ -312,7 +282,7 @@ const MultiThreadedImpl = struct {
                     return;
                 };
 
-                db.write(kv.key, kv.value) catch |err| {
+                db.write(allocator, kv.key, kv.value) catch |err| {
                     debug.print(
                         "db write error key {s} {s}\n",
                         .{ kv.key, @errorName(err) },
@@ -330,7 +300,7 @@ const MultiThreadedImpl = struct {
                 );
                 return;
             };
-            defer db.deinit();
+            defer db.deinit(allocator);
 
             const Pool = std.Thread.Pool;
 
@@ -383,12 +353,7 @@ const MultiThreadedImpl = struct {
     };
 
     pub fn run(input: []const u8, opts: lsm.Opts) !void {
-        var arena = heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
-        const arena_allocator = arena.allocator();
-
-        lsm.BeginProfile(arena_allocator);
+        lsm.BeginProfile(allocator);
         defer lsm.EndProfile();
 
         var mailbox = MessageQueue.init();
@@ -398,123 +363,5 @@ const MultiThreadedImpl = struct {
 
         consumer.join();
         publisher.join();
-    }
-};
-
-const MultiProcessImpl = struct {
-    const Self = @This();
-
-    pub fn init() !Runnable {
-        return .{
-            .run = Self.run,
-        };
-    }
-
-    pub fn run(input: []const u8, opts: lsm.Opts) !void {
-        var arena = heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
-        const alloc = arena.allocator();
-
-        var mailbox = try lsm.ProcessMessageQueue.init(alloc, ".");
-        defer mailbox.deinit();
-
-        const reader = try std.Thread.spawn(.{}, struct {
-            pub fn consume(options: lsm.Opts, inbox: *const lsm.ProcessMessageQueue.ReadIter) void {
-                const db = lsm.databaseFromOpts(allocator, options) catch |err| {
-                    debug.print(
-                        "database init error {s}\n",
-                        .{@errorName(err)},
-                    );
-                    return;
-                };
-                defer db.deinit();
-
-                var count: usize = 0;
-                while (inbox.next()) |item| {
-                    var kv: KV = .{ .key = undefined, .value = undefined, .timestamp = 0 };
-                    kv.decode(item) catch |err| {
-                        debug.print(
-                            "not able to decode kv {s} {any}\n",
-                            .{ @errorName(err), item },
-                        );
-                        return;
-                    };
-
-                    db.write(kv.key, kv.value) catch |err| {
-                        debug.print(
-                            "db write error count {d} key {s} {s}\n",
-                            .{ count, kv.key, @errorName(err) },
-                        );
-                        return;
-                    };
-                    count += 1;
-                }
-            }
-        }.consume, .{ opts, &mailbox.subscribe() });
-
-        const writer = mailbox.publisher();
-
-        var kvs = std.ArrayList([]const u8).init(allocator);
-        defer kvs.deinit();
-
-        var idx: usize = 0;
-        var data_row = [2][]const u8{ undefined, undefined };
-
-        const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
-        defer lsm.CsvClose(handle);
-
-        while (lsm.ReadNextRow(handle)) |row| {
-            while (lsm.ReadNextCol(row, handle)) |val| {
-                if (idx < data_row.len) {
-                    data_row[idx] = mem.span(val);
-                }
-
-                idx += 1;
-                if (idx == 2) {
-                    const item = KV.init(data_row[0], data_row[1]);
-
-                    const data = item.encodeAlloc(allocator) catch |err| {
-                        debug.print(
-                            "not able to encode KV for key {s} error {s}\n",
-                            .{ item.key, @errorName(err) },
-                        );
-                        return;
-                    };
-
-                    kvs.append(data) catch return;
-
-                    if (kvs.items.len >= mem.page_size) {
-                        for (kvs.items) |d| {
-                            const msg = d;
-                            writer.publish(msg) catch |err| {
-                                debug.print(
-                                    "not able to publish items {s}\n",
-                                    .{@errorName(err)},
-                                );
-                            };
-                        }
-                        kvs.clearRetainingCapacity();
-                    }
-
-                    idx = 0;
-                }
-            }
-        }
-
-        if (kvs.items.len > 0) {
-            for (kvs.items) |d| {
-                const msg = d;
-                writer.publish(msg) catch |err| {
-                    debug.print(
-                        "not able to publish items {s}\n",
-                        .{@errorName(err)},
-                    );
-                };
-            }
-        }
-
-        try writer.done();
-        reader.join();
     }
 };
