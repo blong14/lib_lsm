@@ -5,21 +5,31 @@ const ArrayList = std.ArrayList;
 const Atomic = std.atomic.Value;
 const Mutex = std.Thread.Mutex;
 
+const MIN_CHUNK_SIZE = 4096;
+const MAX_CHUNK_SIZE = 4096 * 4096;
+
 pub const ThreadSafeBumpAllocator = struct {
     alloc: Allocator,
     chunk_size: usize,
-    chunks: ArrayList([]align(16) u8),
-    current_chunk: []align(16) u8,
     used: Atomic(usize),
     total_allocations: Atomic(usize),
     total_used_bytes: Atomic(usize),
-    lock: Mutex,
 
-    pub fn init(alloc: Allocator, initial_chunk_size: usize) !ThreadSafeBumpAllocator {
+    lock: Mutex,
+    chunks: ArrayList([]align(16) u8),
+    current_chunk: []align(16) u8,
+
+    pub fn init(
+        alloc: Allocator,
+        initial_chunk_size: usize,
+    ) !ThreadSafeBumpAllocator {
         var chunks = ArrayList([]align(16) u8).init(alloc);
 
         // Ensure initial chunk size is at least 4KB and a power of 2
-        const adjusted_size = std.math.ceilPowerOfTwo(usize, @max(initial_chunk_size, 4096)) catch initial_chunk_size;
+        const adjusted_size = std.math.ceilPowerOfTwo(
+            usize,
+            @max(initial_chunk_size, MIN_CHUNK_SIZE),
+        ) catch initial_chunk_size;
 
         const first_chunk = try alloc.alignedAlloc(u8, 16, adjusted_size);
         errdefer alloc.free(first_chunk);
@@ -28,6 +38,7 @@ pub const ThreadSafeBumpAllocator = struct {
 
         return ThreadSafeBumpAllocator{
             .chunk_size = adjusted_size,
+            .lock = Mutex{},
             .chunks = chunks,
             .current_chunk = first_chunk,
             .used = Atomic(usize).init(0),
@@ -35,7 +46,6 @@ pub const ThreadSafeBumpAllocator = struct {
             .total_allocations = Atomic(usize).init(1),
             .total_used_bytes = Atomic(usize).init(0),
             .alloc = alloc,
-            .lock = Mutex{},
         };
     }
 
@@ -43,7 +53,6 @@ pub const ThreadSafeBumpAllocator = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        // Free all chunks in the active list
         for (self.chunks.items) |chunk| {
             self.alloc.free(chunk);
         }
@@ -62,9 +71,7 @@ pub const ThreadSafeBumpAllocator = struct {
     }
 
     fn add_chunk(self: *ThreadSafeBumpAllocator) !void {
-        // Double chunk size for exponential growth, but cap at 1MB to avoid
-        // excessive memory usage
-        const new_size = @min(self.chunk_size * 2, 1024 * 1024);
+        const new_size = @min(self.chunk_size * 2, MAX_CHUNK_SIZE);
         const new_chunk = try self.alloc.alignedAlloc(u8, 16, new_size);
 
         if (new_size > self.chunk_size) {
@@ -82,7 +89,6 @@ pub const ThreadSafeBumpAllocator = struct {
         const self: *ThreadSafeBumpAllocator = @ptrCast(@alignCast(ctx));
         const algn = @as(usize, 1) << @intCast(log2_align);
 
-        // Fast path for small allocations with common alignments
         if (len <= 64 and algn <= 16) {
             return self.fastAllocate(len, algn);
         }
@@ -93,16 +99,17 @@ pub const ThreadSafeBumpAllocator = struct {
 
     fn fastAllocate(self: *ThreadSafeBumpAllocator, len: usize, algn: usize) ?[*]u8 {
         const current_used = self.used.load(.acquire);
-        const current_chunk = self.current_chunk;
-
         const aligned_start = std.mem.alignForward(usize, current_used, algn);
         const new_used = aligned_start + len;
+
+        self.lock.lock();
+        const current_chunk = self.current_chunk;
+        self.lock.unlock();
 
         if (new_used <= current_chunk.len) {
             if (self.used.cmpxchgWeak(current_used, new_used, .acq_rel, .acquire)) |_| {
                 return self.slowAllocate(len, algn, 0);
             }
-
             // We successfully claimed the memory
             _ = self.total_used_bytes.fetchAdd(len, .monotonic);
 
@@ -195,15 +202,40 @@ pub const ThreadSafeBumpAllocator = struct {
         }
     }
 
+    fn formatBytesWithBuffer(bytes: u64, buf: []u8) []const u8 {
+        if (bytes == 0) {
+            return "0B";
+        }
+
+        if (bytes < 1024) {
+            return std.fmt.bufPrint(buf, "{d}B", .{bytes}) catch "??B";
+        } else if (bytes < 1024 * 1024) {
+            const kb = @as(f64, @floatFromInt(bytes)) / 1024.0;
+            return std.fmt.bufPrint(buf, "{d:.1}K", .{kb}) catch "??K";
+        } else if (bytes < 1024 * 1024 * 1024) {
+            const mb = @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+            return std.fmt.bufPrint(buf, "{d:.1}M", .{mb}) catch "??M";
+        } else {
+            const gb = @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
+            return std.fmt.bufPrint(buf, "{d:.1}G", .{gb}) catch "??G";
+        }
+    }
+
     pub fn printStats(self: *ThreadSafeBumpAllocator) void {
         self.lock.lock();
         defer self.lock.unlock();
 
+        var written_buf: [32]u8 = undefined;
+        const total_written_str = formatBytesWithBuffer(
+            self.total_used_bytes.load(.monotonic),
+            &written_buf,
+        );
+
         std.log.info(
-            "Arena Stats: Allocations={}, UsedBytes={}, Chunks={}\n",
+            "Bump Allocator Stats: Allocations={d}, UsedBytes={s}, Chunks={d}\n",
             .{
                 self.total_allocations.load(.monotonic),
-                self.total_used_bytes.load(.monotonic),
+                total_written_str,
                 self.chunks.items.len,
             },
         );
@@ -249,7 +281,7 @@ test "Benchmark" {
     const talloc = testing.allocator;
     const calloc = std.heap.c_allocator;
 
-    var bump = try ThreadSafeBumpAllocator.init(talloc, 64 * 1024);
+    var bump = try ThreadSafeBumpAllocator.init(talloc, 1024 * 1024);
     defer bump.deinit();
 
     const bump_alloc = bump.allocator();
