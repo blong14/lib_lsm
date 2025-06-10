@@ -33,6 +33,20 @@ pub const KV = struct {
         self.* = undefined;
     }
 
+    pub fn clone(self: Self, alloc: Allocator) !KV {
+        const key_copy = try alloc.dupe(u8, self.key);
+        errdefer alloc.free(key_copy);
+
+        const value_copy = try alloc.dupe(u8, self.value);
+        errdefer alloc.free(value_copy);
+
+        return KV{
+            .key = key_copy,
+            .value = value_copy,
+            .timestamp = self.timestamp,
+        };
+    }
+
     pub fn userKey(self: Self) []const u8 {
         return self.key;
     }
@@ -50,67 +64,50 @@ pub const KV = struct {
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {
-        // Minimum size check:
-        // key_len(8) + at least 1 byte key + value_len(8) + at least 1 byte value + timestamp(8)
-        if (data.len < 8 + 1 + 8 + 1 + 8) {
+        const min_size = @sizeOf(u64) + 1 + @sizeOf(u64) + 1 + @sizeOf(i128);
+        if (data.len < min_size) {
             return error.InvalidData;
         }
 
         var ptr: usize = 0;
-
-        const key_len_sz = @sizeOf(u64);
-        if (ptr + key_len_sz > data.len) {
-            return error.InvalidData;
-        }
-
-        var key_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-        @memcpy(&key_len_bytes, data[ptr .. ptr + key_len_sz]);
-
-        const key_len = readInt(u64, &key_len_bytes, Endian);
         const max_key_size = 1024 * 1024; // 1MB
+        const max_value_size = 16 * 1024 * 1024; // 16MB
+
+        const key_len = readInt(u64, @ptrCast(&data[ptr]), Endian);
         if (key_len == 0 or key_len > max_key_size) {
             return error.InvalidKeyLength;
         }
-
-        ptr += key_len_sz;
+        ptr += @sizeOf(u64);
 
         if (ptr + key_len > data.len) {
             return error.InvalidData;
         }
+
         const key = data[ptr .. ptr + key_len];
         ptr += key_len;
 
-        const value_len_sz = @sizeOf(u64);
-        if (ptr + value_len_sz > data.len) {
+        if (ptr + @sizeOf(u64) > data.len) {
             return error.InvalidData;
         }
 
-        var value_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-        @memcpy(&value_len_bytes, data[ptr .. ptr + value_len_sz]);
-
-        const value_len = readInt(u64, &value_len_bytes, Endian);
-        const max_value_size = 16 * 1024 * 1024; // 16MB
+        const value_len = readInt(u64, @ptrCast(&data[ptr]), Endian);
         if (value_len == 0 or value_len > max_value_size) {
             return error.InvalidValueLength;
         }
-
-        ptr += value_len_sz;
+        ptr += @sizeOf(u64);
 
         if (ptr + value_len > data.len) {
             return error.InvalidData;
         }
+
         const value = data[ptr .. ptr + value_len];
         ptr += value_len;
 
-        const timestamp_sz = @sizeOf(i128);
-        if (ptr + timestamp_sz > data.len) {
+        if (ptr + @sizeOf(i128) > data.len) {
             return error.InvalidData;
         }
 
-        var timestamp_bytes: [@divExact(@typeInfo(i128).Int.bits, 8)]u8 = undefined;
-        @memcpy(&timestamp_bytes, data[ptr .. ptr + timestamp_sz]);
-
-        const timestamp = readInt(i128, &timestamp_bytes, Endian);
+        const timestamp = readInt(i128, @ptrCast(&data[ptr]), Endian);
         if (timestamp <= 0) {
             return error.InvalidTimestamp;
         }
@@ -127,7 +124,6 @@ pub const KV = struct {
     }
 
     pub fn encode(self: Self, buf: []u8) ![]u8 {
-        // Validate data before encoding
         const max_key_size = 1024 * 1024; // 1MB
         if (self.key.len == 0 or self.key.len > max_key_size) {
             return error.InvalidKeyLength;
@@ -192,19 +188,12 @@ pub const KV = struct {
 };
 
 pub fn compare(a: KV, b: KV) std.math.Order {
-    switch (std.mem.order(u8, a.userKey(), b.userKey())) {
-        .eq => {
-            if (a.timestamp > b.timestamp) {
-                return std.math.Order.gt;
-            } else {
-                // a was created before b
-                // so should be "visible"
-                return std.math.Order.eq;
-            }
-        },
-        .lt => return std.math.Order.lt,
-        .gt => return std.math.Order.gt,
+    const key_order = std.mem.order(u8, a.key, b.key);
+    if (key_order == .eq) {
+        return if (a.timestamp > b.timestamp) .gt else .eq;
     }
+
+    return key_order;
 }
 
 pub fn decode(byts: []const u8) !KV {
