@@ -68,7 +68,7 @@ const allocator = jemalloc.allocator;
 
 export fn lsm_init() ?*anyopaque {
     const db = defaultDatabase(allocator) catch return null;
-    db.open() catch return null;
+    db.open(allocator) catch return null;
     return db;
 }
 
@@ -90,7 +90,7 @@ export fn lsm_write(addr: *anyopaque, key: [*c]const u8, value: [*c]const u8) bo
     const db: *Database = @ptrCast(@alignCast(addr));
     const k = std.mem.span(key);
     const v = std.mem.span(value);
-    db.write(k, v) catch return false;
+    db.write(allocator, k, v) catch return false;
     return true;
 }
 
@@ -119,7 +119,7 @@ export fn lsm_iter_deinit(addr: *anyopaque) bool {
 
 export fn lsm_deinit(addr: *anyopaque) bool {
     const db: *Database = @ptrCast(@alignCast(addr));
-    db.deinit();
+    db.deinit(allocator);
     allocator.destroy(db);
     return true;
 }

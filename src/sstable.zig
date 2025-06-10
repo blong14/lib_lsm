@@ -434,7 +434,10 @@ pub const SSTableStore = struct {
             std.debug.print("------+-------+------+---------+------+-------------+------------\n", .{});
 
             // Format totals with dedicated buffers
-            const total_written_str = formatBytesWithBuffer(total_bytes_written, &written_buf);
+            const total_written_str = formatBytesWithBuffer(
+                total_bytes_written,
+                &written_buf,
+            );
             const total_read_str = formatBytesWithBuffer(total_bytes_read, &read_buf);
 
             std.debug.print("Total | {d:5} | {d:4} | {s:>7} | {s:>4} | {d:11} | -\n", .{ total_files, total_keys, total_written_str, total_read_str, total_compactions });
@@ -576,6 +579,9 @@ pub const SSTableStore = struct {
             if (tables.len == 0) {
                 return;
             }
+            for (tables) |table| {
+                table.retain();
+            }
 
             const start_time = std.time.nanoTimestamp();
 
@@ -591,8 +597,7 @@ pub const SSTableStore = struct {
             var bytes_read: u64 = 0;
 
             for (tables) |table| {
-                table.retain();
-                defer {
+                errdefer {
                     _ = table.release();
                 }
 
@@ -605,6 +610,7 @@ pub const SSTableStore = struct {
                     _ = try new_table.write(kv);
                     count += 1;
                 }
+                _ = table.release();
             }
 
             if (count > 0) {
@@ -1088,10 +1094,8 @@ pub const SSTable = struct {
 
             var kv: ?KV = null;
             if (self.nxt + offset_sz <= self.block.offset_data.items.len) {
-                var nxt_offset_byts: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-                @memcpy(&nxt_offset_byts, self.block.offset_data.items[self.nxt .. self.nxt + offset_sz]);
-
-                const nxt_offset = readInt(u64, &nxt_offset_byts, Endian);
+                const offset_ptr: *const [offset_sz]u8 = @ptrCast(&self.block.offset_data.items[self.nxt]);
+                const nxt_offset = readInt(u64, offset_ptr, Endian);
 
                 kv = self.block.read(nxt_offset) catch |err| {
                     std.log.err("sstable iter error {s}", .{@errorName(err)});
@@ -1252,22 +1256,13 @@ test "SSTableStore flush and compaction" {
     var store = try SSTableStore.init(alloc, dopts);
     defer store.deinit(alloc);
 
-    const byte_allocator = try alloc.create(ThreadSafeBumpAllocator);
-    defer alloc.destroy(byte_allocator);
-    defer byte_allocator.deinit();
-
-    byte_allocator.* = ThreadSafeBumpAllocator.init(alloc, std.mem.page_size) catch |err| {
-        std.log.err("unable to init bump allocator {s}", .{@errorName(err)});
-        return err;
-    };
-
-    var memtable = try Memtable.init(alloc, byte_allocator, "level-0", dopts);
+    var memtable = try Memtable.init(alloc, "level-0", dopts);
     defer alloc.destroy(memtable);
     defer memtable.deinit();
 
-    try memtable.put(KV.init("flush_key1", "flush_value1"));
-    try memtable.put(KV.init("flush_key2", "flush_value2"));
-    try memtable.put(KV.init("flush_key3", "flush_value3"));
+    try memtable.put(alloc, KV.init("flush_key1", "flush_value1"));
+    try memtable.put(alloc, KV.init("flush_key2", "flush_value2"));
+    try memtable.put(alloc, KV.init("flush_key3", "flush_value3"));
 
     // Flush memtable to SSTable
     {
