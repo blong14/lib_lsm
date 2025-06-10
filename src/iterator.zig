@@ -63,7 +63,6 @@ pub fn MergeIterator(
 
         const Item = struct {
             value: T,
-            source_index: usize,
         };
 
         fn itemCompare(context: void, a: Item, b: Item) std.math.Order {
@@ -104,10 +103,7 @@ pub fn MergeIterator(
             try self.iterators.append(iter);
 
             if (self.iterators.items[self.iterators.items.len - 1].next()) |value| {
-                try self.queue.add(Item{
-                    .value = value,
-                    .source_index = self.iterators.items.len - 1,
-                });
+                try self.queue.add(Item{ .value = value });
             }
         }
 
@@ -116,15 +112,11 @@ pub fn MergeIterator(
 
             if (self.queue.removeOrNull()) |item| {
                 const value = item.value;
-                const source_index = item.source_index;
 
-                // Get the next item from the source iterator
-                var iter = &self.iterators.items[source_index];
-                if (iter.next()) |next_value| {
-                    self.queue.add(Item{
-                        .value = next_value,
-                        .source_index = source_index,
-                    }) catch unreachable;
+                for (self.iterators.items) |*iter| {
+                    if (iter.next()) |next_value| {
+                        self.queue.add(Item{ .value = next_value }) catch unreachable;
+                    }
                 }
 
                 return value;
