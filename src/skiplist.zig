@@ -11,10 +11,6 @@ const Allocator = std.mem.Allocator;
 const Iterator = iter.Iterator;
 const KV = kv.KV;
 
-const assert = std.debug.assert;
-const copyForwards = std.mem.copyForwards;
-const print = std.debug.print;
-
 pub fn SkipList(
     comptime V: type,
     comptime decodeFn: fn (v: []const u8) anyerror!V,
@@ -116,7 +112,8 @@ pub fn SkipList(
                 const alloc = it.arena.allocator();
 
                 const val = alloc.alloc(u8, value_len) catch unreachable;
-                copyForwards(u8, val, value_buffer[0..value_len]);
+
+                @memcpy(val, value_buffer[0..value_len]);
 
                 return decodeFn(val) catch |err| {
                     std.log.err("value decode failed: {s}", .{@errorName(err)});

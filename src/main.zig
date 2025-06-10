@@ -13,6 +13,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const KV = lsm.KV;
+const ThreadSafeByteAllocator = lsm.ThreadSafeBumpAllocator;
 
 const allocator = jemalloc.allocator;
 const usage =
@@ -77,87 +78,244 @@ pub fn main() !void {
         return err;
     };
     defer allocator.destroy(db);
-    defer db.deinit();
+    defer db.deinit(allocator);
 
-    try db.open();
+    try db.open(allocator);
+
+    var byte_allocator = try ThreadSafeByteAllocator.init(allocator, 4096);
+    defer byte_allocator.deinit();
+
+    const alloc = byte_allocator.allocator();
+    defer byte_allocator.printStats();
 
     if (res.args.bench != 0) {
         benchmark(allocator, db);
     } else {
         // Fallback runnable used for simple scanning of the database files.
-        scanAndPrint(allocator, db);
+        scanAndPrint(alloc, db);
     }
 }
 
 fn benchmark(alloc: Allocator, db: *lsm.Database) void {
-    // Use a smaller number of operations to avoid freezing
-    const num_ops = 1_000_000;
+    const num_ops = 10_000;
 
-    std.log.info("Starting benchmark with {d} operations...", .{num_ops});
+    // Number of worker threads to use - adjust based on available cores
+    const num_threads: u64 = @min(16, std.Thread.getCpuCount() catch 4);
+
+    std.log.info("Starting benchmark with {d} operations using {d} threads...", .{ num_ops, num_threads });
 
     // Timing variables
     var timer = std.time.Timer.start() catch unreachable;
     var write_time: u64 = 0;
-    var read_time: u64 = 0;
+    var read_time: u64 = 1;
+
+    // Thread synchronization
+    const ThreadContext = struct {
+        thread: std.Thread = undefined,
+        thread_id: usize,
+        db: *lsm.Database,
+        alloc: Allocator,
+        start_idx: usize,
+        end_idx: usize,
+        success_count: std.atomic.Value(u64),
+        error_count: std.atomic.Value(u64),
+
+        fn init(
+            database: *lsm.Database,
+            thread_id: usize,
+            malloc: Allocator,
+            start: usize,
+            end: usize,
+        ) @This() {
+            return .{
+                .db = database,
+                .thread_id = thread_id,
+                .alloc = malloc,
+                .start_idx = start,
+                .end_idx = end,
+                .success_count = std.atomic.Value(u64).init(0),
+                .error_count = std.atomic.Value(u64).init(0),
+            };
+        }
+    };
 
     // Write benchmark
-    var count: u64 = 0;
-    timer.reset();
-    for (0..num_ops) |i| {
-        const key = std.fmt.allocPrint(alloc, "key_{d}", .{i}) catch unreachable;
-        defer alloc.free(key);
+    {
+        const threads = alloc.alloc(ThreadContext, num_threads) catch unreachable;
+        defer alloc.free(threads);
 
-        const value = std.fmt.allocPrint(alloc, "value_{d}", .{i}) catch unreachable;
-        defer alloc.free(value);
+        const ops_per_thread = num_ops / num_threads;
 
-        count += 1;
-        db.write(key, value) catch |err| {
-            std.log.err("Write error: {s}", .{@errorName(err)});
-            return;
-        };
-
-        // Periodically log progress to show the benchmark is still running
-        if (i % (num_ops / 10) == 0 and i > 0) {
-            std.log.info("Write progress ({d}): {d}%", .{ count, i * 100 / num_ops });
+        // Initialize thread contexts
+        for (threads, 0..) |*ctx, i| {
+            const start = i * ops_per_thread;
+            const end = if (i == num_threads - 1) num_ops else start + ops_per_thread;
+            ctx.* = ThreadContext.init(db, i, alloc, start, end);
         }
+
+        // Worker function for writes
+        const writeWorker = struct {
+            fn work(ctx: *ThreadContext) void {
+                var success_count: u64 = 0;
+                var error_count: u64 = 0;
+
+                for (ctx.start_idx..ctx.end_idx) |i| {
+                    const key = std.fmt.allocPrint(ctx.alloc, "key_{d}", .{i}) catch unreachable;
+                    defer ctx.alloc.free(key);
+
+                    const value = std.fmt.allocPrint(ctx.alloc, "value_{d}", .{i}) catch unreachable;
+                    defer ctx.alloc.free(value);
+
+                    ctx.db.write(ctx.alloc, key, value) catch |err| {
+                        std.log.debug("database write error for key {s} {s}\n", .{
+                            key,
+                            @errorName(err),
+                        });
+                        error_count += 1;
+                        continue;
+                    };
+                    success_count += 1;
+
+                    // Periodically log progress
+                    const chunk_size = (ctx.end_idx - ctx.start_idx) / 5;
+                    if (chunk_size > 0 and i % chunk_size == 0 and i > ctx.start_idx) {
+                        const progress = (i - ctx.start_idx) * 100 / (ctx.end_idx - ctx.start_idx);
+                        std.log.debug("Thread {d} write progress: {d}%", .{
+                            ctx.thread_id,
+                            progress,
+                        });
+                    }
+                }
+
+                ctx.success_count.store(success_count, .release);
+                ctx.error_count.store(error_count, .release);
+            }
+        }.work;
+
+        // Start timer and launch threads
+        timer.reset();
+
+        for (threads) |*ctx| {
+            ctx.thread = std.Thread.spawn(.{}, writeWorker, .{ctx}) catch unreachable;
+        }
+
+        // Wait for all threads to complete
+        for (threads) |*ctx| {
+            ctx.thread.join();
+        }
+
+        // Calculate total counts
+        var total_success: u64 = 0;
+        var total_errors: u64 = 0;
+
+        for (threads) |ctx| {
+            total_success += ctx.success_count.load(.acquire);
+            total_errors += ctx.error_count.load(.acquire);
+        }
+
+        write_time = timer.read();
+
+        // Ensure all writes are flushed
+        db.flush(alloc);
+
+        std.log.info("Write phase completed: {d} successful, {d} errors", .{ total_success, total_errors });
     }
-
-    db.flush();
-
-    write_time = timer.read();
-    std.log.info("Write phase completed: total keys {d}", .{count});
 
     // Read benchmark
-    count = 0;
-    var missed: u64 = 0;
-    timer.reset();
-    for (0..num_ops) |i| {
-        const key = std.fmt.allocPrint(alloc, "key_{d}", .{i}) catch unreachable;
-        defer alloc.free(key);
+    const should_run = true;
+    if (should_run) {
+        const threads = alloc.alloc(ThreadContext, num_threads) catch unreachable;
+        defer alloc.free(threads);
 
-        count += 1;
-        var nxt = db.read(alloc, key) catch {
-            missed += 1;
-            continue;
-        };
-        defer nxt.deinit(alloc);
+        const ops_per_thread = num_ops / num_threads;
 
-        // Periodically log progress
-        if (i % (num_ops / 10) == 0 and i > 0) {
-            std.log.info("Read progress({d}): {d}%", .{ count, i * 100 / num_ops });
+        // Initialize thread contexts
+        for (threads, 0..) |*ctx, i| {
+            const start = i * ops_per_thread;
+            const end = if (i == num_threads - 1) num_ops else start + ops_per_thread;
+            ctx.* = ThreadContext.init(db, i, alloc, start, end);
         }
-    }
-    read_time = timer.read();
 
-    std.log.info("Read phase completed: total keys read {d} total keys missed {d}", .{ count, missed });
+        // Worker function for reads
+        const readWorker = struct {
+            fn work(ctx: *ThreadContext) void {
+                var success_count: u64 = 0;
+                var error_count: u64 = 0;
+
+                for (ctx.start_idx..ctx.end_idx) |i| {
+                    const key = std.fmt.allocPrint(ctx.alloc, "key_{d}", .{i}) catch unreachable;
+                    defer ctx.alloc.free(key);
+
+                    var nxt = ctx.db.read(ctx.alloc, key) catch |err| {
+                        std.log.debug("database read error for key {s} {s}\n", .{
+                            key,
+                            @errorName(err),
+                        });
+                        error_count += 1;
+                        continue;
+                    };
+                    defer nxt.deinit(ctx.alloc);
+
+                    success_count += 1;
+
+                    // Periodically log progress
+                    const chunk_size = (ctx.end_idx - ctx.start_idx) / 5;
+                    if (chunk_size > 0 and i % chunk_size == 0 and i > ctx.start_idx) {
+                        const progress = (i - ctx.start_idx) * 100 / (ctx.end_idx - ctx.start_idx);
+                        std.log.debug("Thread {d} read progress: {d}%", .{
+                            ctx.thread_id,
+                            progress,
+                        });
+                    }
+                }
+
+                ctx.success_count.store(success_count, .release);
+                ctx.error_count.store(error_count, .release);
+            }
+        }.work;
+
+        // Start timer and launch threads
+        timer.reset();
+
+        std.log.info("Starting read phase with {d} operations using {d} threads...", .{
+            num_ops,
+            threads.len,
+        });
+
+        for (threads) |*ctx| {
+            ctx.thread = std.Thread.spawn(.{}, readWorker, .{ctx}) catch unreachable;
+        }
+
+        // Wait for all threads to complete
+        for (threads) |*ctx| {
+            ctx.thread.join();
+        }
+
+        // Calculate total counts
+        var total_success: u64 = 0;
+        var total_errors: u64 = 0;
+
+        for (threads) |ctx| {
+            total_success += ctx.success_count.load(.acquire);
+            total_errors += ctx.error_count.load(.acquire);
+        }
+
+        read_time = timer.read();
+
+        std.log.info("Read phase completed: {d} successful, {d} missed", .{ total_success, total_errors });
+    }
 
     // Report results
     const write_ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(write_time)) / std.time.ns_per_s);
     const read_ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(read_time)) / std.time.ns_per_s);
 
     std.log.info("Benchmark Results:", .{});
-    std.log.info("  Write: {d:.2} ops/sec ({d:.2} ms total)", .{ write_ops_per_sec, @as(f64, @floatFromInt(write_time)) / std.time.ns_per_ms });
-    std.log.info("  Read:  {d:.2} ops/sec ({d:.2} ms total)", .{ read_ops_per_sec, @as(f64, @floatFromInt(read_time)) / std.time.ns_per_ms });
+    std.log.info("  Write: {d:.2} ops/sec ({d:.2} ms total)", .{
+        write_ops_per_sec, @as(f64, @floatFromInt(write_time)) / std.time.ns_per_ms,
+    });
+    std.log.info("  Read:  {d:.2} ops/sec ({d:.2} ms total)", .{
+        read_ops_per_sec, @as(f64, @floatFromInt(read_time)) / std.time.ns_per_ms,
+    });
 }
 
 fn scanAndPrint(alloc: Allocator, db: *lsm.Database) void {
