@@ -70,6 +70,8 @@ pub fn SkipList(
         const SkiplistIterator = struct {
             arena: std.heap.ArenaAllocator,
             impl: *c.SkipMapIterator,
+            // Keep a buffer for the current KV data to ensure it stays valid
+            current_data: ?[]u8 = null,
 
             pub fn init(ctx: *anyopaque, alloc: Allocator) !SkiplistIterator {
                 return .{
@@ -111,14 +113,23 @@ pub fn SkipList(
 
                 const alloc = it.arena.allocator();
 
+                // Store the data in our arena so the KV can borrow from it
                 const val = alloc.alloc(u8, value_len) catch unreachable;
-
                 @memcpy(val, value_buffer[0..value_len]);
 
-                return decodeFn(val) catch |err| {
+                // Keep reference to ensure data stays valid
+                it.current_data = val;
+
+                // Create a borrowed KV that points to our arena data
+                var kv = decodeFn(val) catch |err| {
                     std.log.err("value decode failed: {s}", .{@errorName(err)});
                     return null;
                 };
+
+                // Ensure it's marked as borrowed since it points to arena data
+                kv.ownership = .borrowed;
+
+                return kv;
             }
         };
 

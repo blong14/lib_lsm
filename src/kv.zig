@@ -12,11 +12,17 @@ const createTimestamp = std.time.nanoTimestamp;
 
 const Endian = std.builtin.Endian.little;
 
+pub const KVOwnership = enum {
+    owned, // KV owns the memory and should free it
+    borrowed, // KV just points to memory owned elsewhere
+};
+
 pub const KV = struct {
     key: []const u8,
     ikey: ?[]const u8 = null,
     value: []const u8,
     timestamp: i128,
+    ownership: KVOwnership = .borrowed,
 
     const Self = @This();
 
@@ -25,12 +31,38 @@ pub const KV = struct {
             .key = key,
             .value = value,
             .timestamp = createTimestamp(),
+            .ownership = .borrowed,
         };
     }
 
+    pub fn initOwned(alloc: Allocator, key: []const u8, value: []const u8) !Self {
+        const key_copy = try alloc.dupe(u8, key);
+        errdefer alloc.free(key_copy);
+
+        const value_copy = try alloc.dupe(u8, value);
+        errdefer alloc.free(value_copy);
+
+        return .{
+            .key = key_copy,
+            .value = value_copy,
+            .timestamp = createTimestamp(),
+            .ownership = .owned,
+        };
+    }
+
+    /// Create a KV that borrows data from a buffer (zero-copy)
+    pub fn fromBuffer(buffer: []const u8) !Self {
+        var kv: KV = undefined;
+        try kv.decode(buffer);
+        kv.ownership = .borrowed;
+        return kv;
+    }
+
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        alloc.free(self.key);
-        alloc.free(self.value);
+        if (self.ownership == .owned) {
+            alloc.free(self.key);
+            alloc.free(self.value);
+        }
         self.* = undefined;
     }
 
@@ -45,7 +77,13 @@ pub const KV = struct {
             .key = key_copy,
             .value = value_copy,
             .timestamp = self.timestamp,
+            .ownership = .owned,
         };
+    }
+
+    /// Create an owned copy of this KV
+    pub fn toOwned(self: Self, alloc: Allocator) !KV {
+        return self.clone(alloc);
     }
 
     pub fn userKey(self: Self) []const u8 {
@@ -123,6 +161,7 @@ pub const KV = struct {
         self.*.ikey = internal_key;
         self.*.value = value;
         self.*.timestamp = timestamp;
+        self.*.ownership = .borrowed; // Decoded KVs borrow from the source buffer
     }
 
     pub fn encodeAlloc(self: Self, alloc: Allocator) ![]const u8 {
@@ -301,6 +340,7 @@ test "KV decode" {
     try std.testing.expectEqualStrings(original.value, decoded.value);
     try std.testing.expectEqual(original.timestamp, decoded.timestamp);
     try std.testing.expectEqual(original.len(), decoded.len());
+    try std.testing.expectEqual(KVOwnership.borrowed, decoded.ownership);
 }
 
 test "KV compare" {

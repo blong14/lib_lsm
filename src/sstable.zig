@@ -1097,10 +1097,16 @@ pub const SSTable = struct {
                 const offset_ptr: *const [offset_sz]u8 = @ptrCast(&self.block.offset_data.items[self.nxt]);
                 const nxt_offset = readInt(u64, offset_ptr, Endian);
 
+                // Get the KV as a borrowed reference to the block's data
                 kv = self.block.read(nxt_offset) catch |err| {
                     std.log.err("sstable iter error {s}", .{@errorName(err)});
                     return null;
                 };
+
+                // Ensure the KV is marked as borrowed since it points to block data
+                if (kv) |*k| {
+                    k.ownership = .borrowed;
+                }
 
                 self.*.nxt += offset_sz;
             }

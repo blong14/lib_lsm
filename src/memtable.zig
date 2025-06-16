@@ -74,8 +74,11 @@ pub const Memtable = struct {
         const key = try item.internalKey(alloc);
         defer alloc.free(key);
 
+        // Create an owned copy of the item for storage in the memtable
+        const owned_item = try item.toOwned(alloc);
+
         var data = self.data.load(.acquire);
-        try data.put(alloc, key, item);
+        try data.put(alloc, key, owned_item);
 
         _ = self.byte_count.fetchAdd(item.len(), .release);
     }
@@ -101,7 +104,11 @@ pub const Memtable = struct {
         }
 
         if (latest_kv) |kv| {
-            return kv.clone(alloc) catch return null;
+            // Return a borrowed KV that points to the skiplist data
+            // The caller should not call deinit() on borrowed KVs
+            var borrowed_kv = kv;
+            borrowed_kv.ownership = .borrowed;
+            return borrowed_kv;
         }
 
         return null;
@@ -167,16 +174,20 @@ test Memtable {
     try mtable.put(alloc, kv);
 
     var actual = mtable.get(alloc, "__key__");
-    defer actual.?.deinit(alloc);
+    // Don't call deinit on borrowed KVs
+    // defer actual.?.deinit(alloc);
 
     // then
     try testing.expectEqualStrings(kv.value, actual.?.value);
+    try testing.expectEqual(keyvalue.KVOwnership.borrowed, actual.?.ownership);
 
     const kv2 = KV.init("__key__", "__updated_value__");
     try mtable.put(alloc, kv2);
 
     var latest = mtable.get(alloc, "__key__");
-    defer latest.?.deinit(alloc);
+    // Don't call deinit on borrowed KVs
+    // defer latest.?.deinit(alloc);
 
     try testing.expectEqualStrings("__updated_value__", latest.?.value);
+    try testing.expectEqual(keyvalue.KVOwnership.borrowed, latest.?.ownership);
 }
