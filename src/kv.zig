@@ -14,6 +14,7 @@ const Endian = std.builtin.Endian.little;
 
 pub const KV = struct {
     key: []const u8,
+    ikey: ?[]const u8 = null,
     value: []const u8,
     timestamp: i128,
 
@@ -52,11 +53,12 @@ pub const KV = struct {
     }
 
     pub fn internalKey(self: Self, alloc: Allocator) ![]const u8 {
+        if (self.ikey) |key| return try alloc.dupe(u8, key);
         return encodeInternalKey(alloc, self.key, self.timestamp);
     }
 
     pub fn len(self: Self) u64 {
-        return @sizeOf(u64) + self.key.len + @sizeOf(u64) + self.value.len + @sizeOf(i128);
+        return @sizeOf(u64) + self.key.len + @sizeOf(i128) + @sizeOf(u64) + self.value.len;
     }
 
     pub fn order(a: []const u8, b: []const u8) Order {
@@ -64,7 +66,8 @@ pub const KV = struct {
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {
-        const min_size = @sizeOf(u64) + 1 + @sizeOf(u64) + 1 + @sizeOf(i128);
+        // key len key timestamp value len value
+        const min_size = @sizeOf(u64) + 1 + @sizeOf(i128) + @sizeOf(u64) + 1;
         if (data.len < min_size) {
             return error.InvalidData;
         }
@@ -84,7 +87,20 @@ pub const KV = struct {
         }
 
         const key = data[ptr .. ptr + key_len];
+        const internal_key = data[ptr .. ptr + key_len + @sizeOf(i128)];
+
         ptr += key_len;
+
+        if (ptr + @sizeOf(i128) > data.len) {
+            return error.InvalidData;
+        }
+
+        const timestamp = readInt(i128, @ptrCast(&data[ptr]), Endian);
+        if (timestamp <= 0) {
+            return error.InvalidTimestamp;
+        }
+
+        ptr += @sizeOf(i128);
 
         if (ptr + @sizeOf(u64) > data.len) {
             return error.InvalidData;
@@ -103,16 +119,8 @@ pub const KV = struct {
         const value = data[ptr .. ptr + value_len];
         ptr += value_len;
 
-        if (ptr + @sizeOf(i128) > data.len) {
-            return error.InvalidData;
-        }
-
-        const timestamp = readInt(i128, @ptrCast(&data[ptr]), Endian);
-        if (timestamp <= 0) {
-            return error.InvalidTimestamp;
-        }
-
         self.*.key = key;
+        self.*.ikey = internal_key;
         self.*.value = value;
         self.*.timestamp = timestamp;
     }
@@ -153,6 +161,12 @@ pub const KV = struct {
         @memcpy(ptr, self.key);
         ptr += self.key.len;
 
+        var timestamp_bytes: [@divExact(@typeInfo(i128).Int.bits, 8)]u8 = undefined;
+        writeInt(ByteAlignedInt(i128), &timestamp_bytes, self.timestamp, Endian);
+        @memcpy(ptr, &timestamp_bytes);
+
+        ptr += @sizeOf(i128);
+
         var value_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
         writeInt(ByteAlignedInt(u64), &value_len_bytes, self.value.len, Endian);
         @memcpy(ptr, &value_len_bytes);
@@ -160,12 +174,6 @@ pub const KV = struct {
 
         @memcpy(ptr, self.value);
         ptr += self.value.len;
-
-        var timestamp_bytes: [@divExact(@typeInfo(i128).Int.bits, 8)]u8 = undefined;
-        writeInt(ByteAlignedInt(i128), &timestamp_bytes, self.timestamp, Endian);
-        @memcpy(ptr, &timestamp_bytes);
-
-        ptr += @sizeOf(i128);
 
         return buf[0..len_];
     }
@@ -188,12 +196,16 @@ pub const KV = struct {
 };
 
 pub fn compare(a: KV, b: KV) std.math.Order {
-    const key_order = std.mem.order(u8, a.key, b.key);
+    const key_order = KV.order(a.key, b.key);
     if (key_order == .eq) {
-        return if (a.timestamp > b.timestamp) .gt else .eq;
+        return if (a.timestamp < b.timestamp) .lt else .gt;
     }
 
     return key_order;
+}
+
+pub fn userKeyCompare(a: KV, b: KV) std.math.Order {
+    return KV.order(a.key, b.key);
 }
 
 pub fn decode(byts: []const u8) !KV {
@@ -239,54 +251,36 @@ test "KV encode" {
 
     {
         // given
-        const kv = KV.init("__key__", "__value__");
+        var kv = KV.init("__key__", "__value__");
+        kv.timestamp = 1;
 
         // when
         const str = try kv.encodeAlloc(alloc);
         defer alloc.free(str);
 
         // then
-        const key_value_part = str[0 .. str.len - 16];
-
         try std.testing.expectEqualSlices(
             u8,
-            "\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__",
-            key_value_part,
+            "\x07\x00\x00\x00\x00\x00\x00\x00__key__\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\x00\x00\x00\x00\x00\x00__value__",
+            str,
         );
-
-        const timestamp_bytes = str[str.len - 16 ..];
-
-        var timestamp_array: [@divExact(@typeInfo(i128).Int.bits, 8)]u8 = undefined;
-        @memcpy(&timestamp_array, timestamp_bytes);
-
-        const timestamp = readInt(i128, &timestamp_array, Endian);
-        try std.testing.expect(timestamp > 0);
     }
 
     {
         // given
-        const kv = KV.init("__key__", "__value__");
+        var kv = KV.init("__key__", "__value__");
+        kv.timestamp = 1;
 
         // when
         var buf: [std.mem.page_size]u8 = undefined;
         const str = try kv.encode(&buf);
 
         // then
-        const key_value_part = str[0 .. str.len - 16];
-
         try std.testing.expectEqualSlices(
             u8,
-            "\x07\x00\x00\x00\x00\x00\x00\x00__key__\x09\x00\x00\x00\x00\x00\x00\x00__value__",
-            key_value_part,
+            "\x07\x00\x00\x00\x00\x00\x00\x00__key__\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\x00\x00\x00\x00\x00\x00__value__",
+            str,
         );
-
-        const timestamp_bytes = str[str.len - 16 ..];
-
-        var timestamp_array: [@divExact(@typeInfo(i128).Int.bits, 8)]u8 = undefined;
-        @memcpy(&timestamp_array, timestamp_bytes);
-
-        const timestamp = readInt(i128, &timestamp_array, Endian);
-        try std.testing.expect(timestamp > 0);
     }
 }
 
@@ -313,15 +307,16 @@ test "KV compare" {
     // given
     const kv1 = KV.init("key1", "value1");
     const kv2 = KV.init("key2", "value2");
-    const kv3 = KV.init("key1", "different_value");
+    var kv3 = KV.init("key1", "different_value");
+    kv3.timestamp = kv1.timestamp + 1;
 
     // then
     try std.testing.expectEqual(Order.lt, compare(kv1, kv2));
     try std.testing.expectEqual(Order.gt, compare(kv2, kv1));
-    try std.testing.expectEqual(Order.eq, compare(kv1, kv3));
+    try std.testing.expectEqual(Order.lt, compare(kv1, kv3));
     try std.testing.expectEqual(Order.lt, compare(kv3, kv2));
     try std.testing.expectEqual(Order.gt, compare(kv3, kv1));
 
-    try std.testing.expectEqual(KV.order(kv1.key, kv3.key), Order.eq);
+    try std.testing.expectEqual(Order.eq, KV.order(kv1.key, kv3.key));
     try std.testing.expect(!std.mem.eql(u8, kv1.value, kv3.value));
 }

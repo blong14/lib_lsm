@@ -424,26 +424,20 @@ pub const Database = struct {
                 var siter = try sstable.iterator(alloc);
                 defer siter.deinit();
 
-                var mtable = self.mtable.load(.seq_cst);
+                const nxt_table = try Memtable.init(alloc, sstable.id, self.opts);
                 while (siter.next()) |nxt| {
-                    try mtable.put(alloc, nxt);
+                    try nxt_table.put(alloc, nxt);
                 }
 
-                mtable.isFlushed.store(true, .seq_cst);
-                mtable.mutable.store(false, .seq_cst);
+                nxt_table.isFlushed.store(true, .seq_cst);
+                nxt_table.mutable.store(false, .seq_cst);
 
-                try self.mtables.append(mtable);
-
-                var new_id_buf: [64]u8 = undefined;
-                const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
-
-                const nxt_table = try Memtable.init(alloc, new_id, self.opts);
-
-                self.mtable.store(nxt_table, .seq_cst);
+                try self.mtables.append(nxt_table);
             }
         }
 
         std.log.info("database opened @ {s} w/ {d} warm tables", .{ self.opts.data_dir, self.mtables.items.len });
+        std.log.info("current hot table key count {d}", .{self.mtable.load(.seq_cst).count()});
     }
 
     pub fn read(self: *Self, alloc: Allocator, key: []const u8) !KV {
@@ -467,7 +461,7 @@ pub const Database = struct {
         defer alloc.free(internal_key);
 
         var kv: KV = undefined;
-        self.sstables.read(key, &kv) catch |err| return err;
+        try self.sstables.read(key, &kv);
 
         return kv.clone(alloc);
     }
@@ -495,8 +489,10 @@ pub const Database = struct {
         merger.* = try MergeIterator(KV, keyvalue.compare).init(alloc);
 
         const hot_table = self.mtable.load(.seq_cst);
-        const hot_iter = try hot_table.iterator(alloc);
-        try merger.add(hot_iter);
+        if (hot_table.count() > 0) {
+            const hot_iter = try hot_table.iterator(alloc);
+            try merger.add(hot_iter);
+        }
 
         var warm_tables: std.ArrayList(*Memtable) = undefined;
         {
@@ -511,8 +507,8 @@ pub const Database = struct {
             try merger.add(warm_iter);
         }
 
-        const siter = try self.sstables.iterator(alloc);
-        try merger.add(siter);
+        //const siter = try self.sstables.iterator(alloc);
+        //try merger.add(siter);
 
         const wrapper = try alloc.create(MergeIteratorWrapper);
         errdefer alloc.destroy(wrapper);
@@ -528,7 +524,7 @@ pub const Database = struct {
 
     const ScanWrapper = struct {
         alloc: Allocator,
-        scanner: *ScanIterator(KV, keyvalue.compare),
+        scanner: *ScanIterator(KV, keyvalue.userKeyCompare),
         iterator: Iterator(KV),
 
         const Wrapper = @This();
@@ -559,8 +555,8 @@ pub const Database = struct {
 
         const base_iter = try self.iterator(alloc);
 
-        const si = try alloc.create(ScanIterator(KV, keyvalue.compare));
-        si.* = ScanIterator(KV, keyvalue.compare).init(base_iter, start, end);
+        const si = try alloc.create(ScanIterator(KV, keyvalue.userKeyCompare));
+        si.* = ScanIterator(KV, keyvalue.userKeyCompare).init(base_iter, start, end);
 
         const wrapper = try alloc.create(ScanWrapper);
         errdefer alloc.destroy(wrapper);

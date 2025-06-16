@@ -13,7 +13,6 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const KV = lsm.KV;
-const ThreadSafeByteAllocator = lsm.ThreadSafeBumpAllocator;
 
 const allocator = jemalloc.allocator;
 const usage =
@@ -82,17 +81,11 @@ pub fn main() !void {
 
     try db.open(allocator);
 
-    var byte_allocator = try ThreadSafeByteAllocator.init(allocator, 4096);
-    defer byte_allocator.deinit();
-
-    const alloc = byte_allocator.allocator();
-    defer byte_allocator.printStats();
-
     if (res.args.bench != 0) {
         benchmark(allocator, db);
     } else {
         // Fallback runnable used for simple scanning of the database files.
-        scanAndPrint(alloc, db);
+        iterator(allocator, db);
     }
 }
 
@@ -241,6 +234,7 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
             fn work(ctx: *ThreadContext) void {
                 var success_count: u64 = 0;
                 var error_count: u64 = 0;
+                const chunk_size = (ctx.end_idx - ctx.start_idx) / 5;
 
                 for (ctx.start_idx..ctx.end_idx) |i| {
                     const key = std.fmt.allocPrint(ctx.alloc, "key_{d}", .{i}) catch unreachable;
@@ -259,12 +253,12 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
                     success_count += 1;
 
                     // Periodically log progress
-                    const chunk_size = (ctx.end_idx - ctx.start_idx) / 5;
                     if (chunk_size > 0 and i % chunk_size == 0 and i > ctx.start_idx) {
                         const progress = (i - ctx.start_idx) * 100 / (ctx.end_idx - ctx.start_idx);
-                        std.log.debug("Thread {d} read progress: {d}%", .{
+                        std.log.debug("Thread {d} read progress: {d}% of {d}", .{
                             ctx.thread_id,
                             progress,
+                            ctx.end_idx - ctx.start_idx,
                         });
                     }
                 }
@@ -274,7 +268,6 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
             }
         }.work;
 
-        // Start timer and launch threads
         timer.reset();
 
         std.log.info("Starting read phase with {d} operations using {d} threads...", .{
@@ -286,12 +279,10 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
             ctx.thread = std.Thread.spawn(.{}, readWorker, .{ctx}) catch unreachable;
         }
 
-        // Wait for all threads to complete
         for (threads) |*ctx| {
             ctx.thread.join();
         }
 
-        // Calculate total counts
         var total_success: u64 = 0;
         var total_errors: u64 = 0;
 
@@ -305,7 +296,6 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
         std.log.info("Read phase completed: {d} successful, {d} missed", .{ total_success, total_errors });
     }
 
-    // Report results
     const write_ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(write_time)) / std.time.ns_per_s);
     const read_ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(read_time)) / std.time.ns_per_s);
 
@@ -318,15 +308,36 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
     });
 }
 
-fn scanAndPrint(alloc: Allocator, db: *lsm.Database) void {
-    var it = db.iterator(alloc) catch |err| @panic(@errorName(err));
+fn scan(alloc: Allocator, db: *lsm.Database, start: db.KV, end: db.KV) void {
+    var it = db.scan(alloc, start, end) catch |err| @panic(@errorName(err));
     defer it.deinit();
+
+    var w = std.io.bufferedWriter(std.io.getStdOut().writer());
+    defer w.flush() catch unreachable;
 
     var count: usize = 0;
     while (it.next()) |kv| {
         count += 1;
-        std.log.info("{s}", .{kv});
+        const out = std.fmt.allocPrint(alloc, "{s}\n", .{kv}) catch unreachable;
+        _ = w.write(out) catch unreachable;
     }
 
-    std.log.info("total rows {d}", .{count});
+    std.log.info("\ntotal rows {d}", .{count});
+}
+
+fn iterator(alloc: Allocator, db: *lsm.Database) void {
+    var it = db.iterator(alloc) catch |err| @panic(@errorName(err));
+    defer it.deinit();
+
+    var w = std.io.bufferedWriter(std.io.getStdOut().writer());
+    defer w.flush() catch unreachable;
+
+    var count: usize = 0;
+    while (it.next()) |kv| {
+        count += 1;
+        const out = std.fmt.allocPrint(alloc, "{s}\n", .{kv}) catch unreachable;
+        _ = w.write(out) catch unreachable;
+    }
+
+    std.log.info("\ntotal rows {d}", .{count});
 }
