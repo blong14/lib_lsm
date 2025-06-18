@@ -60,7 +60,13 @@ pub fn SkipList(
             const v = try encodeFn(alloc, value);
             defer alloc.free(v);
 
-            const result = c.skiplist_insert(self.impl, key.ptr, key.len, v.ptr, v.len);
+            try self.putRaw(key, v);
+        }
+
+        /// Zero-copy version that accepts pre-encoded value bytes directly.
+        /// This is useful when reading from mmapped data to avoid extra allocations.
+        pub fn putRaw(self: *Self, key: []const u8, value_bytes: []const u8) !void {
+            const result = c.skiplist_insert(self.impl, key.ptr, key.len, value_bytes.ptr, value_bytes.len);
             if (result != 0) {
                 std.log.err("not able to insert {d}", .{result});
                 return SkipListError.FailedInsert;
@@ -113,23 +119,13 @@ pub fn SkipList(
 
                 const alloc = it.arena.allocator();
 
-                // Store the data in our arena so the KV can borrow from it
-                const val = alloc.alloc(u8, value_len) catch unreachable;
-                @memcpy(val, value_buffer[0..value_len]);
+                const raw = alloc.alloc(u8, value_len) catch unreachable;
+                @memcpy(raw, value_buffer[0..value_len]);
 
-                // Keep reference to ensure data stays valid
-                it.current_data = val;
-
-                // Create a borrowed KV that points to our arena data
-                var kv = decodeFn(val) catch |err| {
+                return decodeFn(raw) catch |err| {
                     std.log.err("value decode failed: {s}", .{@errorName(err)});
                     return null;
                 };
-
-                // Ensure it's marked as borrowed since it points to arena data
-                kv.ownership = .borrowed;
-
-                return kv;
             }
         };
 

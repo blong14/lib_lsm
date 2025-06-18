@@ -19,8 +19,8 @@ pub const KVOwnership = enum {
 
 pub const KV = struct {
     key: []const u8,
-    ikey: ?[]const u8 = null,
     value: []const u8,
+    raw_bytes: ?[]const u8 = null,
     timestamp: i128,
     ownership: KVOwnership = .borrowed,
 
@@ -36,63 +36,64 @@ pub const KV = struct {
     }
 
     pub fn initOwned(alloc: Allocator, key: []const u8, value: []const u8) !Self {
-        const key_copy = try alloc.dupe(u8, key);
-        errdefer alloc.free(key_copy);
+        var kv = KV.init(key, value);
 
-        const value_copy = try alloc.dupe(u8, value);
-        errdefer alloc.free(value_copy);
+        // [(keylen)(key)(ts)(valuelen)(value)]
+        const raw = try kv.encodeAlloc(alloc);
+        errdefer alloc.free(raw);
+
+        const key_start = @sizeOf(u64);
+        const value_start = @sizeOf(u64) + key.len + @sizeOf(i128) + @sizeOf(u64);
 
         return .{
-            .key = key_copy,
-            .value = value_copy,
-            .timestamp = createTimestamp(),
+            .key = raw[key_start .. key_start + key.len],
+            .value = raw[value_start .. value_start + value.len],
+            .raw_bytes = raw,
+            .timestamp = kv.timestamp,
             .ownership = .owned,
         };
     }
 
-    /// Create a KV that borrows data from a buffer (zero-copy)
-    pub fn fromBuffer(buffer: []const u8) !Self {
-        var kv: KV = undefined;
-        try kv.decode(buffer);
-        kv.ownership = .borrowed;
-        return kv;
-    }
-
     pub fn deinit(self: *Self, alloc: Allocator) void {
         if (self.ownership == .owned) {
-            alloc.free(self.key);
-            alloc.free(self.value);
+            if (self.raw_bytes) |raw| {
+                alloc.free(raw);
+            }
         }
         self.* = undefined;
     }
 
     pub fn clone(self: Self, alloc: Allocator) !KV {
-        const key_copy = try alloc.dupe(u8, self.key);
-        errdefer alloc.free(key_copy);
+        // [(keylen)(key)(ts)(valuelen)(value)]
+        const raw = try self.encodeAlloc(alloc);
+        errdefer alloc.free(raw);
 
-        const value_copy = try alloc.dupe(u8, self.value);
-        errdefer alloc.free(value_copy);
+        const key_start = @sizeOf(u64);
+        const value_start = @sizeOf(u64) + self.key.len + @sizeOf(i128) + @sizeOf(u64);
 
-        return KV{
-            .key = key_copy,
-            .value = value_copy,
+        return .{
+            .key = raw[key_start .. key_start + self.key.len],
+            .value = raw[value_start .. value_start + self.value.len],
+            .raw_bytes = raw,
             .timestamp = self.timestamp,
             .ownership = .owned,
         };
-    }
-
-    /// Create an owned copy of this KV
-    pub fn toOwned(self: Self, alloc: Allocator) !KV {
-        return self.clone(alloc);
     }
 
     pub fn userKey(self: Self) []const u8 {
         return self.key;
     }
 
+    pub fn userValue(self: Self) []const u8 {
+        return self.value;
+    }
+
     pub fn internalKey(self: Self, alloc: Allocator) ![]const u8 {
-        if (self.ikey) |key| return try alloc.dupe(u8, key);
-        return encodeInternalKey(alloc, self.key, self.timestamp);
+        if (self.raw_bytes) |raw| {
+            return raw[0 .. self.key.len + @sizeOf(i128)];
+        }
+
+        return try encodeInternalKey(alloc, self.key, self.timestamp);
     }
 
     pub fn len(self: Self) u64 {
@@ -125,7 +126,6 @@ pub const KV = struct {
         }
 
         const key = data[ptr .. ptr + key_len];
-        const internal_key = data[ptr .. ptr + key_len + @sizeOf(i128)];
 
         ptr += key_len;
 
@@ -158,16 +158,16 @@ pub const KV = struct {
         ptr += value_len;
 
         self.*.key = key;
-        self.*.ikey = internal_key;
         self.*.value = value;
         self.*.timestamp = timestamp;
         self.*.ownership = .borrowed; // Decoded KVs borrow from the source buffer
+        self.*.raw_bytes = data;
     }
 
     pub fn encodeAlloc(self: Self, alloc: Allocator) ![]const u8 {
+        if (self.raw_bytes) |raw| return raw;
         const buf = try alloc.alloc(u8, self.len());
-        const data = try self.encode(buf);
-        return data;
+        return try self.encode(buf);
     }
 
     pub fn encode(self: Self, buf: []u8) ![]u8 {
@@ -338,6 +338,7 @@ test "KV decode" {
     // then
     try std.testing.expectEqualStrings(original.key, decoded.key);
     try std.testing.expectEqualStrings(original.value, decoded.value);
+    try std.testing.expectEqualSlices(u8, encoded, decoded.raw_bytes.?);
     try std.testing.expectEqual(original.timestamp, decoded.timestamp);
     try std.testing.expectEqual(original.len(), decoded.len());
     try std.testing.expectEqual(KVOwnership.borrowed, decoded.ownership);
