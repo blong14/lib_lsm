@@ -1097,6 +1097,7 @@ pub const SSTable = struct {
                 const offset_ptr: *const [offset_sz]u8 = @ptrCast(&self.block.offset_data.items[self.nxt]);
                 const nxt_offset = readInt(u64, offset_ptr, Endian);
 
+                // Get the KV as a borrowed reference to the block's data
                 kv = self.block.read(nxt_offset) catch |err| {
                     std.log.err("sstable iter error {s}", .{@errorName(err)});
                     return null;
@@ -1249,20 +1250,25 @@ test "SSTableStore flush and compaction" {
     defer alloc.free(pathname);
     defer testDir.dir.deleteTree(pathname) catch {};
 
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
     var dopts = options.defaultOpts();
     dopts.data_dir = pathname;
     dopts.num_levels = 3;
 
-    var store = try SSTableStore.init(alloc, dopts);
-    defer store.deinit(alloc);
+    var store = try SSTableStore.init(allocator, dopts);
+    defer store.deinit(allocator);
 
-    var memtable = try Memtable.init(alloc, "level-0", dopts);
-    defer alloc.destroy(memtable);
+    var memtable = try Memtable.init(allocator, "level-0", dopts);
+    defer allocator.destroy(memtable);
     defer memtable.deinit();
 
-    try memtable.put(alloc, KV.init("flush_key1", "flush_value1"));
-    try memtable.put(alloc, KV.init("flush_key2", "flush_value2"));
-    try memtable.put(alloc, KV.init("flush_key3", "flush_value3"));
+    try memtable.put(allocator, try KV.initOwned(allocator, "flush_key1", "flush_value1"));
+    try memtable.put(allocator, try KV.initOwned(allocator, "flush_key2", "flush_value2"));
+    try memtable.put(allocator, try KV.initOwned(allocator, "flush_key3", "flush_value3"));
 
     // Flush memtable to SSTable
     {

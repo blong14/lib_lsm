@@ -575,7 +575,8 @@ pub const Database = struct {
             return error.InvalidKeyData;
         }
 
-        const item = KV.init(key, value);
+        var item = try KV.initOwned(alloc, key, value);
+        defer item.deinit(alloc);
 
         var mtable = self.mtable.load(.seq_cst);
         if ((mtable.size() + item.len()) >= self.capacity) {

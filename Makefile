@@ -19,8 +19,8 @@ ZIG_DEBUG_OPTS := -Dcpu=x86_64 -Doptimize=Debug
 
 # Runtime options
 DATA_DIR := /home/blong14/Developer/git/lib_lsm/.tmp/data
-# MODE := singlethreaded
-MODE := multithreaded
+MODE := singlethreaded
+# MODE := multithreaded
 SST_CAPACITY := 1000000
 
 # Help command
@@ -78,21 +78,21 @@ fmt:
 	@$(ZIG) build $(ZIG_COMMON_FLAGS) fmt
 
 perf:
-	perf record -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) xlsm -- \
-		--input data/measurements.txt \
+	perf record --call-graph dwarf -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
-	perf script --input=perf.data -F +pid > perf.processed.data
-
-profile:
-	$(ZIG) build $(ZIG_RELEASE_OPTS) xlsm -- \
-		--mode $(MODE) \
-		--input data/measurements.txt \
-		--data_dir $(DATA_DIR) \
-		--sst_capacity $(SST_CAPACITY)
+	# perf script --input=perf.data -F +pid > perf.processed.data
 
 run:
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
+
+profile:
+	rm -rf .tmp/data/*.dat
+	$(ZIG) build $(ZIG_RELEASE_OPTS) xlsm -- \
+		--mode $(MODE) \
+		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 
@@ -110,8 +110,8 @@ coverage:
 
 poop: build 
 	./bin/poop \
-		'./$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./data/measurements.txt --sst_capacity 1_000_000' \
-		'./$(EXEC) --data_dir ./.tmp/data/data2 --mode multithreaded --input ./data/measurements.txt --sst_capacity 1_000_000'
+		'./$(EXEC) --data_dir .tmp/data/data1 --mode singlethreaded --input data/measurements.txt --sst_capacity 1_000_000' \
+		'./$(EXEC) --data_dir .tmp/data/data2 --mode multithreaded --input data/measurements.txt --sst_capacity 1_000_000'
 
 # Debug notes:
 # gdb --tui zig-out/bin/lsm

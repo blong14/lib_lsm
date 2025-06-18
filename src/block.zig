@@ -128,9 +128,7 @@ pub const Block = struct {
     }
 
     pub fn read(self: *Self, idx: usize) !KV {
-        var kv: KV = undefined;
-        try kv.decode(self.data.items[idx..]);
-        return kv;
+        return try keyvalue.decode(self.data.items[idx..]);
     }
 
     pub fn write(self: *Self, kv: KV) !usize {

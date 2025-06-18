@@ -60,7 +60,13 @@ pub fn SkipList(
             const v = try encodeFn(alloc, value);
             defer alloc.free(v);
 
-            const result = c.skiplist_insert(self.impl, key.ptr, key.len, v.ptr, v.len);
+            try self.putRaw(key, v);
+        }
+
+        /// Zero-copy version that accepts pre-encoded value bytes directly.
+        /// This is useful when reading from mmapped data to avoid extra allocations.
+        pub fn putRaw(self: *Self, key: []const u8, value_bytes: []const u8) !void {
+            const result = c.skiplist_insert(self.impl, key.ptr, key.len, value_bytes.ptr, value_bytes.len);
             if (result != 0) {
                 std.log.err("not able to insert {d}", .{result});
                 return SkipListError.FailedInsert;
@@ -70,6 +76,8 @@ pub fn SkipList(
         const SkiplistIterator = struct {
             arena: std.heap.ArenaAllocator,
             impl: *c.SkipMapIterator,
+            // Keep a buffer for the current KV data to ensure it stays valid
+            current_data: ?[]u8 = null,
 
             pub fn init(ctx: *anyopaque, alloc: Allocator) !SkiplistIterator {
                 return .{
@@ -111,11 +119,10 @@ pub fn SkipList(
 
                 const alloc = it.arena.allocator();
 
-                const val = alloc.alloc(u8, value_len) catch unreachable;
+                const raw = alloc.alloc(u8, value_len) catch unreachable;
+                @memcpy(raw, value_buffer[0..value_len]);
 
-                @memcpy(val, value_buffer[0..value_len]);
-
-                return decodeFn(val) catch |err| {
+                return decodeFn(raw) catch |err| {
                     std.log.err("value decode failed: {s}", .{@errorName(err)});
                     return null;
                 };
