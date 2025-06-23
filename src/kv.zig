@@ -111,61 +111,65 @@ pub const KV = struct {
             return error.InvalidData;
         }
 
-        var ptr: usize = 0;
         const max_key_size = 1024 * 1024; // 1MB
         const max_value_size = 16 * 1024 * 1024; // 16MB
 
-        const key_len = readInt(u64, @ptrCast(&data[ptr]), Endian);
+        // Use pointer arithmetic for better performance
+        var ptr = data.ptr;
+        const end_ptr = data.ptr + data.len;
+
+        // Read key length
+        const key_len = readInt(u64, @ptrCast(ptr), Endian);
         if (key_len == 0 or key_len > max_key_size) {
             return error.InvalidKeyLength;
         }
         ptr += @sizeOf(u64);
 
-        if (ptr + key_len > data.len) {
+        // Bounds check for key
+        if (ptr + key_len > end_ptr) {
             return error.InvalidData;
         }
 
-        const key = data[ptr .. ptr + key_len];
-
+        const key = ptr[0..key_len];
         ptr += key_len;
 
-        if (ptr + @sizeOf(i128) > data.len) {
+        // Bounds check for timestamp
+        if (ptr + @sizeOf(i128) > end_ptr) {
             return error.InvalidData;
         }
 
-        const timestamp = readInt(i128, @ptrCast(&data[ptr]), Endian);
+        const timestamp = readInt(i128, @ptrCast(ptr), Endian);
         if (timestamp <= 0) {
             return error.InvalidTimestamp;
         }
-
         ptr += @sizeOf(i128);
 
-        if (ptr + @sizeOf(u64) > data.len) {
+        // Bounds check for value length
+        if (ptr + @sizeOf(u64) > end_ptr) {
             return error.InvalidData;
         }
 
-        const value_len = readInt(u64, @ptrCast(&data[ptr]), Endian);
+        const value_len = readInt(u64, @ptrCast(ptr), Endian);
         if (value_len == 0 or value_len > max_value_size) {
             return error.InvalidValueLength;
         }
         ptr += @sizeOf(u64);
 
-        if (ptr + value_len > data.len) {
+        // Final bounds check for value
+        if (ptr + value_len > end_ptr) {
             return error.InvalidData;
         }
 
-        const value = data[ptr .. ptr + value_len];
-        ptr += value_len;
+        const value = ptr[0..value_len];
 
-        self.*.key = key;
-        self.*.value = value;
-        self.*.timestamp = timestamp;
-        self.*.ownership = .borrowed; // Decoded KVs borrow from the source buffer
-        self.*.raw_bytes = data;
+        self.key = key;
+        self.value = value;
+        self.timestamp = timestamp;
+        self.ownership = .borrowed;
+        self.raw_bytes = data;
     }
 
     pub fn encodeAlloc(self: Self, alloc: Allocator) ![]const u8 {
-        if (self.raw_bytes) |raw| return raw;
         const buf = try alloc.alloc(u8, self.len());
         return try self.encode(buf);
     }

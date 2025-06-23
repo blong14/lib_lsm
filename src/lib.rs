@@ -162,6 +162,46 @@ pub extern "C" fn skiplist_iterator_free(iter_ptr: *mut SkipMapIterator) {
     }
 }
 
+#[repr(C)]
+pub struct SkipMapEntry {
+    key_ptr: *const u8,
+    key_len: usize,
+    value_ptr: *const u8,
+    value_len: usize,
+}
+
+#[no_mangle]
+pub extern "C" fn skiplist_iterator_xnext(
+    iter_ptr: *mut SkipMapIterator,
+    entry_out: *mut SkipMapEntry,
+) -> c_int {
+    if iter_ptr.is_null() || entry_out.is_null() {
+        return -1; // Error: null pointer
+    }
+
+    let iterator = unsafe { &mut *iter_ptr };
+
+    match iterator.inner.next() {
+        Some(entry) => {
+            let entry_key = entry.key();
+            let entry_value = entry.value();
+
+            let key_bytes = entry_key.as_bytes();
+            let value_bytes = entry_value;
+
+            unsafe {
+                (*entry_out).key_ptr = key_bytes.as_ptr();
+                (*entry_out).key_len = key_bytes.len();
+                (*entry_out).value_ptr = value_bytes.as_ptr();
+                (*entry_out).value_len = value_bytes.len();
+            }
+
+            0 // Success
+        }
+        None => -1, // No more elements
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn skiplist_iterator_next(
     iter_ptr: *mut SkipMapIterator,

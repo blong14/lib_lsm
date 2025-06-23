@@ -96,19 +96,9 @@ pub fn SkipList(
             pub fn next(ctx: *anyopaque) ?V {
                 const it: *SkiplistIterator = @ptrCast(@alignCast(ctx));
 
-                var key_buffer: [4096]u8 = undefined;
-                var key_len: usize = key_buffer.len;
+                var entry: c.SkipMapEntry = undefined;
+                const result = c.skiplist_iterator_xnext(it.impl, &entry);
 
-                var value_buffer: [4096]u8 = undefined;
-                var value_len: usize = value_buffer.len;
-
-                const result = c.skiplist_iterator_next(
-                    it.impl,
-                    &key_buffer[0],
-                    &key_len,
-                    &value_buffer[0],
-                    &value_len,
-                );
                 if (result == -1) {
                     // No more elements
                     return null;
@@ -117,12 +107,10 @@ pub fn SkipList(
                     return null;
                 }
 
-                const alloc = it.arena.allocator();
+                // Get direct view of the value data without copying
+                const value_slice = @as([*]const u8, @ptrCast(entry.value_ptr))[0..entry.value_len];
 
-                const raw = alloc.alloc(u8, value_len) catch unreachable;
-                @memcpy(raw, value_buffer[0..value_len]);
-
-                return decodeFn(raw) catch |err| {
+                return decodeFn(value_slice) catch |err| {
                     std.log.err("value decode failed: {s}", .{@errorName(err)});
                     return null;
                 };

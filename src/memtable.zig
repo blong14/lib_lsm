@@ -71,10 +71,14 @@ pub const Memtable = struct {
         if (item.raw_bytes) |raw| {
             var data = self.data.load(.acquire);
             try data.putRaw(try item.internalKey(alloc), raw);
-
             _ = self.byte_count.fetchAdd(raw.len, .release);
         } else {
-            return error.MissingRawData;
+            var kv = try item.clone(alloc);
+            defer kv.deinit(alloc);
+
+            var data = self.data.load(.acquire);
+            try data.putRaw(try kv.internalKey(alloc), kv.raw_bytes.?);
+            _ = self.byte_count.fetchAdd(kv.raw_bytes.?.len, .release);
         }
     }
 
@@ -99,7 +103,7 @@ pub const Memtable = struct {
         }
 
         if (latest_kv) |kv| {
-            return kv;
+            return kv.clone(alloc) catch return null;
         }
 
         return null;

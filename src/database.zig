@@ -391,11 +391,11 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        mtx.lock();
-        defer mtx.unlock();
-
         self.agent.stop();
         self.agent.deinit();
+
+        mtx.lock();
+        defer mtx.unlock();
 
         for (self.mtables.items) |mtable| {
             mtable.deinit();
@@ -426,7 +426,10 @@ pub const Database = struct {
 
                 const nxt_table = try Memtable.init(alloc, sstable.id, self.opts);
                 while (siter.next()) |nxt| {
-                    try nxt_table.put(alloc, nxt);
+                    var key_copy = try nxt.clone(alloc);
+                    defer key_copy.deinit(alloc);
+
+                    try nxt_table.put(alloc, key_copy);
                 }
 
                 nxt_table.isFlushed.store(true, .seq_cst);
@@ -443,7 +446,7 @@ pub const Database = struct {
     pub fn read(self: *Self, alloc: Allocator, key: []const u8) !KV {
         const hot_table = self.mtable.load(.seq_cst);
         if (hot_table.get(alloc, key)) |kv| {
-            return kv;
+            return kv.clone(alloc);
         }
 
         mtx.lock();
@@ -453,7 +456,7 @@ pub const Database = struct {
 
         for (warm_tables.items) |mtable| {
             if (mtable.get(alloc, key)) |kv| {
-                return kv;
+                return kv.clone(alloc);
             }
         }
 

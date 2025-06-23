@@ -105,7 +105,7 @@ const SingleThreadedImpl = struct {
             return err;
         };
         defer allocator.destroy(db);
-        defer db.deinit(allocator);
+        // defer db.deinit(allocator);
 
         var idx: usize = 0;
         var data = [2][]const u8{ undefined, undefined };
@@ -121,15 +121,10 @@ const SingleThreadedImpl = struct {
                 }
                 idx += 1;
                 if (idx == 2) {
-                    const key_len = data[0].len;
-                    const value_len = data[1].len;
+                    var kv = try lsm.KV.initOwned(allocator, data[0], data[1]);
+                    defer kv.deinit(allocator);
 
-                    const byts = try allocator.alloc(u8, key_len + value_len);
-
-                    mem.copyForwards(u8, byts[0..key_len], data[0]);
-                    mem.copyForwards(u8, byts[key_len..], data[1]);
-
-                    db.write(allocator, byts[0..key_len], byts[key_len..]) catch |err| {
+                    db.write(allocator, kv.key, kv.value) catch |err| {
                         debug.print(
                             "database write error: key {s} value {s} error {s}\n",
                             .{ data[0], data[1], @errorName(err) },
