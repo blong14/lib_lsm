@@ -128,9 +128,7 @@ pub const Block = struct {
     }
 
     pub fn read(self: *Self, idx: usize) !KV {
-        var kv: KV = undefined;
-        try kv.decode(self.data.items[idx..]);
-        return kv;
+        return try keyvalue.decode(self.data.items[idx..]);
     }
 
     pub fn write(self: *Self, kv: KV) !usize {
@@ -141,15 +139,20 @@ pub const Block = struct {
 
         const data_writer = self.data.writer();
 
-        const encoded_kv = try kv.encodeAlloc(self.alloc);
-        defer self.alloc.free(encoded_kv);
+        var byte_count: u64 = 0;
+        if (kv.raw_bytes) |encoded_kv| {
+            byte_count = try data_writer.write(encoded_kv);
+            assert(byte_count == encoded_kv.len);
+        } else {
+            const encoded_kv = try kv.encodeAlloc(self.alloc);
+            defer self.alloc.free(encoded_kv);
 
-        const byte_count = try data_writer.write(encoded_kv);
-        assert(byte_count == encoded_kv.len);
+            byte_count = try data_writer.write(encoded_kv);
+            assert(byte_count == encoded_kv.len);
+        }
 
         self.*.count += 1;
         self.*.byte_count += @sizeOf(u64) + byte_count;
-
         return offset;
     }
 
