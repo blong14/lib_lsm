@@ -444,29 +444,32 @@ pub const Database = struct {
     }
 
     pub fn read(self: *Self, alloc: Allocator, key: []const u8) !KV {
-        const hot_table = self.mtable.load(.seq_cst);
-        if (hot_table.get(alloc, key)) |kv| {
-            return kv.clone(alloc);
-        }
+        var iter_obj = try self.scan(alloc, key, key);
+        defer iter_obj.deinit();
 
-        mtx.lock();
-        const warm_tables = try self.mtables.clone();
-        mtx.unlock();
-        defer warm_tables.deinit();
+        var latest_kv: ?KV = null;
+        var latest_timestamp: i128 = std.math.minInt(i128);
 
-        for (warm_tables.items) |mtable| {
-            if (mtable.get(alloc, key)) |kv| {
-                return kv.clone(alloc);
+        while (iter_obj.next()) |kv| {
+            switch (std.mem.order(u8, kv.userKey(), key)) {
+                .lt => continue,
+                .eq => {
+                    const timestamp = kv.timestamp;
+
+                    if (timestamp > latest_timestamp) {
+                        latest_kv = kv;
+                        latest_timestamp = timestamp;
+                    }
+                },
+                .gt => break,
             }
         }
 
-        const internal_key = try keyvalue.encodeInternalKey(alloc, key, null);
-        defer alloc.free(internal_key);
+        if (latest_kv) |k| {
+            return try k.clone(alloc);
+        }
 
-        var kv: KV = undefined;
-        try self.sstables.read(key, &kv);
-
-        return kv.clone(alloc);
+        return error.NotFound;
     }
 
     const MergeIteratorWrapper = struct {
@@ -510,6 +513,8 @@ pub const Database = struct {
             try merger.add(warm_iter);
         }
 
+        // TODO: Add this back
+        //
         //const siter = try self.sstables.iterator(alloc);
         //try merger.add(siter);
 

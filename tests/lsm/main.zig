@@ -105,7 +105,7 @@ const SingleThreadedImpl = struct {
             return err;
         };
         defer allocator.destroy(db);
-        // defer db.deinit(allocator);
+        defer db.deinit(allocator);
 
         var idx: usize = 0;
         var data = [2][]const u8{ undefined, undefined };

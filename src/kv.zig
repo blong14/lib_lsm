@@ -116,49 +116,32 @@ pub const KV = struct {
 
         // Use pointer arithmetic for better performance
         var ptr = data.ptr;
-        const end_ptr = data.ptr + data.len;
 
         // Read key length
         const key_len = readInt(u64, @ptrCast(ptr), Endian);
         if (key_len == 0 or key_len > max_key_size) {
             return error.InvalidKeyLength;
         }
+
         ptr += @sizeOf(u64);
 
-        // Bounds check for key
-        if (ptr + key_len > end_ptr) {
-            return error.InvalidData;
-        }
-
         const key = ptr[0..key_len];
-        ptr += key_len;
 
-        // Bounds check for timestamp
-        if (ptr + @sizeOf(i128) > end_ptr) {
-            return error.InvalidData;
-        }
+        ptr += key_len;
 
         const timestamp = readInt(i128, @ptrCast(ptr), Endian);
         if (timestamp <= 0) {
             return error.InvalidTimestamp;
         }
-        ptr += @sizeOf(i128);
 
-        // Bounds check for value length
-        if (ptr + @sizeOf(u64) > end_ptr) {
-            return error.InvalidData;
-        }
+        ptr += @sizeOf(i128);
 
         const value_len = readInt(u64, @ptrCast(ptr), Endian);
         if (value_len == 0 or value_len > max_value_size) {
             return error.InvalidValueLength;
         }
-        ptr += @sizeOf(u64);
 
-        // Final bounds check for value
-        if (ptr + value_len > end_ptr) {
-            return error.InvalidData;
-        }
+        ptr += @sizeOf(u64);
 
         const value = ptr[0..value_len];
 

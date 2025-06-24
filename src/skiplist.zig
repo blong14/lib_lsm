@@ -97,8 +97,8 @@ pub fn SkipList(
                 const it: *SkiplistIterator = @ptrCast(@alignCast(ctx));
 
                 var entry: c.SkipMapEntry = undefined;
-                const result = c.skiplist_iterator_xnext(it.impl, &entry);
 
+                const result = c.skiplist_iterator_next(it.impl, &entry);
                 if (result == -1) {
                     // No more elements
                     return null;
@@ -107,7 +107,6 @@ pub fn SkipList(
                     return null;
                 }
 
-                // Get direct view of the value data without copying
                 const value_slice = @as([*]const u8, @ptrCast(entry.value_ptr))[0..entry.value_len];
 
                 return decodeFn(value_slice) catch |err| {
