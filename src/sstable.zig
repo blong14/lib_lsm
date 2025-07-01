@@ -843,10 +843,7 @@ pub const SSTableStore = struct {
 
         var keys_written: u64 = 0;
         while (it.next()) |nxt| {
-            var kv_copy = try nxt.clone(alloc);
-            defer kv_copy.deinit(alloc);
-
-            _ = sstable.write(kv_copy) catch |err| switch (err) {
+            _ = sstable.write(nxt) catch |err| switch (err) {
                 error.DuplicateError => continue,
                 else => {
                     std.log.err(
@@ -1033,11 +1030,17 @@ pub const SSTable = struct {
         // idea 1: check block meta to see if the key is even in this block
         // idea 2: update API to accept an index instead of a key
         // idea 3: map keys and indices
-        var stream = fixedBufferStream(self.block.offset_data.items);
-        var stream_reader = stream.reader();
+        const offset_sz = @sizeOf(u64);
+        const offset_data = self.block.offset_data.items;
+        const offset_total = offset_data.len / offset_sz;
 
-        while (stream.pos < stream.buffer.len) {
-            const idx = try stream_reader.readInt(u64, Endian);
+        var start: usize = 0;
+        var end: usize = offset_total;
+
+        while (start < end) {
+            const mid: usize = start + (end - start) / 2;
+            const offset_ptr: *const [offset_sz]u8 = @ptrCast(&offset_data[mid * offset_sz]);
+            const idx = readInt(u64, offset_ptr, Endian);
 
             const value = self.block.read(idx) catch |err| {
                 std.log.err(
@@ -1047,23 +1050,18 @@ pub const SSTable = struct {
                 return err;
             };
 
-            if (std.mem.eql(u8, value.key, key)) {
-                kv.* = value;
-
-                // Record read latency if we have access to stats
-                // This is a bit of a hack since we don't have direct access to the store's stats
-                // In a real implementation, we might want to pass the stats object or use a global context
-                // const start_time = std.time.nanoTimestamp();
-                // const end_time = std.time.nanoTimestamp();
-                // const latency = @as(u64, @intCast(end_time - start_time));
-
-                return;
+            switch (std.mem.order(u8, key, value.key)) {
+                .lt => end = mid,
+                .gt => start = mid + 1,
+                .eq => {
+                    kv.* = value;
+                    return;
+                },
             }
         }
 
         return error.NotFound;
     }
-
     pub fn write(self: *Self, value: KV) !usize {
         if (self.mutable) {
             const idx = self.block.write(value) catch |err| {

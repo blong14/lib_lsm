@@ -201,4 +201,3 @@ pub extern "C" fn skiplist_iterator_next(
         None => -1, // No more elements
     }
 }
-

@@ -63,8 +63,12 @@ pub const KV = struct {
         self.* = undefined;
     }
 
+    pub fn valid(self: Self) bool {
+        return self.raw_bytes != null;
+    }
+
     pub fn clone(self: Self, alloc: Allocator) !KV {
-        // [(keylen)(key)(ts)(valuelen)(value)]
+        // [(keylen)(key)(ts)(vjaluelen)(value)]
         const raw = try self.encodeAlloc(alloc);
         errdefer alloc.free(raw);
 
@@ -164,7 +168,7 @@ pub const KV = struct {
         }
 
         const max_value_size = 16 * 1024 * 1024; // 16MB
-        if (self.value.len == 0 or self.value.len > max_value_size) {
+        if (self.value.len > max_value_size) {
             return error.InvalidValueLength;
         }
 
@@ -213,16 +217,17 @@ pub const KV = struct {
         _ = fmt;
         _ = options;
 
-        try writer.print("{s}\t{d}\t{d}", .{
+        try writer.print("{s}\t{d}\t{d}\t{}", .{
             self.key,
             self.timestamp,
-            self.len(),
+            self.key.len,
+            self.ownership,
         });
     }
 };
 
 pub fn compare(a: KV, b: KV) std.math.Order {
-    const key_order = KV.order(a.key, b.key);
+    const key_order = std.mem.order(u8, a.key, b.key);
     if (key_order == .eq) {
         return if (a.timestamp < b.timestamp) .lt else .gt;
     }

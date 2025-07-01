@@ -83,30 +83,9 @@ pub const Memtable = struct {
     }
 
     pub fn get(self: Self, alloc: Allocator, key: []const u8) ?KV {
+        _ = alloc;
         const data = self.data.load(.acquire);
-
-        var iter_obj = data.iterator(alloc) catch return null;
-        defer iter_obj.deinit();
-
-        var latest_kv: ?KV = null;
-        var latest_timestamp: i128 = std.math.minInt(i128);
-
-        while (iter_obj.next()) |kv| {
-            if (std.mem.eql(u8, kv.userKey(), key)) {
-                const timestamp = kv.timestamp;
-
-                if (timestamp > latest_timestamp) {
-                    latest_kv = kv;
-                    latest_timestamp = timestamp;
-                }
-            }
-        }
-
-        if (latest_kv) |kv| {
-            return kv.clone(alloc) catch return null;
-        }
-
-        return null;
+        return data.get(key) catch return null;
     }
 
     pub fn count(self: Self) usize {

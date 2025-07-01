@@ -90,7 +90,7 @@ pub fn main() !void {
 }
 
 fn benchmark(alloc: Allocator, db: *lsm.Database) void {
-    const num_ops = 10_000;
+    const num_ops = 100_000;
 
     // Number of worker threads to use - adjust based on available cores
     const num_threads: u64 = @min(16, std.Thread.getCpuCount() catch 4);
@@ -149,10 +149,11 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
         // Worker function for writes
         const writeWorker = struct {
             fn work(ctx: *ThreadContext) void {
-                var arena = lsm.ThreadSafeBumpAllocator.init(ctx.alloc, 1024 * 1024) catch unreachable;
-                defer arena.deinit();
+                // var arena = lsm.ThreadSafeBumpAllocator.init(ctx.alloc, 1024 * 1024) catch unreachable;
+                // defer arena.deinit();
 
-                const malloc = arena.allocator();
+                // const malloc = arena.allocator();
+                const malloc = ctx.alloc;
 
                 var success_count: u64 = 0;
                 var error_count: u64 = 0;
@@ -334,7 +335,7 @@ fn iterator(alloc: Allocator, db: *lsm.Database) void {
     var it = db.iterator(alloc) catch |err| @panic(@errorName(err));
     defer it.deinit();
 
-    // var w = std.io.bufferedWriter(std.io.getStdOut().writer());
+    var w = std.io.bufferedWriter(std.io.getStdOut().writer());
 
     // var arena = lsm.ThreadSafeBumpAllocator.init(alloc, 1024 * 1024) catch unreachable;
     // defer arena.deinit();
@@ -343,13 +344,12 @@ fn iterator(alloc: Allocator, db: *lsm.Database) void {
 
     var count: usize = 0;
     while (it.next()) |kv| {
-        _ = kv;
+        const out = std.fmt.allocPrint(alloc, "{s}\n", .{kv}) catch unreachable;
+        _ = w.write(out) catch unreachable;
         count += 1;
-        // const out = std.fmt.allocPrint(malloc, "{s}\n", .{kv}) catch unreachable;
-        // _ = w.write(out) catch unreachable;
     }
 
-    // w.flush() catch unreachable;
+    w.flush() catch unreachable;
 
     std.log.info("\ntotal rows {d}", .{count});
 }

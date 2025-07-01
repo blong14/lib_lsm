@@ -444,24 +444,42 @@ pub const Database = struct {
     }
 
     pub fn read(self: *Self, alloc: Allocator, key: []const u8) !KV {
-        var iter_obj = try self.scan(alloc, key, key);
-        defer iter_obj.deinit();
+        var kvs = std.ArrayList(KV).init(alloc);
+
+        const hot_table = self.mtable.load(.seq_cst);
+        if (hot_table.get(alloc, key)) |kv| {
+            try kvs.append(kv);
+        }
+
+        mtx.lock();
+        const items = try self.mtables.clone();
+        mtx.unlock();
+
+        for (items.items) |table| {
+            if (table.get(alloc, key)) |kv| {
+                try kvs.append(kv);
+            }
+        }
+
+        var skv: KV = undefined;
+        self.sstables.read(key, &skv) catch |err| {
+            if (err != error.NotFound) {
+                return err;
+            }
+        };
+        if (skv.valid()) {
+            try kvs.append(skv);
+        }
 
         var latest_kv: ?KV = null;
         var latest_timestamp: i128 = std.math.minInt(i128);
 
-        while (iter_obj.next()) |kv| {
-            switch (std.mem.order(u8, kv.userKey(), key)) {
-                .lt => continue,
-                .eq => {
-                    const timestamp = kv.timestamp;
+        for (kvs.items) |kv| {
+            const timestamp = kv.timestamp;
 
-                    if (timestamp > latest_timestamp) {
-                        latest_kv = kv;
-                        latest_timestamp = timestamp;
-                    }
-                },
-                .gt => break,
+            if (timestamp >= latest_timestamp) {
+                latest_kv = kv;
+                latest_timestamp = timestamp;
             }
         }
 
@@ -509,6 +527,7 @@ pub const Database = struct {
         defer warm_tables.deinit();
 
         for (warm_tables.items) |mtable| {
+            std.debug.print("warm table {any} count {d}\n", .{ &mtable, mtable.count() });
             const warm_iter = try mtable.iterator(alloc);
             try merger.add(warm_iter);
         }
@@ -540,6 +559,12 @@ pub const Database = struct {
         pub fn deinit(ctx: *anyopaque) void {
             const sw: *Wrapper = @ptrCast(@alignCast(ctx));
             sw.iterator.deinit();
+            if (sw.scanner.start) |start| {
+                @constCast(&start).deinit(sw.alloc);
+            }
+            if (sw.scanner.end) |end| {
+                @constCast(&end).deinit(sw.alloc);
+            }
             sw.alloc.destroy(sw.scanner);
             sw.alloc.destroy(sw);
         }
@@ -558,8 +583,8 @@ pub const Database = struct {
         start_key: []const u8,
         end_key: []const u8,
     ) !Iterator(KV) {
-        const start = KV.init(start_key, "");
-        const end = KV.init(end_key, "");
+        const start = try KV.initOwned(alloc, start_key, "");
+        const end = try KV.initOwned(alloc, end_key, "");
 
         const base_iter = try self.iterator(alloc);
 
@@ -641,6 +666,7 @@ pub const Database = struct {
 
         for (self.mtables.items) |table| {
             if (!table.flushed()) {
+                std.debug.print("sstables flush...\n", .{});
                 self.sstables.flush(alloc, table) catch |err| {
                     std.log.err(
                         "sstables not able to flush mtable {s} {s}",
