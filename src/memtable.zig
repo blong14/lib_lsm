@@ -68,43 +68,24 @@ pub const Memtable = struct {
             return error.MemtableImmutable;
         }
 
-        // We create a unique key for every valid put operation in the format
-        // {user_key}_{timestamp}. This allows us to maintain multiple versions
-        // of the same user key with different timestamps.
-        const key = try item.internalKey(alloc);
-        defer alloc.free(key);
+        if (item.raw_bytes) |raw| {
+            var data = self.data.load(.acquire);
+            try data.putRaw(try item.internalKey(alloc), raw);
+            _ = self.byte_count.fetchAdd(raw.len, .release);
+        } else {
+            var kv = try item.clone(alloc);
+            defer kv.deinit(alloc);
 
-        var data = self.data.load(.acquire);
-        try data.put(alloc, key, item);
-
-        _ = self.byte_count.fetchAdd(item.len(), .release);
+            var data = self.data.load(.acquire);
+            try data.putRaw(try kv.internalKey(alloc), kv.raw_bytes.?);
+            _ = self.byte_count.fetchAdd(kv.raw_bytes.?.len, .release);
+        }
     }
 
     pub fn get(self: Self, alloc: Allocator, key: []const u8) ?KV {
+        _ = alloc;
         const data = self.data.load(.acquire);
-
-        var iter_obj = data.iterator(alloc) catch return null;
-        defer iter_obj.deinit();
-
-        var latest_kv: ?KV = null;
-        var latest_timestamp: i128 = std.math.minInt(i128);
-
-        while (iter_obj.next()) |kv| {
-            if (std.mem.eql(u8, kv.userKey(), key)) {
-                const timestamp = kv.timestamp;
-
-                if (timestamp > latest_timestamp) {
-                    latest_kv = kv;
-                    latest_timestamp = timestamp;
-                }
-            }
-        }
-
-        if (latest_kv) |kv| {
-            return kv.clone(alloc) catch return null;
-        }
-
-        return null;
+        return data.get(key) catch return null;
     }
 
     pub fn count(self: Self) usize {
@@ -162,7 +143,8 @@ test Memtable {
     defer mtable.deinit();
 
     // when
-    const kv = KV.init("__key__", "__value__");
+    var kv = try KV.initOwned(alloc, "__key__", "__value__");
+    defer kv.deinit(alloc);
 
     try mtable.put(alloc, kv);
 
@@ -171,6 +153,8 @@ test Memtable {
 
     // then
     try testing.expectEqualStrings(kv.value, actual.?.value);
+    // TODO: fix ownership once rust lib is updated
+    try testing.expectEqual(keyvalue.KVOwnership.owned, actual.?.ownership);
 
     const kv2 = KV.init("__key__", "__updated_value__");
     try mtable.put(alloc, kv2);
@@ -179,4 +163,6 @@ test Memtable {
     defer latest.?.deinit(alloc);
 
     try testing.expectEqualStrings("__updated_value__", latest.?.value);
+    // TODO: fix ownership once rust lib is updated
+    try testing.expectEqual(keyvalue.KVOwnership.owned, latest.?.ownership);
 }

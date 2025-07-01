@@ -162,20 +162,20 @@ pub extern "C" fn skiplist_iterator_free(iter_ptr: *mut SkipMapIterator) {
     }
 }
 
+#[repr(C)]
+pub struct SkipMapEntry {
+    key_ptr: *const u8,
+    key_len: usize,
+    value_ptr: *const u8,
+    value_len: usize,
+}
+
 #[no_mangle]
 pub extern "C" fn skiplist_iterator_next(
     iter_ptr: *mut SkipMapIterator,
-    key: *mut c_char,
-    key_len: *mut usize,
-    value: *mut u8,
-    value_len: *mut usize,
+    entry_out: *mut SkipMapEntry,
 ) -> c_int {
-    if iter_ptr.is_null()
-        || key.is_null()
-        || key_len.is_null()
-        || value.is_null()
-        || value_len.is_null()
-    {
+    if iter_ptr.is_null() || entry_out.is_null() {
         return -1; // Error: null pointer
     }
 
@@ -190,15 +190,10 @@ pub extern "C" fn skiplist_iterator_next(
             let value_bytes = entry_value;
 
             unsafe {
-                if *key_len < key_bytes.len() || *value_len < value_bytes.len() {
-                    return -2; // Error: buffer too small
-                }
-
-                ptr::copy_nonoverlapping(key_bytes.as_ptr(), key as *mut u8, key_bytes.len());
-                *key_len = key_bytes.len();
-
-                ptr::copy_nonoverlapping(value_bytes.as_ptr(), value, value_bytes.len());
-                *value_len = value_bytes.len();
+                (*entry_out).key_ptr = key_bytes.as_ptr();
+                (*entry_out).key_len = key_bytes.len();
+                (*entry_out).value_ptr = value_bytes.as_ptr();
+                (*entry_out).value_len = value_bytes.len();
             }
 
             0 // Success

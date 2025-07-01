@@ -90,7 +90,7 @@ pub fn main() !void {
 }
 
 fn benchmark(alloc: Allocator, db: *lsm.Database) void {
-    const num_ops = 10_000;
+    const num_ops = 100_000;
 
     // Number of worker threads to use - adjust based on available cores
     const num_threads: u64 = @min(16, std.Thread.getCpuCount() catch 4);
@@ -149,17 +149,20 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
         // Worker function for writes
         const writeWorker = struct {
             fn work(ctx: *ThreadContext) void {
+                // var arena = lsm.ThreadSafeBumpAllocator.init(ctx.alloc, 1024 * 1024) catch unreachable;
+                // defer arena.deinit();
+
+                // const malloc = arena.allocator();
+                const malloc = ctx.alloc;
+
                 var success_count: u64 = 0;
                 var error_count: u64 = 0;
 
                 for (ctx.start_idx..ctx.end_idx) |i| {
-                    const key = std.fmt.allocPrint(ctx.alloc, "key_{d}", .{i}) catch unreachable;
-                    defer ctx.alloc.free(key);
+                    const key = std.fmt.allocPrint(malloc, "key_{d}", .{i}) catch unreachable;
+                    const value = std.fmt.allocPrint(malloc, "value_{d}", .{i}) catch unreachable;
 
-                    const value = std.fmt.allocPrint(ctx.alloc, "value_{d}", .{i}) catch unreachable;
-                    defer ctx.alloc.free(value);
-
-                    ctx.db.write(ctx.alloc, key, value) catch |err| {
+                    ctx.db.write(malloc, key, value) catch |err| {
                         std.log.debug("database write error for key {s} {s}\n", .{
                             key,
                             @errorName(err),
@@ -236,19 +239,22 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
                 var error_count: u64 = 0;
                 const chunk_size = (ctx.end_idx - ctx.start_idx) / 5;
 
-                for (ctx.start_idx..ctx.end_idx) |i| {
-                    const key = std.fmt.allocPrint(ctx.alloc, "key_{d}", .{i}) catch unreachable;
-                    defer ctx.alloc.free(key);
+                var arena = lsm.ThreadSafeBumpAllocator.init(ctx.alloc, 1024 * 1024) catch unreachable;
+                defer arena.deinit();
 
-                    var nxt = ctx.db.read(ctx.alloc, key) catch |err| {
-                        std.log.debug("database read error for key {s} {s}\n", .{
+                const malloc = arena.allocator();
+
+                for (ctx.start_idx..ctx.end_idx) |i| {
+                    const key = std.fmt.allocPrint(malloc, "key_{d}", .{i}) catch unreachable;
+
+                    _ = ctx.db.read(malloc, key) catch |err| {
+                        std.log.debug("database read error for key {s} {s}", .{
                             key,
                             @errorName(err),
                         });
                         error_count += 1;
                         continue;
                     };
-                    defer nxt.deinit(ctx.alloc);
 
                     success_count += 1;
 
@@ -330,14 +336,20 @@ fn iterator(alloc: Allocator, db: *lsm.Database) void {
     defer it.deinit();
 
     var w = std.io.bufferedWriter(std.io.getStdOut().writer());
-    defer w.flush() catch unreachable;
+
+    // var arena = lsm.ThreadSafeBumpAllocator.init(alloc, 1024 * 1024) catch unreachable;
+    // defer arena.deinit();
+
+    // const malloc = arena.allocator();
 
     var count: usize = 0;
     while (it.next()) |kv| {
-        count += 1;
         const out = std.fmt.allocPrint(alloc, "{s}\n", .{kv}) catch unreachable;
         _ = w.write(out) catch unreachable;
+        count += 1;
     }
+
+    w.flush() catch unreachable;
 
     std.log.info("\ntotal rows {d}", .{count});
 }

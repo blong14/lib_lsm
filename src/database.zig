@@ -391,11 +391,11 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        mtx.lock();
-        defer mtx.unlock();
-
         self.agent.stop();
         self.agent.deinit();
+
+        mtx.lock();
+        defer mtx.unlock();
 
         for (self.mtables.items) |mtable| {
             mtable.deinit();
@@ -426,7 +426,10 @@ pub const Database = struct {
 
                 const nxt_table = try Memtable.init(alloc, sstable.id, self.opts);
                 while (siter.next()) |nxt| {
-                    try nxt_table.put(alloc, nxt);
+                    var key_copy = try nxt.clone(alloc);
+                    defer key_copy.deinit(alloc);
+
+                    try nxt_table.put(alloc, key_copy);
                 }
 
                 nxt_table.isFlushed.store(true, .seq_cst);
@@ -441,29 +444,50 @@ pub const Database = struct {
     }
 
     pub fn read(self: *Self, alloc: Allocator, key: []const u8) !KV {
+        var kvs = std.ArrayList(KV).init(alloc);
+
         const hot_table = self.mtable.load(.seq_cst);
         if (hot_table.get(alloc, key)) |kv| {
-            return kv;
+            try kvs.append(kv);
         }
 
         mtx.lock();
-        const warm_tables = try self.mtables.clone();
+        const items = try self.mtables.clone();
         mtx.unlock();
-        defer warm_tables.deinit();
 
-        for (warm_tables.items) |mtable| {
-            if (mtable.get(alloc, key)) |kv| {
-                return kv;
+        for (items.items) |table| {
+            if (table.get(alloc, key)) |kv| {
+                try kvs.append(kv);
             }
         }
 
-        const internal_key = try keyvalue.encodeInternalKey(alloc, key, null);
-        defer alloc.free(internal_key);
+        var skv: KV = undefined;
+        self.sstables.read(key, &skv) catch |err| {
+            if (err != error.NotFound) {
+                return err;
+            }
+        };
+        if (skv.valid()) {
+            try kvs.append(skv);
+        }
 
-        var kv: KV = undefined;
-        try self.sstables.read(key, &kv);
+        var latest_kv: ?KV = null;
+        var latest_timestamp: i128 = std.math.minInt(i128);
 
-        return kv.clone(alloc);
+        for (kvs.items) |kv| {
+            const timestamp = kv.timestamp;
+
+            if (timestamp >= latest_timestamp) {
+                latest_kv = kv;
+                latest_timestamp = timestamp;
+            }
+        }
+
+        if (latest_kv) |k| {
+            return try k.clone(alloc);
+        }
+
+        return error.NotFound;
     }
 
     const MergeIteratorWrapper = struct {
@@ -503,10 +527,13 @@ pub const Database = struct {
         defer warm_tables.deinit();
 
         for (warm_tables.items) |mtable| {
+            std.debug.print("warm table {any} count {d}\n", .{ &mtable, mtable.count() });
             const warm_iter = try mtable.iterator(alloc);
             try merger.add(warm_iter);
         }
 
+        // TODO: Add this back
+        //
         //const siter = try self.sstables.iterator(alloc);
         //try merger.add(siter);
 
@@ -532,6 +559,12 @@ pub const Database = struct {
         pub fn deinit(ctx: *anyopaque) void {
             const sw: *Wrapper = @ptrCast(@alignCast(ctx));
             sw.iterator.deinit();
+            if (sw.scanner.start) |start| {
+                @constCast(&start).deinit(sw.alloc);
+            }
+            if (sw.scanner.end) |end| {
+                @constCast(&end).deinit(sw.alloc);
+            }
             sw.alloc.destroy(sw.scanner);
             sw.alloc.destroy(sw);
         }
@@ -550,8 +583,8 @@ pub const Database = struct {
         start_key: []const u8,
         end_key: []const u8,
     ) !Iterator(KV) {
-        const start = KV.init(start_key, "");
-        const end = KV.init(end_key, "");
+        const start = try KV.initOwned(alloc, start_key, "");
+        const end = try KV.initOwned(alloc, end_key, "");
 
         const base_iter = try self.iterator(alloc);
 
@@ -575,7 +608,8 @@ pub const Database = struct {
             return error.InvalidKeyData;
         }
 
-        const item = KV.init(key, value);
+        var item = try KV.initOwned(alloc, key, value);
+        defer item.deinit(alloc);
 
         var mtable = self.mtable.load(.seq_cst);
         if ((mtable.size() + item.len()) >= self.capacity) {
@@ -632,6 +666,7 @@ pub const Database = struct {
 
         for (self.mtables.items) |table| {
             if (!table.flushed()) {
+                std.debug.print("sstables flush...\n", .{});
                 self.sstables.flush(alloc, table) catch |err| {
                     std.log.err(
                         "sstables not able to flush mtable {s} {s}",
