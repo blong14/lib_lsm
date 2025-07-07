@@ -1,17 +1,19 @@
 extern crate libc;
 
-use crossbeam_skiplist::{map::Entry, SkipMap};
-use std::ffi::CStr;
+use crossbeam_skiplist::{SkipMap};
 use std::os::raw::{c_char, c_int, c_void};
 use std::{ptr, slice, str};
 
 // https://nnethercote.github.io/perf-book/build-configuration.html#jemalloc
+// cbindgen:ignore
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+type StringSkipMap = SkipMap<String, Vec<u8>>;
+
 #[no_mangle]
 pub extern "C" fn skiplist_init() -> *mut c_void {
-    let skip_map: SkipMap<String, Vec<u8>> = SkipMap::new();
+    let skip_map: StringSkipMap = SkipMap::new();
     Box::into_raw(Box::new(skip_map)) as *mut c_void
 }
 
@@ -20,7 +22,7 @@ pub extern "C" fn skiplist_free(skiplist: *mut c_void) {
     if !skiplist.is_null() {
         // Deallocate the memory for the skip map
         unsafe {
-            let _ = Box::from_raw(skiplist as *mut SkipMap<String, Vec<u8>>);
+            let _ = Box::from_raw(skiplist as *mut StringSkipMap);
         }
     }
 }
@@ -37,7 +39,7 @@ pub extern "C" fn skiplist_insert(
         return -1; // Null pointer check
     }
 
-    let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
+    let skip_map = unsafe { &mut *(skiplist as *mut StringSkipMap) };
 
     // SAFETY: The system ensures UTF-8 encoded keys, so unchecked conversion is safe.
     let key_str = unsafe {
@@ -58,10 +60,10 @@ pub extern "C" fn skiplist_get(
     skiplist: *mut c_void,
     key: *const c_char,
     key_len: usize,
-    value: *mut u8,
+    value_ptr: *mut *const u8,
     value_len: *mut usize,
 ) -> c_int {
-    if skiplist.is_null() || key.is_null() || value.is_null() || value_len.is_null() {
+    if skiplist.is_null() || key.is_null() || value_ptr.is_null() || value_len.is_null() {
         return -1; // Error: null pointer
     }
 
@@ -70,67 +72,28 @@ pub extern "C" fn skiplist_get(
         str::from_utf8_unchecked(key_bytes)
     };
 
-    let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
+    let skip_map = unsafe { &*(skiplist as *const StringSkipMap) };
+
     if let Some(entry) = skip_map.get(key_str) {
         let entry_value = entry.value();
-        let len = entry_value.len();
 
         unsafe {
-            if *value_len < len {
-                return -2; // Error: buffer too small
-            }
-            ptr::copy_nonoverlapping(entry_value.as_ptr(), value, len);
-            *value_len = len;
+            *value_ptr = entry_value.as_ptr();
+            *value_len = entry_value.len();
         }
+
         0 // Success
     } else {
         -1 // Not found
     }
 }
 
-#[no_mangle]
-pub extern "C" fn skiplist_remove(skiplist: *mut c_void, key: *const c_char) -> c_int {
-    if skiplist.is_null() || key.is_null() {
-        return -1; // Error: null pointer
-    }
-
-    // SAFETY: The key is ensured to be a valid UTF-8 null-terminated string.
-    let c_str = unsafe { CStr::from_ptr(key) };
-    let key_str = match c_str.to_str() {
-        Ok(s) => s,
-        Err(_) => return -1, // Error: invalid UTF-8
-    };
-
-    let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
-    match skip_map.remove(key_str) {
-        Some(_) => 0, // Success
-        None => -1,   // Not found
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn skiplist_clear(skiplist: *mut c_void) {
-    if skiplist.is_null() {
-        return;
-    }
-
-    let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
-    skip_map.clear();
-}
-
-#[no_mangle]
-pub extern "C" fn skiplist_size(skiplist: *mut c_void) -> c_int {
-    if skiplist.is_null() {
-        return -1; // Error: null pointer
-    }
-
-    let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
-    skip_map.len() as c_int
-}
-
-#[repr(C)]
+/// Opaque iterator for traversing the skip map
 pub struct SkipMapIterator {
-    inner: Box<dyn Iterator<Item = Entry<'static, String, Vec<u8>>>>,
+    skiplist: *const StringSkipMap,
+    current_key: Option<String>,
+    current_entry_key: Vec<u8>,
+    current_entry_value: Vec<u8>,
 }
 
 #[no_mangle]
@@ -139,15 +102,11 @@ pub extern "C" fn skiplist_iterator_create(skiplist: *mut c_void) -> *mut SkipMa
         return ptr::null_mut();
     }
 
-    let skip_map = unsafe { &mut *(skiplist as *mut SkipMap<String, Vec<u8>>) };
-
-    // Create an iterator and wrap it in a Box
     let iterator = Box::new(SkipMapIterator {
-        inner: Box::new(
-            skip_map
-                .iter()
-                .map(|entry| unsafe { std::mem::transmute(entry) }),
-        ),
+        skiplist: skiplist as *const StringSkipMap,
+        current_key: None,
+        current_entry_key: Vec::new(),
+        current_entry_value: Vec::new(),
     });
 
     Box::into_raw(iterator)
@@ -162,6 +121,7 @@ pub extern "C" fn skiplist_iterator_free(iter_ptr: *mut SkipMapIterator) {
     }
 }
 
+/// Entry containing key-value pair data
 #[repr(C)]
 pub struct SkipMapEntry {
     key_ptr: *const u8,
@@ -180,20 +140,38 @@ pub extern "C" fn skiplist_iterator_next(
     }
 
     let iterator = unsafe { &mut *iter_ptr };
+    let skip_map = unsafe { &*iterator.skiplist };
 
-    match iterator.inner.next() {
+    // Get the next entry based on current position
+    let next_entry = match &iterator.current_key {
+        None => {
+            // First iteration - get the first entry
+            skip_map.front()
+        }
+        Some(current_key) => {
+            // Get the entry after the current key
+            skip_map.range::<str, _>((std::ops::Bound::Excluded(current_key.as_str()), std::ops::Bound::Unbounded))
+                .next()
+        }
+    };
+
+    match next_entry {
         Some(entry) => {
             let entry_key = entry.key();
             let entry_value = entry.value();
 
-            let key_bytes = entry_key.as_bytes();
-            let value_bytes = entry_value;
+            // Store the key and value in the iterator to keep them alive
+            iterator.current_entry_key = entry_key.as_bytes().to_vec();
+            iterator.current_entry_value = entry_value.clone();
+            
+            // Update iterator position for next call
+            iterator.current_key = Some(entry_key.clone());
 
             unsafe {
-                (*entry_out).key_ptr = key_bytes.as_ptr();
-                (*entry_out).key_len = key_bytes.len();
-                (*entry_out).value_ptr = value_bytes.as_ptr();
-                (*entry_out).value_len = value_bytes.len();
+                (*entry_out).key_ptr = iterator.current_entry_key.as_ptr();
+                (*entry_out).key_len = iterator.current_entry_key.len();
+                (*entry_out).value_ptr = iterator.current_entry_value.as_ptr();
+                (*entry_out).value_len = iterator.current_entry_value.len();
             }
 
             0 // Success

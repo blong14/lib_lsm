@@ -429,7 +429,7 @@ pub const Database = struct {
                     var key_copy = try nxt.clone(alloc);
                     defer key_copy.deinit(alloc);
 
-                    try nxt_table.put(alloc, key_copy);
+                    try nxt_table.put(key_copy);
                 }
 
                 nxt_table.isFlushed.store(true, .seq_cst);
@@ -443,51 +443,27 @@ pub const Database = struct {
         std.log.info("current hot table key count {d}", .{self.mtable.load(.seq_cst).count()});
     }
 
-    pub fn read(self: *Self, alloc: Allocator, key: []const u8) !KV {
-        var kvs = std.ArrayList(KV).init(alloc);
-
+    pub fn read(self: *Self, key: []const u8) !?KV {
         const hot_table = self.mtable.load(.seq_cst);
-        if (hot_table.get(alloc, key)) |kv| {
-            try kvs.append(kv);
+        if (try hot_table.get(key)) |kv| {
+            return kv;
         }
 
-        mtx.lock();
-        const items = try self.mtables.clone();
-        mtx.unlock();
+        //mtx.lock();
+        //const items = try self.mtables.clone();
+        //mtx.unlock();
 
-        for (items.items) |table| {
-            if (table.get(alloc, key)) |kv| {
-                try kvs.append(kv);
-            }
-        }
+        //for (items.items) |table| {
+        //    if (try table.get(key)) |kv| {
+        //        return kv;
+        //    }
+        //}
 
-        var skv: KV = undefined;
-        self.sstables.read(key, &skv) catch |err| {
-            if (err != error.NotFound) {
-                return err;
-            }
-        };
-        if (skv.valid()) {
-            try kvs.append(skv);
-        }
+        // if (try self.sstables.read(key)) |kv| {
+        // return kv;
+        // }
 
-        var latest_kv: ?KV = null;
-        var latest_timestamp: i128 = std.math.minInt(i128);
-
-        for (kvs.items) |kv| {
-            const timestamp = kv.timestamp;
-
-            if (timestamp >= latest_timestamp) {
-                latest_kv = kv;
-                latest_timestamp = timestamp;
-            }
-        }
-
-        if (latest_kv) |k| {
-            return try k.clone(alloc);
-        }
-
-        return error.NotFound;
+        return null;
     }
 
     const MergeIteratorWrapper = struct {
@@ -603,6 +579,30 @@ pub const Database = struct {
         return Iterator(KV).init(wrapper, ScanWrapper.next, ScanWrapper.deinit);
     }
 
+    pub fn xwrite(self: *Self, alloc: Allocator, kv: KV) anyerror!void {
+        if (kv.key.len == 0 or !std.unicode.utf8ValidateSlice(kv.key)) {
+            return error.InvalidKeyData;
+        }
+
+        var mtable = self.mtable.load(.seq_cst);
+        if ((mtable.size() + kv.len()) >= self.capacity) {
+            mtx.lock();
+            defer mtx.unlock();
+            try self.freeze(alloc, mtable);
+        }
+
+        while (true) {
+            mtable = self.mtable.load(.seq_cst);
+            mtable.put(kv) catch |err| switch (err) {
+                error.MemtableImmutable => continue,
+                else => return err,
+            };
+            break;
+        }
+
+        self.agent.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+    }
+
     pub fn write(self: *Self, alloc: Allocator, key: []const u8, value: []const u8) anyerror!void {
         if (key.len == 0 or !std.unicode.utf8ValidateSlice(key)) {
             return error.InvalidKeyData;
@@ -620,7 +620,7 @@ pub const Database = struct {
 
         while (true) {
             mtable = self.mtable.load(.seq_cst);
-            mtable.put(alloc, item) catch |err| switch (err) {
+            mtable.put(item) catch |err| switch (err) {
                 error.MemtableImmutable => continue,
                 else => return err,
             };
@@ -710,23 +710,25 @@ test Database {
     defer db.deinit(alloc);
 
     // given
-    const key = "__key__";
-    const value = "__value__";
+    var expected = try KV.initOwned(alloc, "__key__", "__value__");
+    defer expected.deinit(alloc);
 
     // when
-    try db.write(alloc, key, value);
+    try db.xwrite(alloc, expected);
 
     // then
-    var actual = try db.read(alloc, key);
-    defer actual.deinit(alloc); // Make sure to free the memory when done
+    const actual = try db.read(expected.key);
 
-    try testing.expectEqualStrings(value, actual.value);
+    try testing.expectEqualStrings(expected.value, actual.?.value);
 }
 
 test "basic functionality with many items" {
-    const alloc = testing.allocator;
-    const testDir = testing.tmpDir(.{});
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
+    const alloc = arena.allocator();
+
+    const testDir = testing.tmpDir(.{});
     const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(dir_name);
     defer testDir.dir.deleteTree(dir_name) catch {};
@@ -737,33 +739,27 @@ test "basic functionality with many items" {
 
     // given
     const kvs = [5]KV{
-        KV.init("__key_c__", "__value_c__"),
-        KV.init("__key_b__", "__value_b__"),
-        KV.init("__key_d__", "__value_d__"),
-        KV.init("__key_a__", "__value_a__"),
-        KV.init("__key_e__", "__value_e__"),
+        try KV.initOwned(alloc, "__key_c__", "__value_c__"),
+        try KV.initOwned(alloc, "__key_b__", "__value_b__"),
+        try KV.initOwned(alloc, "__key_d__", "__value_d__"),
+        try KV.initOwned(alloc, "__key_a__", "__value_a__"),
+        try KV.initOwned(alloc, "__key_e__", "__value_e__"),
     };
 
     // when
     for (kvs) |kv| {
-        try db.write(alloc, kv.key, kv.value);
+        try db.xwrite(alloc, kv);
     }
 
     // then
-    var byte_allocator = try ThreadSafeBumpAllocator.init(alloc, 4096);
-    defer byte_allocator.deinit();
-
-    const balloc = byte_allocator.allocator();
-
     for (kvs) |kv| {
-        var actual = try db.read(balloc, kv.key);
-        defer actual.deinit(balloc);
+        const actual = try db.read(kv.key);
 
-        try testing.expectEqualStrings(kv.value, actual.value);
+        try testing.expectEqualStrings(kv.value, actual.?.value);
     }
 
     // then
-    var it = try db.iterator(balloc);
+    var it = try db.iterator(alloc);
     defer it.deinit();
 
     var count: usize = 0;
@@ -776,7 +772,7 @@ test "basic functionality with many items" {
     var items = std.ArrayList(KV).init(alloc);
     defer items.deinit();
 
-    var scan_iter = try db.scan(balloc, "__key_b__", "__key_d__");
+    var scan_iter = try db.scan(alloc, "__key_b__", "__key_d__");
     defer scan_iter.deinit();
 
     while (scan_iter.next()) |nxt| {

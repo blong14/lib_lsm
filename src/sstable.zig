@@ -755,21 +755,19 @@ pub const SSTableStore = struct {
         return self.levels.items[level].items;
     }
 
-    pub fn read(self: *Self, key: []const u8, kv: *KV) !void {
+    pub fn read(self: *Self, key: []const u8) !?KV {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         for (0..self.num_levels) |level| {
             for (self.levels.items[level].items) |sstable| {
-                sstable.read(key, kv) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
-                return;
+                if (try sstable.read(key)) |kv| {
+                    return kv;
+                }
             }
         }
 
-        return error.NotFound;
+        return null;
     }
 
     const LevelIterator = struct {
@@ -1025,11 +1023,7 @@ pub const SSTable = struct {
         self.*.stream = stream;
     }
 
-    pub fn read(self: Self, key: []const u8, kv: *KV) !void {
-        // TODO: fix this implementation
-        // idea 1: check block meta to see if the key is even in this block
-        // idea 2: update API to accept an index instead of a key
-        // idea 3: map keys and indices
+    pub fn read(self: Self, key: []const u8) !?KV {
         const offset_sz = @sizeOf(u64);
         const offset_data = self.block.offset_data.items;
         const offset_total = offset_data.len / offset_sz;
@@ -1053,15 +1047,13 @@ pub const SSTable = struct {
             switch (std.mem.order(u8, key, value.key)) {
                 .lt => end = mid,
                 .gt => start = mid + 1,
-                .eq => {
-                    kv.* = value;
-                    return;
-                },
+                .eq => return value,
             }
         }
 
-        return error.NotFound;
+        return null;
     }
+
     pub fn write(self: *Self, value: KV) !usize {
         if (self.mutable) {
             const idx = self.block.write(value) catch |err| {
@@ -1119,8 +1111,13 @@ pub const SSTable = struct {
 
 test "SSTable basic operations" {
     const testing = std.testing;
-    var alloc = testing.allocator;
+    const allocator = testing.allocator;
     const testDir = testing.tmpDir(.{});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
 
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
@@ -1136,19 +1133,18 @@ test "SSTable basic operations" {
     {
         // Test read/write
         const expected = "__value__";
-        const kv = KV.init("__key__", expected);
+        const kv = try KV.initOwned(alloc, "__key__", expected);
 
         _ = try st.write(kv);
 
-        var actual: KV = undefined;
-        try st.read(kv.key, &actual);
+        const actual = try st.read(kv.key);
 
-        try testing.expectEqualStrings(expected, actual.value);
+        try testing.expectEqualStrings(expected, actual.?.value);
     }
 
     {
         // Test multiple entries and iteration
-        const akv = KV.init("__another_key__", "__another_value__");
+        const akv = try KV.initOwned(alloc, "__another_key__", "__another_value__");
         _ = try st.write(akv);
 
         var siter = try st.iterator(alloc);
@@ -1177,8 +1173,13 @@ test "SSTable basic operations" {
 
 test "SSTable persistence and error handling" {
     const testing = std.testing;
-    var alloc = testing.allocator;
+    const allocator = testing.allocator;
     const testDir = testing.tmpDir(.{});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
 
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
@@ -1193,8 +1194,8 @@ test "SSTable persistence and error handling" {
         defer alloc.destroy(st);
         defer st.deinit();
 
-        _ = try st.write(KV.init("key1", "value1"));
-        _ = try st.write(KV.init("key2", "value2"));
+        _ = try st.write(try KV.initOwned(alloc, "key1", "value1"));
+        _ = try st.write(try KV.initOwned(alloc, "key2", "value2"));
 
         try st.block.freeze();
 
@@ -1233,11 +1234,10 @@ test "SSTable persistence and error handling" {
         st.mutable = false; // Ensure the table is immutable after opening
 
         // Try to read a key that doesn't exist
-        var kv: KV = undefined;
-        try testing.expectError(error.NotFound, st.read("nonexistent_key", &kv));
+        try testing.expectEqual(null, try st.read("nonexistent_key"));
 
         // Try to write to an immutable table
-        try testing.expectError(error.WriteError, st.write(KV.init("new_key", "new_value")));
+        try testing.expectError(error.WriteError, st.write(try KV.initOwned(alloc, "new_key", "new_value")));
     }
 }
 
@@ -1266,9 +1266,9 @@ test "SSTableStore flush and compaction" {
     defer allocator.destroy(memtable);
     defer memtable.deinit();
 
-    try memtable.put(allocator, try KV.initOwned(allocator, "flush_key1", "flush_value1"));
-    try memtable.put(allocator, try KV.initOwned(allocator, "flush_key2", "flush_value2"));
-    try memtable.put(allocator, try KV.initOwned(allocator, "flush_key3", "flush_value3"));
+    try memtable.put(try KV.initOwned(allocator, "flush_key1", "flush_value1"));
+    try memtable.put(try KV.initOwned(allocator, "flush_key2", "flush_value2"));
+    try memtable.put(try KV.initOwned(allocator, "flush_key3", "flush_value3"));
 
     // Flush memtable to SSTable
     {
@@ -1278,13 +1278,10 @@ test "SSTableStore flush and compaction" {
         try testing.expectEqual(@as(usize, 1), store.get(0).len);
     }
 
-    var kv: KV = undefined;
-
     // Read back the data
     {
-        try store.read("flush_key1", &kv);
-
-        try testing.expectEqualStrings("flush_value1", kv.value);
+        const kv = try store.read("flush_key1");
+        try testing.expectEqualStrings("flush_value1", kv.?.value);
     }
 
     // Test store iterator
@@ -1308,16 +1305,20 @@ test "SSTableStore flush and compaction" {
         try testing.expectEqual(@as(usize, 1), store.get(1).len);
 
         // Verify data is still accessible after compaction
-        try store.read("flush_key2", &kv);
-        try testing.expectEqualStrings("flush_value2", kv.value);
+        const kv = try store.read("flush_key2");
+        try testing.expectEqualStrings("flush_value2", kv.?.value);
     }
 }
 
 test "SSTableStore open" {
     const testing = std.testing;
-    var alloc = testing.allocator;
-    const testDir = testing.tmpDir(.{});
 
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
     defer testDir.dir.deleteTree(pathname) catch {};
@@ -1333,12 +1334,14 @@ test "SSTableStore open" {
 
         // Create and add tables to different levels
         var table0 = try SSTable.init(alloc, 0, dopts);
-        _ = try table0.write(KV.init("key0", "value0"));
+        _ = try table0.write(try KV.initOwned(alloc, "key0", "value0"));
+
         try store.add(table0, 0);
         _ = table0.release();
 
         var table1 = try SSTable.init(alloc, 1, dopts);
-        _ = try table1.write(KV.init("key1", "value1"));
+        _ = try table1.write(try KV.initOwned(alloc, "key1", "value1"));
+
         try store.add(table1, 1);
         _ = table1.release();
 
@@ -1379,12 +1382,11 @@ test "SSTableStore open" {
         try testing.expectEqual(@as(usize, 1), store.get(1).len);
 
         // Verify data in the tables
-        var kv: KV = undefined;
-        try store.read("key0", &kv);
-        try testing.expectEqualStrings("value0", kv.value);
+        var kv = try store.read("key0");
+        try testing.expectEqualStrings("value0", kv.?.value);
 
-        try store.read("key1", &kv);
-        try testing.expectEqualStrings("value1", kv.value);
+        kv = try store.read("key1");
+        try testing.expectEqualStrings("value1", kv.?.value);
     }
 }
 
@@ -1408,9 +1410,9 @@ test "CompactionStrategies" {
             }
 
             // Add some test data
-            _ = try table.write(KV.init("key1", "value1"));
-            _ = try table.write(KV.init("key2", "value2"));
-            _ = try table.write(KV.init("key3", "value3"));
+            _ = try table.write(try KV.initOwned(a, "key1", "value1"));
+            _ = try table.write(try KV.initOwned(a, "key2", "value2"));
+            _ = try table.write(try KV.initOwned(a, "key3", "value3"));
 
             return table;
         }

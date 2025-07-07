@@ -45,6 +45,7 @@ type tableDefinition struct {
 
 func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	keyBytes := []byte("tables_" + name)
+
 	cKey := C.CString(string(keyBytes))
 	defer C.free(unsafe.Pointer(cKey))
 	key := (*C.uchar)(unsafe.Pointer(cKey))
@@ -53,7 +54,6 @@ func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("%#v -- key not found %s", pe.db, keyBytes)
 	}
-	defer C.lsm_value_deinit(resp)
 
 	valBytes := []byte(C.GoString((*C.char)(unsafe.Pointer(resp))))
 

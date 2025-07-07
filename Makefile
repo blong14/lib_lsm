@@ -81,6 +81,7 @@ perf:
 	rm -rf .tmp/data/*.dat
 	perf record --call-graph dwarf -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
 		--bench \
+		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 	# perf script --input=perf.data -F +pid > perf.processed.data
@@ -92,8 +93,7 @@ read:
 
 write:
 	rm -rf .tmp/data/*.dat
-	$(ZIG) build $(ZIG_RELEASE_OPTS) xlsm -- \
-		--mode $(MODE) \
+	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
@@ -102,6 +102,7 @@ bench:
 	rm -rf .tmp/data/*.dat
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--bench \
+		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 test:

@@ -63,33 +63,24 @@ pub const Memtable = struct {
         return self.id;
     }
 
-    pub fn put(self: *Self, alloc: Allocator, item: KV) !void {
+    pub fn put(self: *Self, item: KV) !void {
         if (!self.mutable.load(.acquire)) {
             return error.MemtableImmutable;
         }
 
-        if (item.raw_bytes) |raw| {
-            var data = self.data.load(.acquire);
-            try data.putRaw(try item.internalKey(alloc), raw);
-            _ = self.byte_count.fetchAdd(raw.len, .release);
-        } else {
-            var kv = try item.clone(alloc);
-            defer kv.deinit(alloc);
+        var data = self.data.load(.acquire);
+        try data.putRaw(item.key, item.raw_bytes);
 
-            var data = self.data.load(.acquire);
-            try data.putRaw(try kv.internalKey(alloc), kv.raw_bytes.?);
-            _ = self.byte_count.fetchAdd(kv.raw_bytes.?.len, .release);
-        }
+        _ = self.byte_count.fetchAdd(item.len(), .release);
     }
 
-    pub fn get(self: Self, alloc: Allocator, key: []const u8) ?KV {
-        _ = alloc;
+    pub fn get(self: Self, key: []const u8) !?KV {
         const data = self.data.load(.acquire);
-        return data.get(key) catch return null;
+        return try data.get(key);
     }
 
     pub fn count(self: Self) usize {
-        return self.data.load(.acquire).count();
+        return self.size();
     }
 
     pub fn freeze(self: *Self) void {
@@ -146,23 +137,21 @@ test Memtable {
     var kv = try KV.initOwned(alloc, "__key__", "__value__");
     defer kv.deinit(alloc);
 
-    try mtable.put(alloc, kv);
+    try mtable.put(kv);
 
-    var actual = mtable.get(alloc, "__key__");
-    defer actual.?.deinit(alloc);
+    const actual = try mtable.get("__key__");
 
     // then
     try testing.expectEqualStrings(kv.value, actual.?.value);
-    // TODO: fix ownership once rust lib is updated
-    try testing.expectEqual(keyvalue.KVOwnership.owned, actual.?.ownership);
+    try testing.expectEqual(keyvalue.KVOwnership.borrowed, actual.?.ownership);
 
-    const kv2 = KV.init("__key__", "__updated_value__");
-    try mtable.put(alloc, kv2);
+    var kv2 = try KV.initOwned(alloc, "__key__", "__updated_value__");
+    defer kv2.deinit(alloc);
 
-    var latest = mtable.get(alloc, "__key__");
-    defer latest.?.deinit(alloc);
+    try mtable.put(kv2);
+
+    const latest = try mtable.get("__key__");
 
     try testing.expectEqualStrings("__updated_value__", latest.?.value);
-    // TODO: fix ownership once rust lib is updated
-    try testing.expectEqual(keyvalue.KVOwnership.owned, latest.?.ownership);
+    try testing.expectEqual(keyvalue.KVOwnership.borrowed, latest.?.ownership);
 }

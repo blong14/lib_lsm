@@ -75,9 +75,8 @@ export fn lsm_init() ?*anyopaque {
 export fn lsm_read(addr: *anyopaque, key: [*c]const u8) [*c]const u8 {
     const db: *Database = @ptrCast(@alignCast(addr));
     const k = std.mem.span(key);
-    const kv = db.read(allocator, k) catch return null;
-    defer allocator.free(kv.key);
-    return &kv.value[0];
+    const kv = db.read(k) catch return null;
+    return &kv.?.value[0];
 }
 
 export fn lsm_value_deinit(value: [*c]const u8) bool {
@@ -90,7 +89,12 @@ export fn lsm_write(addr: *anyopaque, key: [*c]const u8, value: [*c]const u8) bo
     const db: *Database = @ptrCast(@alignCast(addr));
     const k = std.mem.span(key);
     const v = std.mem.span(value);
-    db.write(allocator, k, v) catch return false;
+
+    var kv = KV.initOwned(allocator, k, v) catch return false;
+    defer kv.deinit(allocator);
+
+    db.xwrite(allocator, kv) catch return false;
+
     return true;
 }
 
