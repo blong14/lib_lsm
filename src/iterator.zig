@@ -213,12 +213,10 @@ pub fn ScanIterator(
         pub fn nextFn(ctx: *anyopaque) ?T {
             const self: *Self = @ptrCast(@alignCast(ctx));
 
-            // If we haven't started scanning yet, seek to the start position
             if (!self.started) {
                 self.started = true;
 
                 if (self.start) |start| {
-                    // Skip items until we find one greater than start
                     while (self.source.next()) |item| {
                         const order = compareFn(item, start);
                         if (order == .eq or order == .gt) {
@@ -229,9 +227,7 @@ pub fn ScanIterator(
                 }
             }
 
-            // For subsequent calls, get the next item and check against end bound
             if (self.source.next()) |item| {
-                // If we have an end bound, check if the item is <= end
                 if (self.end) |end| {
                     const order = compareFn(item, end);
                     if (order == .gt) {

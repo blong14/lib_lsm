@@ -63,52 +63,24 @@ pub const Memtable = struct {
         return self.id;
     }
 
-    pub fn put(self: *Self, alloc: Allocator, item: KV) !void {
+    pub fn put(self: *Self, item: KV) !void {
         if (!self.mutable.load(.acquire)) {
             return error.MemtableImmutable;
         }
 
-        // We create a unique key for every valid put operation in the format
-        // {user_key}_{timestamp}. This allows us to maintain multiple versions
-        // of the same user key with different timestamps.
-        const key = try item.internalKey(alloc);
-        defer alloc.free(key);
-
         var data = self.data.load(.acquire);
-        try data.put(alloc, key, item);
+        try data.putRaw(item.key, item.raw_bytes);
 
         _ = self.byte_count.fetchAdd(item.len(), .release);
     }
 
-    pub fn get(self: Self, alloc: Allocator, key: []const u8) ?KV {
+    pub fn get(self: Self, key: []const u8) !?KV {
         const data = self.data.load(.acquire);
-
-        var iter_obj = data.iterator(alloc) catch return null;
-        defer iter_obj.deinit();
-
-        var latest_kv: ?KV = null;
-        var latest_timestamp: i128 = std.math.minInt(i128);
-
-        while (iter_obj.next()) |kv| {
-            if (std.mem.eql(u8, kv.userKey(), key)) {
-                const timestamp = kv.timestamp;
-
-                if (timestamp > latest_timestamp) {
-                    latest_kv = kv;
-                    latest_timestamp = timestamp;
-                }
-            }
-        }
-
-        if (latest_kv) |kv| {
-            return kv.clone(alloc) catch return null;
-        }
-
-        return null;
+        return try data.get(key);
     }
 
     pub fn count(self: Self) usize {
-        return self.data.load(.acquire).count();
+        return self.size();
     }
 
     pub fn freeze(self: *Self) void {
@@ -162,21 +134,24 @@ test Memtable {
     defer mtable.deinit();
 
     // when
-    const kv = KV.init("__key__", "__value__");
+    var kv = try KV.initOwned(alloc, "__key__", "__value__");
+    defer kv.deinit(alloc);
 
-    try mtable.put(alloc, kv);
+    try mtable.put(kv);
 
-    var actual = mtable.get(alloc, "__key__");
-    defer actual.?.deinit(alloc);
+    const actual = try mtable.get("__key__");
 
     // then
     try testing.expectEqualStrings(kv.value, actual.?.value);
+    try testing.expectEqual(keyvalue.KVOwnership.borrowed, actual.?.ownership);
 
-    const kv2 = KV.init("__key__", "__updated_value__");
-    try mtable.put(alloc, kv2);
+    var kv2 = try KV.initOwned(alloc, "__key__", "__updated_value__");
+    defer kv2.deinit(alloc);
 
-    var latest = mtable.get(alloc, "__key__");
-    defer latest.?.deinit(alloc);
+    try mtable.put(kv2);
+
+    const latest = try mtable.get("__key__");
 
     try testing.expectEqualStrings("__updated_value__", latest.?.value);
+    try testing.expectEqual(keyvalue.KVOwnership.borrowed, latest.?.ownership);
 }

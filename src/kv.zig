@@ -12,39 +12,64 @@ const createTimestamp = std.time.nanoTimestamp;
 
 const Endian = std.builtin.Endian.little;
 
+pub const KVOwnership = enum {
+    owned, // KV owns the memory and should free it
+    borrowed, // KV just points to memory owned elsewhere
+};
+
 pub const KV = struct {
     key: []const u8,
-    ikey: ?[]const u8 = null,
     value: []const u8,
+    raw_bytes: []const u8,
     timestamp: i128,
+    ownership: KVOwnership = .borrowed,
 
     const Self = @This();
 
-    pub fn init(key: []const u8, value: []const u8) Self {
-        return .{
+    pub fn initOwned(alloc: Allocator, key: []const u8, value: []const u8) !Self {
+        var kv: KV = .{
             .key = key,
             .value = value,
+            .raw_bytes = undefined,
             .timestamp = createTimestamp(),
+        };
+
+        const raw = try kv.encodeAlloc(alloc);
+        errdefer alloc.free(raw);
+
+        const key_start = @sizeOf(u64);
+        const value_start = @sizeOf(u64) + key.len + @sizeOf(i128) + @sizeOf(u64);
+
+        return .{
+            .key = raw[key_start .. key_start + key.len],
+            .value = raw[value_start .. value_start + value.len],
+            .raw_bytes = raw,
+            .timestamp = kv.timestamp,
+            .ownership = .owned,
         };
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        alloc.free(self.key);
-        alloc.free(self.value);
+        if (self.ownership == .owned) {
+            alloc.free(self.raw_bytes);
+        }
         self.* = undefined;
     }
 
     pub fn clone(self: Self, alloc: Allocator) !KV {
-        const key_copy = try alloc.dupe(u8, self.key);
-        errdefer alloc.free(key_copy);
+        // [(keylen)(key)(ts)(vjaluelen)(value)]
+        const raw = try self.encodeAlloc(alloc);
+        errdefer alloc.free(raw);
 
-        const value_copy = try alloc.dupe(u8, self.value);
-        errdefer alloc.free(value_copy);
+        const key_start = @sizeOf(u64);
+        const value_start = @sizeOf(u64) + self.key.len + @sizeOf(i128) + @sizeOf(u64);
 
-        return KV{
-            .key = key_copy,
-            .value = value_copy,
+        return .{
+            .key = raw[key_start .. key_start + self.key.len],
+            .value = raw[value_start .. value_start + self.value.len],
+            .raw_bytes = raw,
             .timestamp = self.timestamp,
+            .ownership = .owned,
         };
     }
 
@@ -52,17 +77,16 @@ pub const KV = struct {
         return self.key;
     }
 
-    pub fn internalKey(self: Self, alloc: Allocator) ![]const u8 {
-        if (self.ikey) |key| return try alloc.dupe(u8, key);
-        return encodeInternalKey(alloc, self.key, self.timestamp);
+    pub fn userValue(self: Self) []const u8 {
+        return self.value;
+    }
+
+    pub fn internalKey(self: Self) ![]const u8 {
+        return self.raw_bytes[0 .. self.key.len + @sizeOf(i128)];
     }
 
     pub fn len(self: Self) u64 {
         return @sizeOf(u64) + self.key.len + @sizeOf(i128) + @sizeOf(u64) + self.value.len;
-    }
-
-    pub fn order(a: []const u8, b: []const u8) Order {
-        return std.mem.order(u8, a, b);
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {
@@ -72,63 +96,48 @@ pub const KV = struct {
             return error.InvalidData;
         }
 
-        var ptr: usize = 0;
         const max_key_size = 1024 * 1024; // 1MB
         const max_value_size = 16 * 1024 * 1024; // 16MB
 
-        const key_len = readInt(u64, @ptrCast(&data[ptr]), Endian);
+        var ptr = data.ptr;
+
+        const key_len = readInt(u64, @ptrCast(ptr), Endian);
         if (key_len == 0 or key_len > max_key_size) {
             return error.InvalidKeyLength;
         }
+
         ptr += @sizeOf(u64);
 
-        if (ptr + key_len > data.len) {
-            return error.InvalidData;
-        }
-
-        const key = data[ptr .. ptr + key_len];
-        const internal_key = data[ptr .. ptr + key_len + @sizeOf(i128)];
+        const key = ptr[0..key_len];
 
         ptr += key_len;
 
-        if (ptr + @sizeOf(i128) > data.len) {
-            return error.InvalidData;
-        }
-
-        const timestamp = readInt(i128, @ptrCast(&data[ptr]), Endian);
+        const timestamp = readInt(i128, @ptrCast(ptr), Endian);
         if (timestamp <= 0) {
             return error.InvalidTimestamp;
         }
 
         ptr += @sizeOf(i128);
 
-        if (ptr + @sizeOf(u64) > data.len) {
-            return error.InvalidData;
-        }
-
-        const value_len = readInt(u64, @ptrCast(&data[ptr]), Endian);
+        const value_len = readInt(u64, @ptrCast(ptr), Endian);
         if (value_len == 0 or value_len > max_value_size) {
             return error.InvalidValueLength;
         }
+
         ptr += @sizeOf(u64);
 
-        if (ptr + value_len > data.len) {
-            return error.InvalidData;
-        }
+        const value = ptr[0..value_len];
 
-        const value = data[ptr .. ptr + value_len];
-        ptr += value_len;
-
-        self.*.key = key;
-        self.*.ikey = internal_key;
-        self.*.value = value;
-        self.*.timestamp = timestamp;
+        self.key = key;
+        self.value = value;
+        self.timestamp = timestamp;
+        self.ownership = .borrowed;
+        self.raw_bytes = data;
     }
 
     pub fn encodeAlloc(self: Self, alloc: Allocator) ![]const u8 {
         const buf = try alloc.alloc(u8, self.len());
-        const data = try self.encode(buf);
-        return data;
+        return try self.encode(buf);
     }
 
     pub fn encode(self: Self, buf: []u8) ![]u8 {
@@ -138,7 +147,7 @@ pub const KV = struct {
         }
 
         const max_value_size = 16 * 1024 * 1024; // 16MB
-        if (self.value.len == 0 or self.value.len > max_value_size) {
+        if (self.value.len > max_value_size) {
             return error.InvalidValueLength;
         }
 
@@ -187,16 +196,17 @@ pub const KV = struct {
         _ = fmt;
         _ = options;
 
-        try writer.print("{s}\t{d}\t{d}", .{
+        try writer.print("{s}\t{d}\t{d}\t{}", .{
             self.key,
             self.timestamp,
-            self.len(),
+            self.key.len,
+            self.ownership,
         });
     }
 };
 
 pub fn compare(a: KV, b: KV) std.math.Order {
-    const key_order = KV.order(a.key, b.key);
+    const key_order = std.mem.order(u8, a.key, b.key);
     if (key_order == .eq) {
         return if (a.timestamp < b.timestamp) .lt else .gt;
     }
@@ -205,7 +215,7 @@ pub fn compare(a: KV, b: KV) std.math.Order {
 }
 
 pub fn userKeyCompare(a: KV, b: KV) std.math.Order {
-    return KV.order(a.key, b.key);
+    return std.mem.order(u8, a.key, b.key);
 }
 
 pub fn decode(byts: []const u8) !KV {
@@ -247,11 +257,14 @@ pub fn encodeInternalKey(alloc: Allocator, key: []const u8, ts: ?i128) ![]const 
 }
 
 test "KV encode" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
 
     {
         // given
-        var kv = KV.init("__key__", "__value__");
+        var kv = try KV.initOwned(alloc, "__key__", "__value__");
         kv.timestamp = 1;
 
         // when
@@ -268,7 +281,7 @@ test "KV encode" {
 
     {
         // given
-        var kv = KV.init("__key__", "__value__");
+        var kv = try KV.initOwned(alloc, "__key__", "__value__");
         kv.timestamp = 1;
 
         // when
@@ -286,8 +299,12 @@ test "KV encode" {
 
 test "KV decode" {
     // given
-    const alloc = std.testing.allocator;
-    const original = KV.init("__key__", "__value__");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    const original = try KV.initOwned(alloc, "__key__", "__value__");
 
     const encoded = try original.encodeAlloc(alloc);
     defer alloc.free(encoded);
@@ -299,15 +316,22 @@ test "KV decode" {
     // then
     try std.testing.expectEqualStrings(original.key, decoded.key);
     try std.testing.expectEqualStrings(original.value, decoded.value);
+    try std.testing.expectEqualSlices(u8, encoded, decoded.raw_bytes);
     try std.testing.expectEqual(original.timestamp, decoded.timestamp);
     try std.testing.expectEqual(original.len(), decoded.len());
+    try std.testing.expectEqual(KVOwnership.borrowed, decoded.ownership);
 }
 
 test "KV compare" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
     // given
-    const kv1 = KV.init("key1", "value1");
-    const kv2 = KV.init("key2", "value2");
-    var kv3 = KV.init("key1", "different_value");
+    const kv1 = try KV.initOwned(alloc, "key1", "value1");
+    const kv2 = try KV.initOwned(alloc, "key2", "value2");
+    var kv3 = try KV.initOwned(alloc, "key1", "different_value");
     kv3.timestamp = kv1.timestamp + 1;
 
     // then
@@ -317,6 +341,6 @@ test "KV compare" {
     try std.testing.expectEqual(Order.lt, compare(kv3, kv2));
     try std.testing.expectEqual(Order.gt, compare(kv3, kv1));
 
-    try std.testing.expectEqual(Order.eq, KV.order(kv1.key, kv3.key));
+    try std.testing.expectEqual(Order.eq, userKeyCompare(kv1, kv3));
     try std.testing.expect(!std.mem.eql(u8, kv1.value, kv3.value));
 }
