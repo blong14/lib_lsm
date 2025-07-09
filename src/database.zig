@@ -31,8 +31,6 @@ const Opts = opt.Opts;
 const SSTable = sst.SSTable;
 const SSTableStore = sst.SSTableStore;
 
-var mtx: Mutex = .{};
-
 /// Events that can trigger agent decisions
 pub const DatabaseEvent = union(enum) {
     write_completed: struct { bytes: u64 },
@@ -347,6 +345,7 @@ pub const Database = struct {
     mtable: AtomicValue(*Memtable),
     opts: Opts,
     mtables: std.ArrayList(*Memtable),
+    mtables_mutex: Mutex,
     sstables: *SSTableStore,
 
     const Self = @This();
@@ -381,6 +380,7 @@ pub const Database = struct {
             .capacity = capacity,
             .mtable = AtomicValue(*Memtable).init(mtable),
             .mtables = mtables,
+            .mtables_mutex = Mutex{},
             .opts = opts,
             .sstables = sstables,
         };
@@ -394,14 +394,13 @@ pub const Database = struct {
         self.agent.stop();
         self.agent.deinit();
 
-        mtx.lock();
-        defer mtx.unlock();
-
+        self.mtables_mutex.lock();
         for (self.mtables.items) |mtable| {
             mtable.deinit();
             alloc.destroy(mtable);
         }
         self.mtables.deinit();
+        self.mtables_mutex.unlock();
 
         var mtable = self.mtable.load(.seq_cst);
         mtable.deinit();
@@ -449,11 +448,22 @@ pub const Database = struct {
             return kv;
         }
 
-        mtx.lock();
-        const items = try self.mtables.clone();
-        mtx.unlock();
+        // Check warm tables with minimal lock contention
+        // We take a snapshot of the current tables to avoid holding the lock
+        // during the actual search operations
+        var snapshot_tables: [16]*Memtable = undefined;
+        var table_count: usize = 0;
 
-        for (items.items) |table| {
+        {
+            self.mtables_mutex.lock();
+            defer self.mtables_mutex.unlock();
+
+            table_count = @min(self.mtables.items.len, snapshot_tables.len);
+            @memcpy(snapshot_tables[0..table_count], self.mtables.items[0..table_count]);
+        }
+
+        // Search through the snapshot without holding any locks
+        for (snapshot_tables[0..table_count]) |table| {
             if (try table.get(key)) |kv| {
                 return kv;
             }
@@ -494,15 +504,20 @@ pub const Database = struct {
             try merger.add(hot_iter);
         }
 
-        var warm_tables: std.ArrayList(*Memtable) = undefined;
-        {
-            mtx.lock();
-            defer mtx.unlock();
-            warm_tables = try self.mtables.clone();
-        }
-        defer warm_tables.deinit();
+        var snapshot_tables: [16]*Memtable = undefined;
+        var table_count: usize = 0;
 
-        for (warm_tables.items) |mtable| {
+        {
+            self.mtables_mutex.lock();
+            defer self.mtables_mutex.unlock();
+
+            table_count = @min(self.mtables.items.len, snapshot_tables.len);
+            @memcpy(snapshot_tables[0..table_count], self.mtables.items[0..table_count]);
+        }
+
+        const warm_tables = snapshot_tables[0..table_count];
+
+        for (warm_tables) |mtable| {
             std.debug.print("warm table {any} count {d}\n", .{ &mtable, mtable.count() });
             const warm_iter = try mtable.iterator(alloc);
             try merger.add(warm_iter);
@@ -586,8 +601,8 @@ pub const Database = struct {
 
         var mtable = self.mtable.load(.seq_cst);
         if ((mtable.size() + kv.len()) >= self.capacity) {
-            mtx.lock();
-            defer mtx.unlock();
+            self.mtables_mutex.lock();
+            defer self.mtables_mutex.unlock();
             try self.freeze(alloc, mtable);
         }
 
@@ -613,8 +628,8 @@ pub const Database = struct {
 
         var mtable = self.mtable.load(.seq_cst);
         if ((mtable.size() + item.len()) >= self.capacity) {
-            mtx.lock();
-            defer mtx.unlock();
+            self.mtables_mutex.lock();
+            defer self.mtables_mutex.unlock();
             try self.freeze(alloc, mtable);
         }
 
@@ -630,9 +645,9 @@ pub const Database = struct {
         self.agent.submitEvent(.{ .write_completed = .{ .bytes = item.len() } });
     }
 
-    fn memtableCount(self: Self) usize {
-        mtx.lock();
-        defer mtx.unlock();
+    fn memtableCount(self: *Self) usize {
+        self.mtables_mutex.lock();
+        defer self.mtables_mutex.unlock();
 
         var count: usize = 0;
         for (self.mtables.items) |table| {
@@ -656,8 +671,8 @@ pub const Database = struct {
     }
 
     pub fn xflush(self: *Self, alloc: Allocator) !void {
-        mtx.lock();
-        defer mtx.unlock();
+        self.mtables_mutex.lock();
+        defer self.mtables_mutex.unlock();
 
         if (self.mtables.items.len == 0) {
             std.log.debug("nothing to flush", .{});
