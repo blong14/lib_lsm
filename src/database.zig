@@ -449,15 +449,15 @@ pub const Database = struct {
             return kv;
         }
 
-        //mtx.lock();
-        //const items = try self.mtables.clone();
-        //mtx.unlock();
+        mtx.lock();
+        const items = try self.mtables.clone();
+        mtx.unlock();
 
-        //for (items.items) |table| {
-        //    if (try table.get(key)) |kv| {
-        //        return kv;
-        //    }
-        //}
+        for (items.items) |table| {
+            if (try table.get(key)) |kv| {
+                return kv;
+            }
+        }
 
         // if (try self.sstables.read(key)) |kv| {
         // return kv;

@@ -197,7 +197,7 @@ test "SkipList.Iterator" {
     defer it.deinit();
 
     while (it.next()) |nxt| {
-        try actual.append(nxt);
+        try actual.append(try nxt.clone(alloc));
     }
 
     try testing.expectEqual(3, actual.items.len);

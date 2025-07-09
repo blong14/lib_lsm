@@ -80,7 +80,7 @@ fmt:
 perf:
 	rm -rf .tmp/data/*.dat
 	perf record --call-graph dwarf -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
-		--bench \
+		--perf \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
@@ -88,12 +88,15 @@ perf:
 
 read:
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+		--read \
+		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 
 write:
 	rm -rf .tmp/data/*.dat
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+		--write \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
