@@ -1262,7 +1262,7 @@ test "SSTableStore flush and compaction" {
     var store = try SSTableStore.init(allocator, dopts);
     defer store.deinit(allocator);
 
-    var memtable = try Memtable.init(allocator, "level-0", dopts);
+    var memtable = try Memtable.init(allocator, "level-0");
     defer allocator.destroy(memtable);
     defer memtable.deinit();
 

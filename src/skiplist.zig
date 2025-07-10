@@ -4,17 +4,16 @@ const c = @cImport({
     @cInclude("skiplist.h");
 });
 const iter = @import("iterator.zig");
-const kv = @import("kv.zig");
+const keyvalue = @import("kv.zig");
 
 const Allocator = std.mem.Allocator;
 
 const Iterator = iter.Iterator;
-const KV = kv.KV;
+const KV = keyvalue.KV;
 
 pub fn SkipList(
     comptime V: type,
     comptime decodeFn: fn (v: []const u8) anyerror!V,
-    comptime encodeFn: fn (a: Allocator, v: V) anyerror![]const u8,
 ) type {
     return struct {
         impl: ?*anyopaque,
@@ -30,9 +29,7 @@ pub fn SkipList(
 
         pub fn init() !Self {
             const map = c.skiplist_init() orelse return error.InitializationFailed;
-            return .{
-                .impl = map,
-            };
+            return .{ .impl = map };
         }
 
         pub fn deinit(self: *Self) void {
@@ -58,22 +55,10 @@ pub fn SkipList(
             }
 
             const value_slice = value_ptr[0..value_len];
-            return decodeFn(value_slice) catch |err| {
-                std.log.err("Failed to decode value: {}", .{err});
-                return err;
-            };
+            return try decodeFn(value_slice);
         }
 
-        pub fn put(self: *Self, alloc: Allocator, key: []const u8, value: V) !void {
-            const v = try encodeFn(alloc, value);
-            defer alloc.free(v);
-
-            try self.putRaw(key, v);
-        }
-
-        /// Zero-copy version that accepts pre-encoded value bytes directly.
-        /// This is useful when reading from mmapped data to avoid extra allocations.
-        pub fn putRaw(self: *Self, key: []const u8, value_bytes: []const u8) !void {
+        pub fn put(self: *Self, key: []const u8, value_bytes: []const u8) !void {
             const result = c.skiplist_insert(
                 self.impl,
                 key.ptr,
@@ -82,7 +67,6 @@ pub fn SkipList(
                 value_bytes.len,
             );
             if (result != 0) {
-                std.log.err("not able to insert {d}", .{result});
                 return SkipListError.FailedInsert;
             }
         }
@@ -92,9 +76,7 @@ pub fn SkipList(
 
             pub fn init(ctx: *anyopaque) !SkiplistIterator {
                 const iter_ptr = c.skiplist_iterator_create(ctx) orelse return error.IteratorCreationFailed;
-                return .{
-                    .impl = iter_ptr,
-                };
+                return .{ .impl = iter_ptr };
             }
 
             pub fn deinit(ctx: *anyopaque) void {
@@ -115,21 +97,22 @@ pub fn SkipList(
                     return null;
                 }
 
-                const value_slice = @as([*]const u8, @ptrCast(entry.value_ptr))[0..entry.value_len];
+                const value_slice = @as(
+                    [*]const u8,
+                    @ptrCast(entry.value_ptr),
+                )[0..entry.value_len];
 
-                // Decode the value to get the KV pair
-                const x = decodeFn(value_slice) catch |err| {
-                    std.log.err("value decode failed: {}", .{err});
+                return decodeFn(value_slice) catch |err| {
+                    std.log.err("skiplist value decode failed: {}", .{err});
                     return null;
                 };
-
-                return x;
             }
         };
 
         pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
             const it = try alloc.create(SkiplistIterator);
             errdefer alloc.destroy(it);
+
             it.* = try SkiplistIterator.init(self.impl.?);
 
             return Iterator(KV).init(it, SkiplistIterator.next, SkiplistIterator.deinit);
@@ -141,7 +124,7 @@ test SkipList {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var skl = try SkipList(KV, kv.decode, kv.encode).init();
+    var skl = try SkipList(KV, keyvalue.decode).init();
     defer skl.deinit();
 
     const key: []const u8 = "__key__";
@@ -150,7 +133,7 @@ test SkipList {
         var expected = try KV.initOwned(alloc, key, "__value__");
         defer expected.deinit(alloc);
 
-        try skl.putRaw(key, expected.raw_bytes);
+        try skl.put(key, expected.raw_bytes);
 
         const actual = try skl.get(key);
 
@@ -161,7 +144,7 @@ test SkipList {
         var expected = try KV.initOwned(alloc, key, "__new_value__");
         defer expected.deinit(alloc);
 
-        try skl.putRaw(key, expected.raw_bytes);
+        try skl.put(key, expected.raw_bytes);
 
         const actual = try skl.get(key);
 
@@ -178,7 +161,7 @@ test "SkipList.Iterator" {
 
     const alloc = arena.allocator();
 
-    var skl = try SkipList(KV, kv.decode, kv.encode).init();
+    var skl = try SkipList(KV, keyvalue.decode).init();
     defer skl.deinit();
 
     const entries = [_]KV{
@@ -187,7 +170,7 @@ test "SkipList.Iterator" {
         try KV.initOwned(alloc, "c", "c"),
     };
     for (entries) |entry| {
-        try skl.putRaw(entry.key, entry.raw_bytes);
+        try skl.put(entry.key, entry.raw_bytes);
     }
 
     var actual = std.ArrayList(KV).init(alloc);

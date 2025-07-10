@@ -354,7 +354,7 @@ pub const Database = struct {
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        const mtable = Memtable.init(alloc, new_id, opts) catch |err| {
+        const mtable = Memtable.init(alloc, new_id) catch |err| {
             std.log.err("unable to init memtable {s}", .{@errorName(err)});
             return err;
         };
@@ -423,7 +423,7 @@ pub const Database = struct {
                 var siter = try sstable.iterator(alloc);
                 defer siter.deinit();
 
-                const nxt_table = try Memtable.init(alloc, sstable.id, self.opts);
+                const nxt_table = try Memtable.init(alloc, sstable.id);
                 while (siter.next()) |nxt| {
                     var key_copy = try nxt.clone(alloc);
                     defer key_copy.deinit(alloc);
@@ -439,18 +439,18 @@ pub const Database = struct {
         }
 
         std.log.info("database opened @ {s} w/ {d} warm tables", .{ self.opts.data_dir, self.mtables.items.len });
-        std.log.info("current hot table key count {d}", .{self.mtable.load(.seq_cst).count()});
     }
 
     pub fn read(self: *Self, key: []const u8) !?KV {
+        var latest_kv: ?KV = null;
+        var latest_timestamp: i128 = std.math.minInt(i128);
+
         const hot_table = self.mtable.load(.seq_cst);
         if (try hot_table.get(key)) |kv| {
-            return kv;
+            latest_kv = kv;
+            latest_timestamp = kv.timestamp;
         }
 
-        // Check warm tables with minimal lock contention
-        // We take a snapshot of the current tables to avoid holding the lock
-        // during the actual search operations
         var snapshot_tables: [16]*Memtable = undefined;
         var table_count: usize = 0;
 
@@ -462,18 +462,23 @@ pub const Database = struct {
             @memcpy(snapshot_tables[0..table_count], self.mtables.items[0..table_count]);
         }
 
-        // Search through the snapshot without holding any locks
         for (snapshot_tables[0..table_count]) |table| {
             if (try table.get(key)) |kv| {
-                return kv;
+                if (latest_kv == null or kv.timestamp > latest_timestamp) {
+                    latest_timestamp = kv.timestamp;
+                    latest_kv = kv;
+                }
             }
         }
 
         // if (try self.sstables.read(key)) |kv| {
-        // return kv;
+        //     if (latest_kv == null or kv.timestamp > latest_timestamp) {
+        //         latest_timestamp = kv.timestamp;
+        //         latest_kv = kv;
+        //     }
         // }
 
-        return null;
+        return latest_kv;
     }
 
     const MergeIteratorWrapper = struct {
@@ -499,7 +504,7 @@ pub const Database = struct {
         merger.* = try MergeIterator(KV, keyvalue.compare).init(alloc);
 
         const hot_table = self.mtable.load(.seq_cst);
-        if (hot_table.count() > 0) {
+        if (hot_table.size() > 0) {
             const hot_iter = try hot_table.iterator(alloc);
             try merger.add(hot_iter);
         }
@@ -518,7 +523,6 @@ pub const Database = struct {
         const warm_tables = snapshot_tables[0..table_count];
 
         for (warm_tables) |mtable| {
-            std.debug.print("warm table {any} count {d}\n", .{ &mtable, mtable.count() });
             const warm_iter = try mtable.iterator(alloc);
             try merger.add(warm_iter);
         }
@@ -701,7 +705,7 @@ pub const Database = struct {
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        const nxt_table = try Memtable.init(alloc, new_id, self.opts);
+        const nxt_table = try Memtable.init(alloc, new_id);
 
         try self.mtables.append(mtable);
 

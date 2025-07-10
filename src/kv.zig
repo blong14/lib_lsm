@@ -13,8 +13,10 @@ const createTimestamp = std.time.nanoTimestamp;
 const Endian = std.builtin.Endian.little;
 
 pub const KVOwnership = enum {
-    owned, // KV owns the memory and should free it
-    borrowed, // KV just points to memory owned elsewhere
+    // KV owns the memory and should free it
+    owned,
+    // KV just points to memory owned elsewhere
+    borrowed,
 };
 
 pub const KV = struct {
@@ -57,7 +59,7 @@ pub const KV = struct {
     }
 
     pub fn clone(self: Self, alloc: Allocator) !KV {
-        // [(keylen)(key)(ts)(vjaluelen)(value)]
+        // [(keylen)(key)(ts)(valuelen)(value)]
         const raw = try self.encodeAlloc(alloc);
         errdefer alloc.free(raw);
 
@@ -81,7 +83,7 @@ pub const KV = struct {
         return self.value;
     }
 
-    pub fn internalKey(self: Self) ![]const u8 {
+    pub fn internalKey(self: Self) []const u8 {
         return self.raw_bytes[0 .. self.key.len + @sizeOf(i128)];
     }
 
@@ -91,7 +93,7 @@ pub const KV = struct {
 
     pub fn decode(self: *Self, data: []const u8) !void {
         // key len key timestamp value len value
-        const min_size = @sizeOf(u64) + 1 + @sizeOf(i128) + @sizeOf(u64) + 1;
+        const min_size = @sizeOf(u64) + @sizeOf(i128) + @sizeOf(u64);
         if (data.len < min_size) {
             return error.InvalidData;
         }
@@ -99,34 +101,42 @@ pub const KV = struct {
         const max_key_size = 1024 * 1024; // 1MB
         const max_value_size = 16 * 1024 * 1024; // 16MB
 
-        var ptr = data.ptr;
+        var offset: usize = 0;
 
-        const key_len = readInt(u64, @ptrCast(ptr), Endian);
+        const key_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
         if (key_len == 0 or key_len > max_key_size) {
             return error.InvalidKeyLength;
         }
+        offset += @sizeOf(u64);
 
-        ptr += @sizeOf(u64);
+        if (offset + key_len > data.len) {
+            return error.InvalidData;
+        }
+        const key = data[offset .. offset + key_len];
+        offset += key_len;
 
-        const key = ptr[0..key_len];
-
-        ptr += key_len;
-
-        const timestamp = readInt(i128, @ptrCast(ptr), Endian);
+        if (offset + @sizeOf(i128) > data.len) {
+            return error.InvalidData;
+        }
+        const timestamp = readInt(i128, data[offset..][0..@sizeOf(i128)], Endian);
         if (timestamp <= 0) {
             return error.InvalidTimestamp;
         }
+        offset += @sizeOf(i128);
 
-        ptr += @sizeOf(i128);
-
-        const value_len = readInt(u64, @ptrCast(ptr), Endian);
-        if (value_len == 0 or value_len > max_value_size) {
+        if (offset + @sizeOf(u64) > data.len) {
+            return error.InvalidData;
+        }
+        const value_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
+        if (value_len > max_value_size) {
             return error.InvalidValueLength;
         }
+        offset += @sizeOf(u64);
 
-        ptr += @sizeOf(u64);
-
-        const value = ptr[0..value_len];
+        if (offset + value_len > data.len) {
+            return error.InvalidData;
+        }
+        const value = data[offset .. offset + value_len];
 
         self.key = key;
         self.value = value;
@@ -160,29 +170,22 @@ pub const KV = struct {
             return error.BufferTooSmall;
         }
 
-        var ptr = buf.ptr;
+        var offset: usize = 0;
 
-        var key_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-        writeInt(ByteAlignedInt(u64), &key_len_bytes, self.key.len, Endian);
-        @memcpy(ptr, &key_len_bytes);
-        ptr += @sizeOf(u64);
+        writeInt(u64, buf[offset..][0..@sizeOf(u64)], self.key.len, Endian);
+        offset += @sizeOf(u64);
 
-        @memcpy(ptr, self.key);
-        ptr += self.key.len;
+        @memcpy(buf[offset .. offset + self.key.len], self.key);
+        offset += self.key.len;
 
-        var timestamp_bytes: [@divExact(@typeInfo(i128).Int.bits, 8)]u8 = undefined;
-        writeInt(ByteAlignedInt(i128), &timestamp_bytes, self.timestamp, Endian);
-        @memcpy(ptr, &timestamp_bytes);
+        writeInt(i128, buf[offset..][0..@sizeOf(i128)], self.timestamp, Endian);
+        offset += @sizeOf(i128);
 
-        ptr += @sizeOf(i128);
+        writeInt(u64, buf[offset..][0..@sizeOf(u64)], self.value.len, Endian);
+        offset += @sizeOf(u64);
 
-        var value_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-        writeInt(ByteAlignedInt(u64), &value_len_bytes, self.value.len, Endian);
-        @memcpy(ptr, &value_len_bytes);
-        ptr += @sizeOf(u64);
-
-        @memcpy(ptr, self.value);
-        ptr += self.value.len;
+        @memcpy(buf[offset .. offset + self.value.len], self.value);
+        offset += self.value.len;
 
         return buf[0..len_];
     }
@@ -196,10 +199,12 @@ pub const KV = struct {
         _ = fmt;
         _ = options;
 
-        try writer.print("{s}\t{d}\t{d}\t{}", .{
+        try writer.print("KV{{ key=\"{s}\" ({d}B), value=\"{s}\" ({d}B), ts={d}, {} }}", .{
             self.key,
-            self.timestamp,
             self.key.len,
+            self.value,
+            self.value.len,
+            self.timestamp,
             self.ownership,
         });
     }
@@ -228,30 +233,43 @@ pub fn encode(alloc: Allocator, value: KV) ![]const u8 {
     return value.encodeAlloc(alloc);
 }
 
+pub fn extractTimestamp(internal_key: []const u8) i128 {
+    if (internal_key.len < @sizeOf(u64) + 1 + @sizeOf(i128)) {
+        return 0; // Invalid internal key format
+    }
+
+    // Skip key length (u64)
+    var ptr = internal_key.ptr + @sizeOf(u64);
+
+    // Read key length to skip the key
+    const key_len = readInt(u64, @ptrCast(internal_key.ptr), Endian);
+    if (key_len > internal_key.len - @sizeOf(u64) - @sizeOf(i128)) {
+        return 0; // Invalid key length
+    }
+
+    // Skip the key
+    ptr += key_len;
+
+    // Read timestamp
+    return readInt(i128, @ptrCast(ptr), Endian);
+}
+
 pub fn encodeInternalKey(alloc: Allocator, key: []const u8, ts: ?i128) ![]const u8 {
     const len_ = @sizeOf(u64) + key.len + @sizeOf(i128);
 
     const internal_key_buf = try alloc.alloc(u8, len_);
     errdefer alloc.free(internal_key_buf);
 
-    var ptr = internal_key_buf.ptr;
+    var offset: usize = 0;
 
-    var key_len_bytes: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-    writeInt(ByteAlignedInt(u64), &key_len_bytes, key.len, Endian);
-    @memcpy(ptr, &key_len_bytes);
+    writeInt(u64, internal_key_buf[offset..][0..@sizeOf(u64)], key.len, Endian);
+    offset += @sizeOf(u64);
 
-    ptr += @sizeOf(u64);
-    @memcpy(ptr, key);
-
-    ptr += key.len;
+    @memcpy(internal_key_buf[offset .. offset + key.len], key);
+    offset += key.len;
 
     const timestamp = ts orelse createTimestamp();
-
-    var timestamp_bytes: [@divExact(@typeInfo(i128).Int.bits, 8)]u8 = undefined;
-    writeInt(ByteAlignedInt(i128), &timestamp_bytes, timestamp, Endian);
-    @memcpy(ptr, &timestamp_bytes);
-
-    ptr += @sizeOf(i128);
+    writeInt(i128, internal_key_buf[offset..][0..@sizeOf(i128)], timestamp, Endian);
 
     return internal_key_buf;
 }
