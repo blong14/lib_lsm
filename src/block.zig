@@ -128,9 +128,7 @@ pub const Block = struct {
     }
 
     pub fn read(self: *Self, idx: usize) !KV {
-        var kv: KV = undefined;
-        try kv.decode(self.data.items[idx..]);
-        return kv;
+        return try keyvalue.decode(self.data.items[idx..]);
     }
 
     pub fn write(self: *Self, kv: KV) !usize {
@@ -141,15 +139,11 @@ pub const Block = struct {
 
         const data_writer = self.data.writer();
 
-        const encoded_kv = try kv.encodeAlloc(self.alloc);
-        defer self.alloc.free(encoded_kv);
-
-        const byte_count = try data_writer.write(encoded_kv);
-        assert(byte_count == encoded_kv.len);
+        const byte_count = try data_writer.write(kv.raw_bytes);
+        assert(byte_count == kv.raw_bytes.len);
 
         self.*.count += 1;
         self.*.byte_count += @sizeOf(u64) + byte_count;
-
         return offset;
     }
 
@@ -239,10 +233,15 @@ pub const Block = struct {
 
 test Block {
     const testing = std.testing;
-    const alloc = testing.allocator;
+    const allocator = testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
 
     {
-        const expected = KV.init("__key__", "__value__");
+        const expected = try KV.initOwned(alloc, "__key__", "__value__");
 
         // given
         var block = try Block.init(alloc, PageSize);
@@ -265,8 +264,8 @@ test Block {
         defer alloc.destroy(block);
         defer block.deinit();
 
-        const first_kv = KV.init("__key__", "__value__");
-        const last_kv = KV.init("__key_2__", "__value_2__");
+        const first_kv = try KV.initOwned(alloc, "__key__", "__value__");
+        const last_kv = try KV.initOwned(alloc, "__key_2__", "__value_2__");
 
         // when
         _ = try block.write(first_kv);
