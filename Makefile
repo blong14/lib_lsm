@@ -71,8 +71,10 @@ clean:
 
 debug:
 	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
-		--bench \
-		--data_dir $(DATA_DIR)
+		--write \
+		--input data/measurements.txt \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
 
 fmt:
 	@$(ZIG) build $(ZIG_COMMON_FLAGS) fmt
@@ -86,6 +88,11 @@ perf:
 		--sst_capacity $(SST_CAPACITY)
 	# perf script --input=perf.data -F +pid > perf.processed.data
 
+scan:
+	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
+		--input data/measurements.txt \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
 read:
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--read \
