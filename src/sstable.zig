@@ -831,10 +831,10 @@ pub const SSTableStore = struct {
         const start_time = std.time.nanoTimestamp();
 
         var sstable = try SSTable.init(alloc, 0, self.opts);
-        errdefer alloc.destroy(sstable);
-        errdefer sstable.deinit();
-
-        mtable.freeze();
+        errdefer {
+            sstable.deinit();
+            alloc.destroy(sstable);
+        }
 
         var it = try mtable.iterator(alloc);
         defer it.deinit();
