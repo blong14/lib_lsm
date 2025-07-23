@@ -98,6 +98,7 @@ pub fn main() !void {
         read(allocator, db, res.args.input.?);
     } else {
         // Fallback runnable used for simple scanning of the database files.
+        write(allocator, db, res.args.input.?);
         iterator(allocator, db);
         // scan(allocator, db, "Atlanta", "New York");
     }
@@ -348,13 +349,11 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             ctx.wg.start();
             defer ctx.wg.finish();
 
-            const malloc = ctx.alloc;
-
             var success_count: u64 = 0;
             var error_count: u64 = 0;
 
             for (ctx.items, 0..) |kv, i| {
-                ctx.db.xwrite(malloc, kv) catch |err| {
+                ctx.db.write(kv) catch |err| {
                     std.log.debug("database write error for key {s} {s}\n", .{
                         kv.key,
                         @errorName(err),
@@ -575,7 +574,7 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
 
                     const kv = lsm.KV.initOwned(malloc, key, value) catch unreachable;
 
-                    ctx.db.xwrite(malloc, kv) catch |err| {
+                    ctx.db.write(kv) catch |err| {
                         std.log.debug("database write error for key {s} {s}\n", .{
                             key,
                             @errorName(err),

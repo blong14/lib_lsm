@@ -51,6 +51,7 @@ pub const ThreadSafeBumpAllocator = @import("bump_allocator.zig").ThreadSafeBump
 pub const KV = @import("kv.zig").KV;
 
 const SSTable = @import("sstable.zig").SSTable;
+const DatabaseSupervisor = @import("supervisor.zig").DatabaseSupervisor;
 const TableMap = @import("tablemap.zig").TableMap;
 const WAL = @import("wal.zig").WAL;
 
@@ -66,9 +67,20 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 const jemalloc = @import("jemalloc");
 const allocator = jemalloc.allocator;
 
+var supervisor: *DatabaseSupervisor = undefined;
+
 export fn lsm_init() ?*anyopaque {
     const db = defaultDatabase(allocator) catch return null;
     db.open(allocator) catch return null;
+
+    supervisor = DatabaseSupervisor.init(
+        allocator,
+        db,
+        .{},
+    ) catch return null;
+
+    supervisor.start() catch return null;
+
     return db;
 }
 
@@ -93,7 +105,9 @@ export fn lsm_write(addr: *anyopaque, key: [*c]const u8, value: [*c]const u8) bo
     var kv = KV.initOwned(allocator, k, v) catch return false;
     defer kv.deinit(allocator);
 
-    db.xwrite(allocator, kv) catch return false;
+    db.write(kv) catch return false;
+
+    supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
 
     return true;
 }
@@ -123,7 +137,12 @@ export fn lsm_iter_deinit(addr: *anyopaque) bool {
 
 export fn lsm_deinit(addr: *anyopaque) bool {
     const db: *Database = @ptrCast(@alignCast(addr));
+
+    supervisor.stop();
+    supervisor.deinit();
+
     db.deinit(allocator);
     allocator.destroy(db);
+
     return true;
 }

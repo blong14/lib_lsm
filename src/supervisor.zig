@@ -14,6 +14,7 @@ pub const DatabaseEvent = union(enum) {
 
 /// Actions the supervisor can decide to take
 pub const SupervisorAction = union(enum) {
+    freeze_memtable: struct { id: []const u8 },
     flush_memtable: struct { id: []const u8 },
     compact_level: struct { level: usize },
     no_action: void,
@@ -141,6 +142,20 @@ pub const DatabaseSupervisor = struct {
             const db: *Database = @ptrCast(@alignCast(self.db));
 
             switch (action) {
+                .freeze_memtable => |_| {
+                    std.log.debug("freeze_memtable", .{});
+
+                    const mtable = db.mtable.load(.seq_cst);
+                    db.freeze(self.alloc, mtable) catch |err| {
+                        std.log.err(
+                            "supervisor not able to freeze memtable {s}",
+                            .{@errorName(err)},
+                        );
+                        return;
+                    };
+
+                    self.submitEvent(.{ .memtable_frozen = .{ .id = mtable.getId() } });
+                },
                 .flush_memtable => |_| {
                     std.log.debug("flush_memtable", .{});
 
@@ -187,7 +202,7 @@ pub const DatabaseSupervisor = struct {
         while (self.event_queue.readItem()) |event| {
             switch (event) {
                 .write_completed => |data| {
-                    _ = data;
+                    self.considerFreezingMemtable(data.bytes);
                 },
                 .read_completed => |data| {
                     _ = data;
@@ -254,6 +269,15 @@ pub const DatabaseSupervisor = struct {
         }
     }
 
+    fn considerFreezingMemtable(self: *Self, data: u64) void {
+        const db: *Database = @ptrCast(@alignCast(self.db));
+
+        var mtable = db.mtable.load(.seq_cst);
+        if ((mtable.size() + data) >= db.capacity) {
+            self.queueAction(.{ .freeze_memtable = .{ .id = mtable.getId() } });
+        }
+    }
+
     fn considerFlushingMemtable(self: *Self, id: []const u8) void {
         const db: *Database = @ptrCast(@alignCast(self.db));
 
@@ -265,6 +289,11 @@ pub const DatabaseSupervisor = struct {
                 .{ count, self.policy.max_unflushed_memtables },
             );
             self.queueAction(.{ .flush_memtable = .{ .id = id } });
+        }
+
+        var mtable = db.mtable.load(.seq_cst);
+        if (mtable.size() >= db.capacity) {
+            self.queueAction(.{ .flush_memtable = .{ .id = mtable.getId() } });
         }
     }
 

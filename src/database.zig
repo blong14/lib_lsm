@@ -6,7 +6,6 @@ const lsm = @import("lib.zig");
 const mtbl = @import("memtable.zig");
 const opt = @import("opts.zig");
 const sst = @import("sstable.zig");
-const supervisor = @import("supervisor.zig");
 const tm = @import("tablemap.zig");
 
 const atomic = std.atomic;
@@ -28,12 +27,8 @@ const Memtable = mtbl.Memtable;
 const Opts = opt.Opts;
 const SSTable = sst.SSTable;
 const SSTableStore = sst.SSTableStore;
-const DatabaseSupervisor = supervisor.DatabaseSupervisor;
-const DatabaseEvent = supervisor.DatabaseEvent;
-const SupervisorPolicy = supervisor.SupervisorPolicy;
 
 pub const Database = struct {
-    supervisor: *DatabaseSupervisor,
     capacity: usize,
     mtable: AtomicValue(*Memtable),
     opts: Opts,
@@ -66,10 +61,7 @@ pub const Database = struct {
             return err;
         };
 
-        const sup = try DatabaseSupervisor.init(alloc, db, .{});
-
         db.* = .{
-            .supervisor = sup,
             .capacity = capacity,
             .mtable = AtomicValue(*Memtable).init(mtable),
             .mtables = mtables,
@@ -78,15 +70,10 @@ pub const Database = struct {
             .sstables = sstables,
         };
 
-        // try db.supervisor.start();
-
         return db;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        self.supervisor.stop();
-        self.supervisor.deinit();
-
         self.mtables_mutex.lock();
         for (self.mtables.items) |mtable| {
             mtable.deinit();
@@ -332,18 +319,12 @@ pub const Database = struct {
         return Iterator(KV).init(wrapper, ScanWrapper.next, ScanWrapper.deinit);
     }
 
-    pub fn xwrite(self: *Self, alloc: Allocator, kv: KV) anyerror!void {
+    pub fn write(self: *Self, kv: KV) anyerror!void {
         if (kv.key.len == 0) {
             return error.InvalidKeyData;
         }
 
         var mtable = self.mtable.load(.seq_cst);
-        if ((mtable.size() + kv.len()) >= self.capacity) {
-            self.mtables_mutex.lock();
-            defer self.mtables_mutex.unlock();
-            try self.freeze(alloc, mtable);
-        }
-
         while (true) {
             mtable = self.mtable.load(.seq_cst);
             mtable.put(kv) catch |err| switch (err) {
@@ -352,19 +333,6 @@ pub const Database = struct {
             };
             break;
         }
-
-        self.supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
-    }
-
-    pub fn write(self: *Self, alloc: Allocator, key: []const u8, value: []const u8) anyerror!void {
-        if (key.len == 0) {
-            return error.InvalidKeyData;
-        }
-
-        var item = try KV.initOwned(alloc, key, value);
-        defer item.deinit(alloc);
-
-        return try self.xwrite(alloc, item);
     }
 
     pub fn memtableCount(self: *Self) usize {
@@ -379,6 +347,21 @@ pub const Database = struct {
         }
 
         return count;
+    }
+
+    pub fn freeze(self: *Self, alloc: Allocator, mtable: *Memtable) !void {
+        if (mtable.frozen()) return;
+
+        mtable.freeze();
+
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
+
+        const nxt_table = try Memtable.init(alloc, new_id);
+
+        try self.mtables.append(mtable);
+
+        self.mtable.store(nxt_table, .seq_cst);
     }
 
     pub fn flush(self: *Self, alloc: Allocator) void {
@@ -413,23 +396,6 @@ pub const Database = struct {
             }
         }
     }
-
-    fn freeze(self: *Self, alloc: Allocator, mtable: *Memtable) !void {
-        if (mtable.frozen()) return;
-
-        mtable.freeze();
-
-        var new_id_buf: [64]u8 = undefined;
-        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
-
-        const nxt_table = try Memtable.init(alloc, new_id);
-
-        try self.mtables.append(mtable);
-
-        self.mtable.store(nxt_table, .seq_cst);
-
-        self.supervisor.submitEvent(.{ .memtable_frozen = .{ .id = mtable.getId() } });
-    }
 };
 
 test Database {
@@ -450,7 +416,7 @@ test Database {
     defer expected.deinit(alloc);
 
     // when
-    try db.xwrite(alloc, expected);
+    try db.write(expected);
 
     // then
     const actual = try db.read(expected.key);
@@ -481,7 +447,10 @@ test "basic functionality with many items" {
 
     // when
     for (keys, values) |key, value| {
-        try db.write(alloc, key, value);
+        var expected = try KV.initOwned(alloc, key, value);
+        defer expected.deinit(alloc);
+
+        try db.write(expected);
     }
 
     // then
