@@ -63,13 +63,14 @@ go: $(SOURCES)
 	$(ZIG) build $(ZIG_RELEASE_OPTS) $(ZIG_COMMON_FLAGS) go
 
 # Development targets
-.PHONY: clean debug fmt perf profile run test 
+.PHONY: clean debug fmt perf write read scan test 
 clean:
 	@$(ZIG) build uninstall $(ZIG_COMMON_FLAGS)
 	@$(GO) clean -cache -v
 	@rm -rf $(BUILD_OUT) $(BUILD_CACHE)
 
 debug:
+	rm -rf .tmp/data/*.dat
 	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
 		--write \
 		--input data/measurements.txt \

@@ -7,8 +7,8 @@ pub const DatabaseEvent = union(enum) {
     write_completed: struct { bytes: u64 },
     read_completed: struct { bytes: u64 },
     memtable_frozen: struct { id: []const u8 },
-    sstable_created: struct { level: usize, id: []const u8 },
-    compaction_completed: struct { level: usize, duration_ns: u64 },
+    sstable_created: struct { level: usize },
+    compaction_completed: struct { level: usize, duration_ns: i64 },
     system_idle: struct { duration_ms: u64 },
 };
 
@@ -63,7 +63,7 @@ pub const DatabaseSupervisor = struct {
     pub fn deinit(self: *Self) void {
         self.event_queue.deinit();
         self.action_queue.deinit();
-        self.alloc.destroy(self);
+        self.* = undefined;
     }
 
     pub fn start(self: *Self) !void {
@@ -138,9 +138,9 @@ pub const DatabaseSupervisor = struct {
         self.action_mutex.lock();
         defer self.action_mutex.unlock();
 
-        if (self.action_queue.readItem()) |action| {
-            const db: *Database = @ptrCast(@alignCast(self.db));
+        const db: *Database = @ptrCast(@alignCast(self.db));
 
+        if (self.action_queue.readItem()) |action| {
             switch (action) {
                 .freeze_memtable => |_| {
                     std.log.debug("freeze_memtable", .{});
@@ -154,7 +154,18 @@ pub const DatabaseSupervisor = struct {
                         return;
                     };
 
-                    self.submitEvent(.{ .memtable_frozen = .{ .id = mtable.getId() } });
+                    db.xflush(self.alloc) catch |err| switch (err) {
+                        error.NothingToFlush => return,
+                        else => {
+                            std.log.err(
+                                "supervisor not able to flush memtable {s}",
+                                .{@errorName(err)},
+                            );
+                            return;
+                        },
+                    };
+
+                    self.submitEvent(.{ .sstable_created = .{ .level = 0 } });
                 },
                 .flush_memtable => |_| {
                     std.log.debug("flush_memtable", .{});
@@ -169,6 +180,8 @@ pub const DatabaseSupervisor = struct {
                             return;
                         },
                     };
+
+                    self.submitEvent(.{ .sstable_created = .{ .level = 0 } });
                 },
                 .compact_level => |data| {
                     std.log.debug("compact_level {d}", .{data.level});
@@ -180,6 +193,19 @@ pub const DatabaseSupervisor = struct {
                         );
                         return;
                     };
+
+                    var event: DatabaseEvent = .{
+                        .compaction_completed = .{
+                            .level = data.level,
+                            .duration_ns = 0,
+                        },
+                    };
+
+                    if (db.sstables.getLevelStats(data.level)) |stats| {
+                        event.compaction_completed.duration_ns = stats.last_compaction;
+                    }
+
+                    self.submitEvent(event);
                 },
                 .no_action => return,
             }
@@ -199,7 +225,7 @@ pub const DatabaseSupervisor = struct {
         self.event_mutex.lock();
         defer self.event_mutex.unlock();
 
-        while (self.event_queue.readItem()) |event| {
+        if (self.event_queue.readItem()) |event| {
             switch (event) {
                 .write_completed => |data| {
                     self.considerFreezingMemtable(data.bytes);
@@ -242,7 +268,7 @@ pub const DatabaseSupervisor = struct {
         const level0_files = db.sstables.stats.getFilesCount(0);
         if (level0_files > self.policy.max_level0_files) {
             std.log.debug(
-                "level 0 files ({d}) exceeds policy {d}",
+                "state evaluated: level 0 files ({d}) exceeds policy {d}",
                 .{ level0_files, self.policy.max_level0_files },
             );
             self.queueAction(.{ .compact_level = .{ .level = 0 } });
@@ -260,7 +286,7 @@ pub const DatabaseSupervisor = struct {
 
                 if (ratio > self.policy.compaction_level_threshold) {
                     std.log.debug(
-                        "level {d} file ratio ({d}) exceeds policy {d}",
+                        "state evaluated: level {d} file ratio ({d}) exceeds policy {d}",
                         .{ level, ratio, self.policy.compaction_level_threshold },
                     );
                     self.queueAction(.{ .compact_level = .{ .level = level } });
@@ -281,19 +307,12 @@ pub const DatabaseSupervisor = struct {
     fn considerFlushingMemtable(self: *Self, id: []const u8) void {
         const db: *Database = @ptrCast(@alignCast(self.db));
 
-        // Simple policy: if we have too many unflushed memtables, flush this one
         const count = db.memtableCount();
-        if (count >= self.policy.max_unflushed_memtables) {
-            std.log.debug(
-                "memtable count ({d}) exceeds policy {d}",
-                .{ count, self.policy.max_unflushed_memtables },
-            );
-            self.queueAction(.{ .flush_memtable = .{ .id = id } });
-        }
+        const max_tables = self.policy.max_unflushed_memtables;
 
-        var mtable = db.mtable.load(.seq_cst);
-        if (mtable.size() >= db.capacity) {
-            self.queueAction(.{ .flush_memtable = .{ .id = mtable.getId() } });
+        // Simple policy: if we have too many unflushed memtables, flush this one
+        if (count >= max_tables) {
+            self.queueAction(.{ .flush_memtable = .{ .id = id } });
         }
     }
 

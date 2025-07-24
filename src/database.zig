@@ -105,7 +105,10 @@ pub const Database = struct {
 
                 const nxt_table = try Memtable.init(alloc, sstable.id);
                 while (siter.next()) |nxt| {
-                    try nxt_table.put(nxt);
+                    var k = try nxt.clone(alloc);
+                    defer k.deinit(alloc);
+
+                    try nxt_table.put(k);
                 }
 
                 nxt_table.isFlushed.store(true, .seq_cst);

@@ -47,11 +47,11 @@ pub const EndProfile = prof.EndProfile;
 pub const BlockProfiler = prof.BlockProfiler;
 
 pub const Database = @import("database.zig").Database;
+pub const DatabaseSupervisor = @import("supervisor.zig").DatabaseSupervisor;
 pub const ThreadSafeBumpAllocator = @import("bump_allocator.zig").ThreadSafeBumpAllocator;
 pub const KV = @import("kv.zig").KV;
 
 const SSTable = @import("sstable.zig").SSTable;
-const DatabaseSupervisor = @import("supervisor.zig").DatabaseSupervisor;
 const TableMap = @import("tablemap.zig").TableMap;
 const WAL = @import("wal.zig").WAL;
 

@@ -13,6 +13,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const KV = lsm.KV;
+const DatabaseSupervisor = lsm.DatabaseSupervisor;
 
 const allocator = jemalloc.allocator;
 const usage =
@@ -31,6 +32,8 @@ const usage =
 pub const std_options = .{
     .log_level = .info,
 };
+
+var supervisor: *DatabaseSupervisor = undefined;
 
 pub fn main() !void {
     // First we specify what parameters our program can take.
@@ -80,12 +83,20 @@ pub fn main() !void {
         std.log.err("database init error {s}", .{@errorName(err)});
         return err;
     };
+
+    try db.open(allocator);
+
+    supervisor = try DatabaseSupervisor.init(allocator, db, .{});
+    try supervisor.start();
+
     defer {
+        supervisor.stop();
+        supervisor.deinit();
+        allocator.destroy(supervisor);
+
         db.deinit(allocator);
         allocator.destroy(db);
     }
-
-    try db.open(allocator);
 
     if (res.args.read != 0) {
         read(allocator, db, res.args.input.?);
@@ -94,6 +105,7 @@ pub fn main() !void {
     } else if (res.args.bench != 0) {
         benchmark(allocator, db);
     } else if (res.args.perf != 0) {
+        // benchmark(allocator, db);
         write(allocator, db, res.args.input.?);
         read(allocator, db, res.args.input.?);
     } else {
@@ -120,7 +132,6 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
 
     // Used to manage benchmark memory
     const arena_alloc = arena.allocator();
-
     const ReadThreadContext = struct {
         wg: *std.Thread.WaitGroup,
         thread_id: usize,
@@ -363,6 +374,8 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
                 };
                 success_count += 1;
 
+                supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+
                 // Periodically log progress
                 const chunk_size = ctx.items.len / 5;
                 if (chunk_size > 0 and i % chunk_size == 0 and i > 0) {
@@ -583,6 +596,8 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
                         continue;
                     };
                     success_count += 1;
+
+                    supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
 
                     // Periodically log progress
                     const chunk_size = (ctx.end_idx - ctx.start_idx) / 5;
