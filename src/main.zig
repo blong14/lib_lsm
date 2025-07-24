@@ -1,6 +1,9 @@
 const std = @import("std");
 
 const clap = @import("clap");
+const csv = @cImport({
+    @cInclude("csv.h");
+});
 const jemalloc = @import("jemalloc");
 const lsm = @import("lsm");
 
@@ -11,9 +14,7 @@ const io = std.io;
 const mem = std.mem;
 
 const Allocator = mem.Allocator;
-
 const KV = lsm.KV;
-const DatabaseSupervisor = lsm.DatabaseSupervisor;
 
 const allocator = jemalloc.allocator;
 const usage =
@@ -32,8 +33,6 @@ const usage =
 pub const std_options = .{
     .log_level = .info,
 };
-
-var supervisor: *DatabaseSupervisor = undefined;
 
 pub fn main() !void {
     // First we specify what parameters our program can take.
@@ -79,24 +78,8 @@ pub fn main() !void {
         .wal_capacity = wal_capacity,
     };
 
-    const db = lsm.databaseFromOpts(allocator, opts) catch |err| {
-        std.log.err("database init error {s}", .{@errorName(err)});
-        return err;
-    };
-
-    try db.open(allocator);
-
-    supervisor = try DatabaseSupervisor.init(allocator, db, .{});
-    try supervisor.start();
-
-    defer {
-        supervisor.stop();
-        supervisor.deinit();
-        allocator.destroy(supervisor);
-
-        db.deinit(allocator);
-        allocator.destroy(db);
-    }
+    const db = try lsm.init(allocator, opts);
+    defer lsm.deinit(db);
 
     if (res.args.read != 0) {
         read(allocator, db, res.args.input.?);
@@ -105,7 +88,6 @@ pub fn main() !void {
     } else if (res.args.bench != 0) {
         benchmark(allocator, db);
     } else if (res.args.perf != 0) {
-        // benchmark(allocator, db);
         write(allocator, db, res.args.input.?);
         read(allocator, db, res.args.input.?);
     } else {
@@ -169,7 +151,7 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             var error_count: u64 = 0;
 
             for (ctx.items, 0..) |key, i| {
-                const kv = ctx.db.read(key) catch |err| {
+                const kv = lsm.read(ctx.db, key) catch |err| {
                     std.log.debug("database read error for key {s} {s}", .{
                         key,
                         @errorName(err),
@@ -218,16 +200,16 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     };
     defer thread_pool.deinit();
 
-    const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
-    defer lsm.CsvClose(handle);
+    const handle = csv.CsvOpen2(input.ptr, ';', '"', '\\');
+    defer csv.CsvClose(handle);
 
     var thread_id: usize = 0;
 
     // Start timer and launch threads
     timer.reset();
 
-    while (lsm.ReadNextRow(handle)) |row| {
-        if (lsm.ReadNextCol(row, handle)) |val| {
+    while (csv.CsvReadNextRow(handle)) |row| {
+        if (csv.CsvReadNextCol(row, handle)) |val| {
             const key = mem.span(val);
 
             const k = arena_alloc.alloc(u8, key.len) catch unreachable;
@@ -332,7 +314,7 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         thread_id: usize,
         db: *lsm.Database,
         alloc: Allocator,
-        items: []const lsm.KV,
+        items: []const KV,
         success_count: std.atomic.Value(u64),
         error_count: std.atomic.Value(u64),
 
@@ -341,7 +323,7 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             wg: *std.Thread.WaitGroup,
             thread_id: usize,
             database: *lsm.Database,
-            items: []const lsm.KV,
+            items: []const KV,
         ) @This() {
             return .{
                 .alloc = malloc,
@@ -364,7 +346,7 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             var error_count: u64 = 0;
 
             for (ctx.items, 0..) |kv, i| {
-                ctx.db.write(kv) catch |err| {
+                lsm.write(ctx.db, kv) catch |err| {
                     std.log.debug("database write error for key {s} {s}\n", .{
                         kv.key,
                         @errorName(err),
@@ -372,9 +354,8 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
                     error_count += 1;
                     continue;
                 };
-                success_count += 1;
 
-                supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+                success_count += 1;
 
                 // Periodically log progress
                 const chunk_size = ctx.items.len / 5;
@@ -409,33 +390,33 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     };
     defer thread_pool.deinit();
 
-    var kvs = std.ArrayList(lsm.KV).init(arena_alloc);
+    var kvs = std.ArrayList(KV).init(arena_alloc);
     defer kvs.deinit();
 
-    const handle = lsm.CsvOpen2(input.ptr, ';', '"', '\\');
-    defer lsm.CsvClose(handle);
+    const handle = csv.CsvOpen2(input.ptr, ';', '"', '\\');
+    defer csv.CsvClose(handle);
 
     var thread_id: usize = 0;
 
     // Start timer and launch threads
     timer.reset();
 
-    while (lsm.ReadNextRow(handle)) |row| {
+    while (csv.CsvReadNextRow(handle)) |row| {
         var key: []const u8 = undefined;
-        if (lsm.ReadNextCol(row, handle)) |val| {
+        if (csv.CsvReadNextCol(row, handle)) |val| {
             key = mem.span(val);
         } else {
             break;
         }
 
         var value: []const u8 = undefined;
-        if (lsm.ReadNextCol(row, handle)) |val| {
+        if (csv.CsvReadNextCol(row, handle)) |val| {
             value = mem.span(val);
         } else {
             break;
         }
 
-        const item = lsm.KV.initOwned(arena_alloc, key, value) catch unreachable;
+        const item = KV.initOwned(arena_alloc, key, value) catch unreachable;
         kvs.append(item) catch return;
 
         if (kvs.items.len >= ops_per_thread) {
@@ -585,9 +566,9 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
                     const key = std.fmt.allocPrint(malloc, "key_{d}", .{i}) catch unreachable;
                     const value = std.fmt.allocPrint(malloc, "value_{d}", .{i}) catch unreachable;
 
-                    const kv = lsm.KV.initOwned(malloc, key, value) catch unreachable;
+                    const kv = KV.initOwned(malloc, key, value) catch unreachable;
 
-                    ctx.db.write(kv) catch |err| {
+                    lsm.write(ctx.db, kv) catch |err| {
                         std.log.debug("database write error for key {s} {s}\n", .{
                             key,
                             @errorName(err),
@@ -595,9 +576,8 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
                         error_count += 1;
                         continue;
                     };
-                    success_count += 1;
 
-                    supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+                    success_count += 1;
 
                     // Periodically log progress
                     const chunk_size = (ctx.end_idx - ctx.start_idx) / 5;
@@ -666,7 +646,7 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
             for (ctx.start_idx..ctx.end_idx) |i| {
                 const key = std.fmt.allocPrint(malloc, "key_{d}", .{i}) catch unreachable;
 
-                const v = ctx.db.read(key) catch |err| {
+                const v = lsm.read(ctx.db, key) catch |err| {
                     std.log.debug("database read error for key {s} {s}", .{
                         key,
                         @errorName(err),

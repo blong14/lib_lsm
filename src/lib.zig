@@ -1,59 +1,28 @@
 const std = @import("std");
 
-const atomic = std.atomic;
-const debug = std.debug;
-const heap = std.heap;
-const io = std.io;
-const math = std.math;
-const mem = std.mem;
-const testing = std.testing;
-const hasher = std.hash.Murmur2_64;
-
-const Allocator = mem.Allocator;
-const ArenaAllocator = heap.ArenaAllocator;
-const AtomicValue = atomic.Value;
-const Mutex = std.Thread.Mutex;
-const Order = math.Order;
-
-const csv = @cImport({
-    @cInclude("csv.h");
-});
-pub const CsvOpen2 = csv.CsvOpen2;
-pub const CsvClose = csv.CsvClose;
-pub const ReadNextRow = csv.CsvReadNextRow;
-pub const ReadNextCol = csv.CsvReadNextCol;
-
-const file = @import("file.zig");
-pub const OpenFile = file.open;
+const jemalloc = @import("jemalloc");
 
 const iter = @import("iterator.zig");
-pub const Iterator = iter.Iterator;
-
-const msgq = @import("msgqueue.zig");
-pub const ProcessMessageQueue = msgq.ProcessMessageQueue;
-pub const ThreadMessageQueue = msgq.Queue;
-
-const mtbl = @import("memtable.zig");
-pub const Memtable = mtbl.Memtable;
-
 const opt = @import("opts.zig");
+const spv = @import("supervisor.zig");
+
+const Allocator = std.mem.Allocator;
+
+const DatabaseSupervisor = spv.DatabaseSupervisor;
+const Iterator = iter.Iterator;
+
+const allocator = jemalloc.allocator;
+
+var supervisor: *DatabaseSupervisor = undefined;
+
+// Public Interface
+
 pub const Opts = opt.Opts;
-pub const defaultOpts = opt.defaultOpts;
-pub const withDataDirOpts = opt.withDataDirOpts;
-
-const prof = @import("profile.zig");
-pub const BeginProfile = prof.BeginProfile;
-pub const EndProfile = prof.EndProfile;
-pub const BlockProfiler = prof.BlockProfiler;
-
 pub const Database = @import("database.zig").Database;
-pub const DatabaseSupervisor = @import("supervisor.zig").DatabaseSupervisor;
-pub const ThreadSafeBumpAllocator = @import("bump_allocator.zig").ThreadSafeBumpAllocator;
 pub const KV = @import("kv.zig").KV;
 
-const SSTable = @import("sstable.zig").SSTable;
-const TableMap = @import("tablemap.zig").TableMap;
-const WAL = @import("wal.zig").WAL;
+pub const defaultOpts = opt.defaultOpts;
+pub const withDataDirOpts = opt.withDataDirOpts;
 
 pub fn defaultDatabase(alloc: Allocator) !*Database {
     return try databaseFromOpts(alloc, defaultOpts());
@@ -63,51 +32,66 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
     return try Database.init(alloc, opts);
 }
 
-// Public C Interface
-const jemalloc = @import("jemalloc");
-const allocator = jemalloc.allocator;
+pub fn init(alloc: Allocator, opts: Opts) !*Database {
+    const db = try databaseFromOpts(alloc, opts);
 
-var supervisor: *DatabaseSupervisor = undefined;
+    try db.open(allocator);
 
-export fn lsm_init() ?*anyopaque {
-    const db = defaultDatabase(allocator) catch return null;
-    db.open(allocator) catch return null;
-
-    supervisor = DatabaseSupervisor.init(
+    supervisor = try DatabaseSupervisor.init(
         allocator,
         db,
         .{},
-    ) catch return null;
+    );
 
-    supervisor.start() catch return null;
+    try supervisor.start();
 
     return db;
 }
 
-export fn lsm_read(addr: *anyopaque, key: [*c]const u8) [*c]const u8 {
-    const db: *Database = @ptrCast(@alignCast(addr));
-    const k = std.mem.span(key);
-    const kv = db.read(k) catch return null;
-    return &kv.?.value[0];
+pub fn deinit(db: *Database) void {
+    supervisor.stop();
+    supervisor.deinit();
+
+    db.deinit(allocator);
+    allocator.destroy(db);
 }
 
-export fn lsm_value_deinit(value: [*c]const u8) bool {
-    const v = std.mem.span(value);
-    allocator.free(v);
-    return true;
+pub fn read(db: *Database, key: []const u8) !?KV {
+    return try db.read(key);
 }
 
-export fn lsm_write(addr: *anyopaque, key: [*c]const u8, value: [*c]const u8) bool {
-    const db: *Database = @ptrCast(@alignCast(addr));
-    const k = std.mem.span(key);
-    const v = std.mem.span(value);
+pub fn write(db: *Database, kv: KV) !void {
+    try db.write(kv);
+    supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+}
 
-    var kv = KV.initOwned(allocator, k, v) catch return false;
+// Public C Interface
+
+export fn lsm_init() ?*anyopaque {
+    const opts = defaultOpts();
+    return init(allocator, opts) catch return null;
+}
+
+export fn lsm_read(addr: *anyopaque, k: [*c]const u8) [*c]const u8 {
+    const db: *Database = @ptrCast(@alignCast(addr));
+    const key = std.mem.span(k);
+
+    if (read(db, key) catch return null) |kv| {
+        return &kv.value[0];
+    }
+
+    return null;
+}
+
+export fn lsm_write(addr: *anyopaque, k: [*c]const u8, v: [*c]const u8) bool {
+    const db: *Database = @ptrCast(@alignCast(addr));
+    const key = std.mem.span(k);
+    const value = std.mem.span(v);
+
+    var kv = KV.initOwned(allocator, key, value) catch return false;
     defer kv.deinit(allocator);
 
-    db.write(kv) catch return false;
-
-    supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+    write(db, kv) catch return false;
 
     return true;
 }
@@ -138,11 +122,7 @@ export fn lsm_iter_deinit(addr: *anyopaque) bool {
 export fn lsm_deinit(addr: *anyopaque) bool {
     const db: *Database = @ptrCast(@alignCast(addr));
 
-    supervisor.stop();
-    supervisor.deinit();
-
-    db.deinit(allocator);
-    allocator.destroy(db);
+    deinit(db);
 
     return true;
 }
