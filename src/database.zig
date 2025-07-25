@@ -485,3 +485,125 @@ test "basic functionality with many items" {
 
     try testing.expectEqual(3, items.items.len);
 }
+
+test "write with empty key returns error" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // Create a KV with empty key directly to bypass KV validation
+    const kv = KV{
+        .key = "",
+        .value = "some_value",
+        .raw_bytes = "",
+        .timestamp = std.time.nanoTimestamp(),
+        .ownership = .borrowed,
+    };
+
+    // when/then
+    try testing.expectError(error.InvalidKeyData, db.write(kv));
+}
+
+test "memtableCount returns correct count" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // initially should be 0
+    try testing.expectEqual(@as(usize, 0), db.memtableCount());
+
+    // write some data and freeze to create memtables
+    var kv = try KV.initOwned(alloc, "test_key", "test_value");
+    defer kv.deinit(alloc);
+
+    try db.write(kv);
+
+    const hot_table = db.mtable.load(.seq_cst);
+    try db.freeze(alloc, hot_table);
+
+    // should now have 1 unflushed memtable
+    try testing.expectEqual(@as(usize, 1), db.memtableCount());
+}
+
+test "flush with no memtables" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // xflush should return error when no memtables to flush
+    try testing.expectError(error.NothingToFlush, db.xflush(alloc));
+}
+
+test "read returns null for non-existent key" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // when
+    const result = try db.read("non_existent_key");
+
+    // then
+    try testing.expect(result == null);
+}
+
+test "freeze already frozen memtable" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // write some data
+    var kv = try KV.initOwned(alloc, "test_key", "test_value");
+    defer kv.deinit(alloc);
+    try db.write(kv);
+
+    const hot_table = db.mtable.load(.seq_cst);
+
+    // freeze once
+    try db.freeze(alloc, hot_table);
+
+    // freeze again - should be no-op
+    try db.freeze(alloc, hot_table);
+
+    // should still work without error
+    try testing.expect(hot_table.frozen());
+}
