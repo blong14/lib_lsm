@@ -19,8 +19,8 @@ ZIG_DEBUG_OPTS := -Dcpu=x86_64 -Doptimize=Debug
 
 # Runtime options
 DATA_DIR := /home/blong14/Developer/git/lib_lsm/.tmp/data
-# MODE := singlethreaded
-MODE := multithreaded
+MODE := singlethreaded
+# MODE := multithreaded
 SST_CAPACITY := 1000000
 
 # Help command
@@ -63,36 +63,49 @@ go: $(SOURCES)
 	$(ZIG) build $(ZIG_RELEASE_OPTS) $(ZIG_COMMON_FLAGS) go
 
 # Development targets
-.PHONY: clean debug fmt perf profile run test 
+.PHONY: clean debug fmt perf write read scan test 
 clean:
 	@$(ZIG) build uninstall $(ZIG_COMMON_FLAGS)
 	@$(GO) clean -cache -v
 	@rm -rf $(BUILD_OUT) $(BUILD_CACHE)
 
 debug:
+	rm -rf .tmp/data/*.dat
 	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
-		--bench \
-		--data_dir $(DATA_DIR)
+		--write \
+		--input data/measurements.txt \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
 
 fmt:
 	@$(ZIG) build $(ZIG_COMMON_FLAGS) fmt
 
 perf:
-	perf record -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) xlsm -- \
+	rm -rf .tmp/data/*.dat
+	perf record --call-graph dwarf -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
+		--perf \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
-	perf script --input=perf.data -F +pid > perf.processed.data
+	# perf script --input=perf.data -F +pid > perf.processed.data
 
-profile:
-	$(ZIG) build $(ZIG_RELEASE_OPTS) xlsm -- \
-		--mode $(MODE) \
+scan:
+	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
-
-run:
+read:
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+		--read \
+		--input data/measurements.txt \
+		--data_dir $(DATA_DIR) \
+		--sst_capacity $(SST_CAPACITY)
+
+write:
+	rm -rf .tmp/data/*.dat
+	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+		--write \
+		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 
@@ -100,6 +113,7 @@ bench:
 	rm -rf .tmp/data/*.dat
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--bench \
+		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 test:
@@ -110,8 +124,8 @@ coverage:
 
 poop: build 
 	./bin/poop \
-		'./$(EXEC) --data_dir ./.tmp/data/data1 --mode singlethreaded --input ./data/measurements.txt --sst_capacity 1_000_000' \
-		'./$(EXEC) --data_dir ./.tmp/data/data2 --mode multithreaded --input ./data/measurements.txt --sst_capacity 1_000_000'
+		'./$(EXEC) --data_dir .tmp/data/data1 --mode singlethreaded --input data/measurements.txt --sst_capacity 1_000_000' \
+		'./$(EXEC) --data_dir .tmp/data/data2 --mode multithreaded --input data/measurements.txt --sst_capacity 1_000_000'
 
 # Debug notes:
 # gdb --tui zig-out/bin/lsm

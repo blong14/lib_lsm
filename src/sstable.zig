@@ -128,20 +128,18 @@ pub const SSTableStore = struct {
 
         std.log.debug("releasing {d} tables", .{tables_to_release.items.len});
         for (tables_to_release.items) |table| {
-            if (table.release()) {
-                const fln = try std.fmt.allocPrint(
-                    malloc,
-                    "{s}/{s}.dat",
-                    .{ table.data_dir, table.id },
-                );
+            const fln = try std.fmt.allocPrint(
+                malloc,
+                "{s}/{s}.dat",
+                .{ table.data_dir, table.id },
+            );
 
-                table.deinit();
-                alloc.destroy(table);
+            table.deinit();
+            alloc.destroy(table);
 
-                file_utils.delete(fln) catch |err| {
-                    std.log.warn("file deletion failed for {s} {s}", .{ fln, @errorName(err) });
-                };
-            }
+            file_utils.delete(fln) catch |err| {
+                std.log.warn("file deletion failed for {s} {s}", .{ fln, @errorName(err) });
+            };
         }
 
         self.mutex.lock();
@@ -158,11 +156,8 @@ pub const SSTableStore = struct {
 
             for (self.levels.items) |*level| {
                 for (level.items) |sstable| {
-                    // Release our reference and only destroy if it was the last one
-                    if (sstable.release()) {
-                        sstable.deinit();
-                        alloc.destroy(sstable);
-                    }
+                    sstable.deinit();
+                    alloc.destroy(sstable);
                 }
                 level.deinit();
             }
@@ -607,7 +602,10 @@ pub const SSTableStore = struct {
                 defer it.deinit();
 
                 while (it.next()) |kv| {
-                    _ = try new_table.write(kv);
+                    var kv_copy = try kv.clone(self.alloc);
+                    defer kv_copy.deinit(self.alloc);
+
+                    _ = try new_table.write(kv_copy);
                     count += 1;
                 }
                 _ = table.release();
@@ -757,21 +755,19 @@ pub const SSTableStore = struct {
         return self.levels.items[level].items;
     }
 
-    pub fn read(self: *Self, key: []const u8, kv: *KV) !void {
+    pub fn read(self: *Self, key: []const u8) !?KV {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         for (0..self.num_levels) |level| {
             for (self.levels.items[level].items) |sstable| {
-                sstable.read(key, kv) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
-                return;
+                if (try sstable.read(key)) |kv| {
+                    return kv;
+                }
             }
         }
 
-        return error.NotFound;
+        return null;
     }
 
     const LevelIterator = struct {
@@ -835,10 +831,10 @@ pub const SSTableStore = struct {
         const start_time = std.time.nanoTimestamp();
 
         var sstable = try SSTable.init(alloc, 0, self.opts);
-        errdefer alloc.destroy(sstable);
-        errdefer sstable.deinit();
-
-        mtable.freeze();
+        errdefer {
+            sstable.deinit();
+            alloc.destroy(sstable);
+        }
 
         var it = try mtable.iterator(alloc);
         defer it.deinit();
@@ -855,6 +851,7 @@ pub const SSTableStore = struct {
                     return err;
                 },
             };
+
             keys_written += 1;
         }
 
@@ -1026,16 +1023,18 @@ pub const SSTable = struct {
         self.*.stream = stream;
     }
 
-    pub fn read(self: Self, key: []const u8, kv: *KV) !void {
-        // TODO: fix this implementation
-        // idea 1: check block meta to see if the key is even in this block
-        // idea 2: update API to accept an index instead of a key
-        // idea 3: map keys and indices
-        var stream = fixedBufferStream(self.block.offset_data.items);
-        var stream_reader = stream.reader();
+    pub fn read(self: Self, key: []const u8) !?KV {
+        const offset_sz = @sizeOf(u64);
+        const offset_data = self.block.offset_data.items;
+        const offset_total = offset_data.len / offset_sz;
 
-        while (stream.pos < stream.buffer.len) {
-            const idx = try stream_reader.readInt(u64, Endian);
+        var start: usize = 0;
+        var end: usize = offset_total;
+
+        while (start < end) {
+            const mid: usize = start + (end - start) / 2;
+            const offset_ptr: *const [offset_sz]u8 = @ptrCast(&offset_data[mid * offset_sz]);
+            const idx = readInt(u64, offset_ptr, Endian);
 
             const value = self.block.read(idx) catch |err| {
                 std.log.err(
@@ -1045,21 +1044,14 @@ pub const SSTable = struct {
                 return err;
             };
 
-            if (std.mem.eql(u8, value.key, key)) {
-                kv.* = value;
-
-                // Record read latency if we have access to stats
-                // This is a bit of a hack since we don't have direct access to the store's stats
-                // In a real implementation, we might want to pass the stats object or use a global context
-                // const start_time = std.time.nanoTimestamp();
-                // const end_time = std.time.nanoTimestamp();
-                // const latency = @as(u64, @intCast(end_time - start_time));
-
-                return;
+            switch (std.mem.order(u8, key, value.key)) {
+                .lt => end = mid,
+                .gt => start = mid + 1,
+                .eq => return value,
             }
         }
 
-        return error.NotFound;
+        return null;
     }
 
     pub fn write(self: *Self, value: KV) !usize {
@@ -1097,6 +1089,7 @@ pub const SSTable = struct {
                 const offset_ptr: *const [offset_sz]u8 = @ptrCast(&self.block.offset_data.items[self.nxt]);
                 const nxt_offset = readInt(u64, offset_ptr, Endian);
 
+                // Get the KV as a borrowed reference to the block's data
                 kv = self.block.read(nxt_offset) catch |err| {
                     std.log.err("sstable iter error {s}", .{@errorName(err)});
                     return null;
@@ -1118,8 +1111,13 @@ pub const SSTable = struct {
 
 test "SSTable basic operations" {
     const testing = std.testing;
-    var alloc = testing.allocator;
+    const allocator = testing.allocator;
     const testDir = testing.tmpDir(.{});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
 
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
@@ -1135,19 +1133,18 @@ test "SSTable basic operations" {
     {
         // Test read/write
         const expected = "__value__";
-        const kv = KV.init("__key__", expected);
+        const kv = try KV.initOwned(alloc, "__key__", expected);
 
         _ = try st.write(kv);
 
-        var actual: KV = undefined;
-        try st.read(kv.key, &actual);
+        const actual = try st.read(kv.key);
 
-        try testing.expectEqualStrings(expected, actual.value);
+        try testing.expectEqualStrings(expected, actual.?.value);
     }
 
     {
         // Test multiple entries and iteration
-        const akv = KV.init("__another_key__", "__another_value__");
+        const akv = try KV.initOwned(alloc, "__another_key__", "__another_value__");
         _ = try st.write(akv);
 
         var siter = try st.iterator(alloc);
@@ -1176,8 +1173,13 @@ test "SSTable basic operations" {
 
 test "SSTable persistence and error handling" {
     const testing = std.testing;
-    var alloc = testing.allocator;
+    const allocator = testing.allocator;
     const testDir = testing.tmpDir(.{});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
 
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
@@ -1192,8 +1194,8 @@ test "SSTable persistence and error handling" {
         defer alloc.destroy(st);
         defer st.deinit();
 
-        _ = try st.write(KV.init("key1", "value1"));
-        _ = try st.write(KV.init("key2", "value2"));
+        _ = try st.write(try KV.initOwned(alloc, "key1", "value1"));
+        _ = try st.write(try KV.initOwned(alloc, "key2", "value2"));
 
         try st.block.freeze();
 
@@ -1232,11 +1234,10 @@ test "SSTable persistence and error handling" {
         st.mutable = false; // Ensure the table is immutable after opening
 
         // Try to read a key that doesn't exist
-        var kv: KV = undefined;
-        try testing.expectError(error.NotFound, st.read("nonexistent_key", &kv));
+        try testing.expectEqual(null, try st.read("nonexistent_key"));
 
         // Try to write to an immutable table
-        try testing.expectError(error.WriteError, st.write(KV.init("new_key", "new_value")));
+        try testing.expectError(error.WriteError, st.write(try KV.initOwned(alloc, "new_key", "new_value")));
     }
 }
 
@@ -1249,41 +1250,43 @@ test "SSTableStore flush and compaction" {
     defer alloc.free(pathname);
     defer testDir.dir.deleteTree(pathname) catch {};
 
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
     var dopts = options.defaultOpts();
     dopts.data_dir = pathname;
     dopts.num_levels = 3;
 
-    var store = try SSTableStore.init(alloc, dopts);
-    defer store.deinit(alloc);
+    var store = try SSTableStore.init(allocator, dopts);
+    defer store.deinit(allocator);
 
-    var memtable = try Memtable.init(alloc, "level-0", dopts);
-    defer alloc.destroy(memtable);
+    var memtable = try Memtable.init(allocator, "level-0");
+    defer allocator.destroy(memtable);
     defer memtable.deinit();
 
-    try memtable.put(alloc, KV.init("flush_key1", "flush_value1"));
-    try memtable.put(alloc, KV.init("flush_key2", "flush_value2"));
-    try memtable.put(alloc, KV.init("flush_key3", "flush_value3"));
+    try memtable.put(try KV.initOwned(allocator, "flush_key1", "flush_value1"));
+    try memtable.put(try KV.initOwned(allocator, "flush_key2", "flush_value2"));
+    try memtable.put(try KV.initOwned(allocator, "flush_key3", "flush_value3"));
 
     // Flush memtable to SSTable
     {
-        try store.flush(alloc, memtable);
+        try store.flush(allocator, memtable);
 
         try testing.expect(memtable.isFlushed.load(.acquire));
         try testing.expectEqual(@as(usize, 1), store.get(0).len);
     }
 
-    var kv: KV = undefined;
-
     // Read back the data
     {
-        try store.read("flush_key1", &kv);
-
-        try testing.expectEqualStrings("flush_value1", kv.value);
+        const kv = try store.read("flush_key1");
+        try testing.expectEqualStrings("flush_value1", kv.?.value);
     }
 
     // Test store iterator
     {
-        var it = try store.iterator(alloc);
+        var it = try store.iterator(allocator);
         defer it.deinit();
 
         var count: usize = 0;
@@ -1302,16 +1305,20 @@ test "SSTableStore flush and compaction" {
         try testing.expectEqual(@as(usize, 1), store.get(1).len);
 
         // Verify data is still accessible after compaction
-        try store.read("flush_key2", &kv);
-        try testing.expectEqualStrings("flush_value2", kv.value);
+        const kv = try store.read("flush_key2");
+        try testing.expectEqualStrings("flush_value2", kv.?.value);
     }
 }
 
 test "SSTableStore open" {
     const testing = std.testing;
-    var alloc = testing.allocator;
-    const testDir = testing.tmpDir(.{});
 
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    const testDir = testing.tmpDir(.{});
     const pathname = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
     defer testDir.dir.deleteTree(pathname) catch {};
@@ -1327,12 +1334,14 @@ test "SSTableStore open" {
 
         // Create and add tables to different levels
         var table0 = try SSTable.init(alloc, 0, dopts);
-        _ = try table0.write(KV.init("key0", "value0"));
+        _ = try table0.write(try KV.initOwned(alloc, "key0", "value0"));
+
         try store.add(table0, 0);
         _ = table0.release();
 
         var table1 = try SSTable.init(alloc, 1, dopts);
-        _ = try table1.write(KV.init("key1", "value1"));
+        _ = try table1.write(try KV.initOwned(alloc, "key1", "value1"));
+
         try store.add(table1, 1);
         _ = table1.release();
 
@@ -1373,12 +1382,11 @@ test "SSTableStore open" {
         try testing.expectEqual(@as(usize, 1), store.get(1).len);
 
         // Verify data in the tables
-        var kv: KV = undefined;
-        try store.read("key0", &kv);
-        try testing.expectEqualStrings("value0", kv.value);
+        var kv = try store.read("key0");
+        try testing.expectEqualStrings("value0", kv.?.value);
 
-        try store.read("key1", &kv);
-        try testing.expectEqualStrings("value1", kv.value);
+        kv = try store.read("key1");
+        try testing.expectEqualStrings("value1", kv.?.value);
     }
 }
 
@@ -1402,9 +1410,9 @@ test "CompactionStrategies" {
             }
 
             // Add some test data
-            _ = try table.write(KV.init("key1", "value1"));
-            _ = try table.write(KV.init("key2", "value2"));
-            _ = try table.write(KV.init("key3", "value3"));
+            _ = try table.write(try KV.initOwned(a, "key1", "value1"));
+            _ = try table.write(try KV.initOwned(a, "key2", "value2"));
+            _ = try table.write(try KV.initOwned(a, "key3", "value3"));
 
             return table;
         }
@@ -1431,55 +1439,62 @@ test "CompactionStrategies" {
         }
     }.verify;
 
+    var arena = std.heap.ArenaAllocator.init(talloc);
+    defer arena.deinit();
+
     // Test SimpleCompactionStrategy
     {
+        const alloc = arena.allocator();
+
         var dopts = options.defaultOpts();
         dopts.data_dir = pathname;
         dopts.num_levels = 3;
 
-        var tm = try SSTableStore.init(talloc, dopts);
-        defer tm.deinit(talloc);
+        var tm = try SSTableStore.init(alloc, dopts);
+        defer tm.deinit(alloc);
 
         // Create tables and add them to the store
         // The tables are now managed by the store with reference counting
-        var table1 = try createTestSSTable(talloc, 0, dopts);
+        var table1 = try createTestSSTable(alloc, 0, dopts);
         try tm.add(table1, 0);
         _ = table1.release();
 
-        var table2 = try createTestSSTable(talloc, 0, dopts);
+        var table2 = try createTestSSTable(alloc, 0, dopts);
         try tm.add(table2, 0);
         _ = table2.release();
 
         try tm.compact(0);
 
         // level 0 should be empty, level 1 should have 1 table
-        try verifyCompactionResults(talloc, &tm, 0, 0);
-        try verifyCompactionResults(talloc, &tm, 1, 1);
+        try verifyCompactionResults(alloc, &tm, 0, 0);
+        try verifyCompactionResults(alloc, &tm, 1, 1);
     }
 
     // Test TieredCompactionStrategy
     {
+        const alloc = arena.allocator();
+
         var dopts = options.defaultOpts();
         dopts.compaction_strategy = .tiered;
         dopts.data_dir = pathname;
         dopts.num_levels = 3;
 
-        var tm = try SSTableStore.init(talloc, dopts);
-        defer tm.deinit(talloc);
+        var tm = try SSTableStore.init(alloc, dopts);
+        defer tm.deinit(alloc);
 
-        var table1 = try createTestSSTable(talloc, 0, dopts);
+        var table1 = try createTestSSTable(alloc, 0, dopts);
         try tm.add(table1, 0);
         _ = table1.release();
 
-        var table2 = try createTestSSTable(talloc, 0, dopts);
+        var table2 = try createTestSSTable(alloc, 0, dopts);
         try tm.add(table2, 0);
         _ = table2.release();
 
         try tm.compact(0);
 
         // Since TieredCompactionStrategy is just a stub, we expect no changes
-        try verifyCompactionResults(talloc, &tm, 0, 2);
-        try verifyCompactionResults(talloc, &tm, 1, 0);
+        try verifyCompactionResults(alloc, &tm, 0, 2);
+        try verifyCompactionResults(alloc, &tm, 1, 0);
     }
 
     // Test with a custom strategy (demonstrating extensibility)
@@ -1520,26 +1535,28 @@ test "CompactionStrategies" {
             }
         };
 
+        const alloc = arena.allocator();
+
         var dopts = options.defaultOpts();
         dopts.data_dir = pathname;
         dopts.num_levels = 3;
 
-        var tm = try SSTableStore.init(talloc, dopts);
-        defer tm.deinit(talloc);
+        var tm = try SSTableStore.init(alloc, dopts);
+        defer tm.deinit(alloc);
 
-        var table1 = try createTestSSTable(talloc, 0, dopts);
+        var table1 = try createTestSSTable(alloc, 0, dopts);
         try tm.add(table1, 0);
         _ = table1.release();
 
-        var table2 = try createTestSSTable(talloc, 0, dopts);
+        var table2 = try createTestSSTable(alloc, 0, dopts);
         try tm.add(table2, 0);
         _ = table2.release();
 
-        const custom_strategy = try talloc.create(CustomCompactionStrategy);
+        const custom_strategy = try alloc.create(CustomCompactionStrategy);
         custom_strategy.* = CustomCompactionStrategy.init(talloc);
 
         tm.setCompactionStrategy(
-            talloc,
+            alloc,
             CompactionStrategy.init(
                 custom_strategy,
                 CustomCompactionStrategy.compact,
@@ -1550,7 +1567,7 @@ test "CompactionStrategies" {
         try tm.compact(0);
 
         // level 0 should be empty, level 1 should have 2 tables
-        try verifyCompactionResults(talloc, &tm, 0, 0);
-        try verifyCompactionResults(talloc, &tm, 1, 2);
+        try verifyCompactionResults(alloc, &tm, 0, 0);
+        try verifyCompactionResults(alloc, &tm, 1, 2);
     }
 }

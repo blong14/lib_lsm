@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const MultiArrayList = std.MultiArrayList;
 const Order = std.math.Order;
 
+const Iterator = @import("iterator.zig").Iterator;
+
 const assert = std.debug.assert;
 
 pub fn TableMap(
@@ -14,13 +16,13 @@ pub fn TableMap(
     return struct {
         const Self = @This();
 
-        const TableMapError = error{
+        pub const TableMapError = error{
             Empty,
             NotFound,
             OutOfMemory,
         };
 
-        const Entry = struct {
+        pub const Entry = struct {
             key: K,
             value: V,
         };
@@ -45,7 +47,7 @@ pub fn TableMap(
 
         inline fn index(key: K, keys: []const K, low: usize, high: usize) usize {
             var start = low;
-            var end = high;
+            var end = high + 1;
             while (start < end) {
                 const mid: usize = start + (end - start) / 2;
                 const current_item = keys[mid];
@@ -83,11 +85,26 @@ pub fn TableMap(
 
             const keys = self.impl.items(.key);
             const idx = index(key, keys, 0, cnt - 1);
-            if ((idx == cnt) or !equalto(key, idx, keys)) {
+            if (idx >= cnt or !equalto(key, idx, keys)) {
                 return TableMapError.NotFound;
             }
 
             return self.impl.get(idx).value;
+        }
+
+        pub fn xget(self: Self, key: K) ?Entry {
+            const cnt = self.count();
+            if (cnt == 0) {
+                return null;
+            }
+
+            const keys = self.impl.items(.key);
+            const idx = index(key, keys, 0, cnt - 1);
+            if (idx >= cnt or !equalto(key, idx, keys)) {
+                return null;
+            }
+
+            return self.impl.get(idx);
         }
 
         pub fn put(self: *Self, key: K, value: V) TableMapError!void {
@@ -102,8 +119,12 @@ pub fn TableMap(
 
             const keys = self.impl.items(.key);
             const idx = index(key, keys, 0, cnt - 1);
-            if (equalto(key, idx, keys)) {
-                self.impl.set(idx, Entry{ .key = key, .value = value });
+            if (idx < cnt and equalto(key, idx, keys)) {
+                var entry = self.impl.get(idx);
+                entry.key = key;
+                entry.value = value;
+
+                self.impl.set(idx, entry);
             } else {
                 self.impl.insertAssumeCapacity(idx, Entry{ .key = key, .value = value });
                 self.cnt += 1;
@@ -112,45 +133,41 @@ pub fn TableMap(
             return;
         }
 
-        pub const Iterator = struct {
-            data: *const MultiArrayList(Entry),
-            k: K,
-            val: V,
+        const TableMapIterator = struct {
+            alloc: Allocator,
+            impl: *const MultiArrayList(Entry),
+            count: usize,
             idx: usize,
 
-            pub fn deinit(it: *Iterator) void {
-                _ = it;
+            pub fn deinit(ctx: *anyopaque) void {
+                const it: *TableMapIterator = @ptrCast(@alignCast(ctx));
+                it.alloc.destroy(it);
             }
 
-            pub fn key(it: Iterator) K {
-                return it.k;
-            }
+            pub fn next(ctx: *anyopaque) ?Entry {
+                const it: *TableMapIterator = @ptrCast(@alignCast(ctx));
 
-            pub fn value(it: Iterator) V {
-                return it.val;
-            }
-
-            pub fn next(it: *Iterator) !bool {
-                if (it.idx >= it.data.len) {
-                    return TableMapError.NotFound;
+                if (it.idx >= it.count) {
+                    return null;
                 }
 
-                const entry = it.data.get(it.idx);
-                it.*.k = entry.key;
-                it.*.val = entry.value;
+                const entry = it.impl.get(it.idx);
                 it.*.idx += 1;
 
-                return true;
+                return entry;
             }
         };
 
-        pub fn iter(self: Self, _: Allocator) Iterator {
-            return .{
-                .data = &self.impl,
-                .k = undefined,
-                .val = undefined,
+        pub fn iterator(self: *Self, alloc: Allocator) !Iterator(Entry) {
+            const it = try alloc.create(TableMapIterator);
+            it.* = .{
+                .alloc = alloc,
+                .impl = &self.impl,
+                .count = self.count(),
                 .idx = 0,
             };
+
+            return Iterator(Entry).init(it, TableMapIterator.next, TableMapIterator.deinit);
         }
     };
 }
