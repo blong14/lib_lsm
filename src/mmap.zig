@@ -8,6 +8,7 @@ const copyForwards = std.mem.copyForwards;
 
 pub fn MMap(comptime T: type) type {
     return struct {
+        alloc: Allocator,
         buf: FixedBuffer([]align(std.mem.page_size) u8),
         connected: bool,
         count: usize,
@@ -29,11 +30,12 @@ pub fn MMap(comptime T: type) type {
         pub fn init(alloc: Allocator, capacity: usize) !*Self {
             const mmap = try alloc.create(Self);
             mmap.* = .{
+                .alloc = alloc,
                 .buf = undefined,
                 .connected = false,
                 .count = 0,
                 .file = undefined,
-                .len = capacity / @sizeOf(T),
+                .len = capacity,
                 .size = @sizeOf(T),
             };
             return mmap;
@@ -42,7 +44,7 @@ pub fn MMap(comptime T: type) type {
         pub fn connect(self: *Self, file: std.fs.File) !void {
             const data = try std.posix.mmap(
                 null,
-                self.size * self.len,
+                self.len,
                 std.posix.PROT.READ | std.posix.PROT.WRITE,
                 .{ .TYPE = .SHARED, .ANONYMOUS = false },
                 file.handle,
@@ -57,7 +59,7 @@ pub fn MMap(comptime T: type) type {
             if (self.connected) {
                 std.posix.munmap(self.buf.buffer);
             }
-            self.* = undefined;
+            self.alloc.destroy(self);
         }
 
         pub fn append(self: *Self, value: T) !void {
@@ -286,7 +288,6 @@ test "MMap append" {
     const expected: row = .{ .key = key, .value = "__value__" };
 
     var map = try MMap(row).init(alloc, std.mem.page_size);
-    defer alloc.destroy(map);
     defer map.deinit();
 
     try map.connect(file);
@@ -328,7 +329,6 @@ test "MMap insert" {
     const expected: Row = .{ .key = key, .value = "__expected__" };
 
     var map = try MMap(Row).init(alloc, std.mem.page_size);
-    defer alloc.destroy(map);
     defer map.deinit();
 
     try map.connect(file);
