@@ -92,7 +92,7 @@ pub fn main() !void {
         read(allocator, db, res.args.input.?);
     } else {
         // Fallback runnable used for simple scanning of the database files.
-        write(allocator, db, res.args.input.?);
+        // write(allocator, db, res.args.input.?);
         iterator(allocator, db);
         // scan(allocator, db, "Atlanta", "New York");
     }
