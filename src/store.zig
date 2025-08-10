@@ -572,10 +572,26 @@ pub const SSTableStore = struct {
             if (tables.len == 0) {
                 return;
             }
+            
+            // Track retained tables for cleanup on error
+            var retained_tables = std.ArrayList(*SSTable).init(self.alloc);
+            defer {
+                // Release all retained tables on exit
+                for (retained_tables.items) |table| {
+                    _ = table.release();
+                }
+                retained_tables.deinit();
+            }
+            
             var sz: usize = 0;
             for (tables) |table| {
                 sz += table.block.size();
                 table.retain();
+                retained_tables.append(table) catch {
+                    // If we can't track it, release immediately
+                    _ = table.release();
+                    return error.OutOfMemory;
+                };
             }
 
             sz = sz * 10;
@@ -604,10 +620,6 @@ pub const SSTableStore = struct {
             var bytes_read: u64 = 0;
 
             for (tables) |table| {
-                errdefer {
-                    _ = table.release();
-                }
-
                 bytes_read += table.block.size();
 
                 var it = try table.iterator(self.alloc);
@@ -620,8 +632,10 @@ pub const SSTableStore = struct {
                     _ = try new_table.write(kv_copy);
                     count += 1;
                 }
-                _ = table.release();
             }
+            
+            // Clear the retained_tables list since we're done with them
+            retained_tables.clearRetainingCapacity();
 
             if (count > 0) {
                 // try new_table.block.freeze();

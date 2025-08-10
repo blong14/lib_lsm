@@ -140,9 +140,11 @@ pub const Database = struct {
             latest_timestamp = kv.timestamp;
         }
 
-        // snapshot_tables: Dynamically allocate to ensure we read from ALL memtables.
-        // This is critical for correctness - missing any memtable could return stale data.
-        // For MVCC, we need a consistent point-in-time view of the complete database state.
+        // snapshot_tables: Create a safe snapshot of memtables for consistent reads
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
+        
         var snapshot_tables: []*Memtable = undefined;
         var table_count: usize = 0;
 
@@ -152,21 +154,12 @@ pub const Database = struct {
 
             table_count = self.mtables.items.len;
             if (table_count > 0) {
-                // Use a stack-allocated array for reasonable sizes, heap for large counts
-                if (table_count <= 64) {
-                    var stack_tables: [64]*Memtable = undefined;
-                    @memcpy(stack_tables[0..table_count], self.mtables.items[0..table_count]);
-                    snapshot_tables = stack_tables[0..table_count];
-                } else {
-                    // For very large counts, we'd need heap allocation, but this indicates
-                    // a problem with the flush/compaction strategy
-                    std.log.warn("Large memtable count ({d}) - consider tuning flush policy", .{table_count});
-                    var stack_tables: [64]*Memtable = undefined;
-                    const limited_count = @min(table_count, 64);
-                    @memcpy(stack_tables[0..limited_count], self.mtables.items[0..limited_count]);
-                    snapshot_tables = stack_tables[0..limited_count];
-                    table_count = limited_count;
-                }
+                // Always use heap allocation for safety
+                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch {
+                    std.log.err("Failed to allocate snapshot tables array");
+                    return null;
+                };
+                @memcpy(snapshot_tables, self.mtables.items);
             } else {
                 snapshot_tables = &[_]*Memtable{};
             }
@@ -219,6 +212,11 @@ pub const Database = struct {
             try merger.add(hot_iter);
         }
 
+        // Use arena allocator for safe snapshot management
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
+        
         var snapshot_tables: []*Memtable = undefined;
         var table_count: usize = 0;
 
@@ -228,18 +226,11 @@ pub const Database = struct {
 
             table_count = self.mtables.items.len;
             if (table_count > 0) {
-                if (table_count <= 64) {
-                    var stack_tables: [64]*Memtable = undefined;
-                    @memcpy(stack_tables[0..table_count], self.mtables.items[0..table_count]);
-                    snapshot_tables = stack_tables[0..table_count];
-                } else {
-                    std.log.warn("Large memtable count ({d}) in iterator - consider tuning flush policy", .{table_count});
-                    var stack_tables: [64]*Memtable = undefined;
-                    const limited_count = @min(table_count, 64);
-                    @memcpy(stack_tables[0..limited_count], self.mtables.items[0..limited_count]);
-                    snapshot_tables = stack_tables[0..limited_count];
-                    table_count = limited_count;
-                }
+                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch {
+                    std.log.err("Failed to allocate snapshot tables for iterator");
+                    return error.OutOfMemory;
+                };
+                @memcpy(snapshot_tables, self.mtables.items);
             } else {
                 snapshot_tables = &[_]*Memtable{};
             }

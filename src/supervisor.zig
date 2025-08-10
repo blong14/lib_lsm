@@ -96,17 +96,23 @@ pub const DatabaseSupervisor = struct {
         // For 120 FPS, each frame should take approximately 8.33ms
         const target_frame_time_ns: i128 = @divTrunc(std.time.ns_per_s, 120);
 
-        var previous = std.time.nanoTimestamp();
-
         while (self.isRunning()) {
-            const current = std.time.nanoTimestamp();
-            previous = current;
+            const frame_start = std.time.nanoTimestamp();
+
+            // Check if we should still be running before processing
+            if (!self.isRunning()) break;
 
             self.processEvents();
+            
+            if (!self.isRunning()) break;
+            
             self.evaluateState();
+            
+            if (!self.isRunning()) break;
+            
             self.processActions();
 
-            const frame_time = std.time.nanoTimestamp() - current;
+            const frame_time = std.time.nanoTimestamp() - frame_start;
 
             // Sleep if we're ahead of schedule to maintain 120 FPS
             if (frame_time < target_frame_time_ns) {
