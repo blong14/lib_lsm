@@ -144,7 +144,7 @@ pub const Database = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const temp_alloc = arena.allocator();
-        
+
         var snapshot_tables: []*Memtable = undefined;
         var table_count: usize = 0;
 
@@ -216,7 +216,7 @@ pub const Database = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const temp_alloc = arena.allocator();
-        
+
         var snapshot_tables: []*Memtable = undefined;
         var table_count: usize = 0;
 

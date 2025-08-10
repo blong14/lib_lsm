@@ -103,13 +103,13 @@ pub const DatabaseSupervisor = struct {
             if (!self.isRunning()) break;
 
             self.processEvents();
-            
+
             if (!self.isRunning()) break;
-            
+
             self.evaluateState();
-            
+
             if (!self.isRunning()) break;
-            
+
             self.processActions();
 
             const frame_time = std.time.nanoTimestamp() - frame_start;

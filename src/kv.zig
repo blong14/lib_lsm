@@ -241,7 +241,7 @@ pub fn extractTimestamp(internal_key: []const u8) i128 {
 
     // Read key length from the beginning
     const key_len = readInt(u64, internal_key[0..@sizeOf(u64)], Endian);
-    
+
     // Validate key length bounds
     const expected_total_size = @sizeOf(u64) + key_len + @sizeOf(i128);
     if (expected_total_size > internal_key.len) {
@@ -250,14 +250,14 @@ pub fn extractTimestamp(internal_key: []const u8) i128 {
 
     // Calculate timestamp position: key_len_field + key_data
     const timestamp_offset = @sizeOf(u64) + key_len;
-    
+
     // Ensure we have enough bytes for the timestamp
     if (timestamp_offset + @sizeOf(i128) > internal_key.len) {
         return 0; // Not enough bytes for timestamp
     }
 
     // Read timestamp safely
-    return readInt(i128, internal_key[timestamp_offset..timestamp_offset + @sizeOf(i128)], Endian);
+    return readInt(i128, internal_key[timestamp_offset .. timestamp_offset + @sizeOf(i128)], Endian);
 }
 
 pub fn encodeInternalKey(alloc: Allocator, key: []const u8, ts: ?i128) ![]const u8 {

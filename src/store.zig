@@ -572,7 +572,7 @@ pub const SSTableStore = struct {
             if (tables.len == 0) {
                 return;
             }
-            
+
             // Track retained tables for cleanup on error
             var retained_tables = std.ArrayList(*SSTable).init(self.alloc);
             defer {
@@ -582,7 +582,7 @@ pub const SSTableStore = struct {
                 }
                 retained_tables.deinit();
             }
-            
+
             var sz: usize = 0;
             for (tables) |table| {
                 sz += table.block.size();
@@ -633,7 +633,7 @@ pub const SSTableStore = struct {
                     count += 1;
                 }
             }
-            
+
             // Clear the retained_tables list since we're done with them
             retained_tables.clearRetainingCapacity();
 
