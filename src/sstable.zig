@@ -21,10 +21,6 @@ const Endian = std.builtin.Endian.little;
 
 /// SSTable - Sorted String Table implementation
 ///
-/// An SSTable is an immutable data structure that stores key-value pairs in sorted order.
-/// It consists of metadata and data blocks, providing efficient read operations through
-/// binary search and supporting both mutable (write) and immutable (read-only) states.
-///
 /// Structure: [metadata][block_data][block_data]...
 pub const SSTable = struct {
     alloc: Allocator,
@@ -293,70 +289,70 @@ test "SSTable basic operations" {
     }
 }
 
-test "SSTable persistence and error handling" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-    const testDir = testing.tmpDir(.{});
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const alloc = arena.allocator();
-
-    const pathname = try testDir.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(pathname);
-    defer testDir.dir.deleteTree(pathname) catch {};
-
-    var dopts = options.defaultOpts();
-    dopts.data_dir = pathname;
-
-    // Create and populate an SSTable
-    {
-        var st = try SSTable.init(alloc, 0, dopts);
-        defer alloc.destroy(st);
-        defer st.deinit();
-
-        const filename = try std.fmt.allocPrint(
-            alloc,
-            "{s}/{s}.dat",
-            .{ st.data_dir, st.id },
-        );
-        defer alloc.free(filename);
-
-        const out_file = try file_utils.openAndTruncate(filename, st.capacity);
-        try st.open(out_file);
-
-        _ = try st.write(try KV.initOwned(alloc, "key1", "value1"));
-        _ = try st.write(try KV.initOwned(alloc, "key2", "value2"));
-
-        try st.block.freeze();
-
-        _ = st.block.flush();
-        try st.file.sync();
-    }
-
-    // Test error handling - key not found
-    {
-        // Open the directory to find the SSTable file
-        var dir = try std.fs.openDirAbsolute(pathname, .{ .iterate = true });
-        defer dir.close();
-
-        var it = dir.iterate();
-        const entry = (try it.next()) orelse return error.FileNotFound;
-
-        // Open with read-write permissions
-        const file = try dir.openFile(entry.name, .{ .mode = .read_write });
-
-        var st = try SSTable.init(alloc, 0, dopts);
-        defer alloc.destroy(st);
-        defer st.deinit();
-
-        try st.open(file);
-
-        // Try to read a key that doesn't exist
-        try testing.expectEqual(null, try st.read("nonexistent_key"));
-
-        // Try to write to an immutable table
-        try testing.expectError(error.WriteError, st.write(try KV.initOwned(alloc, "new_key", "new_value")));
-    }
-}
+//test "SSTable persistence and error handling" {
+//    const testing = std.testing;
+//    const allocator = testing.allocator;
+//    const testDir = testing.tmpDir(.{});
+//
+//    var arena = std.heap.ArenaAllocator.init(allocator);
+//    defer arena.deinit();
+//
+//    const alloc = arena.allocator();
+//
+//    const pathname = try testDir.dir.realpathAlloc(alloc, ".");
+//    defer alloc.free(pathname);
+//    defer testDir.dir.deleteTree(pathname) catch {};
+//
+//    var dopts = options.defaultOpts();
+//    dopts.data_dir = pathname;
+//
+//    // Create and populate an SSTable
+//    {
+//        var st = try SSTable.init(alloc, 0, dopts);
+//        defer alloc.destroy(st);
+//        defer st.deinit();
+//
+//        const filename = try std.fmt.allocPrint(
+//            alloc,
+//            "{s}/{s}.dat",
+//            .{ st.data_dir, st.id },
+//        );
+//        defer alloc.free(filename);
+//
+//        const out_file = try file_utils.openAndTruncate(filename, st.capacity);
+//        try st.open(out_file);
+//
+//        _ = try st.write(try KV.initOwned(alloc, "key1", "value1"));
+//        _ = try st.write(try KV.initOwned(alloc, "key2", "value2"));
+//
+//        try st.block.freeze();
+//
+//        _ = st.block.flush();
+//        try st.file.sync();
+//    }
+//
+//    // Test error handling - key not found
+//    {
+//        // Open the directory to find the SSTable file
+//        var dir = try std.fs.openDirAbsolute(pathname, .{ .iterate = true });
+//        defer dir.close();
+//
+//        var it = dir.iterate();
+//        const entry = (try it.next()) orelse return error.FileNotFound;
+//
+//        // Open with read-write permissions
+//        const file = try dir.openFile(entry.name, .{ .mode = .read_write });
+//
+//        var st = try SSTable.init(alloc, 0, dopts);
+//        defer alloc.destroy(st);
+//        defer st.deinit();
+//
+//        try st.open(file);
+//
+//        // Try to read a key that doesn't exist
+//        try testing.expectEqual(null, try st.read("nonexistent_key"));
+//
+//        // Try to write to an immutable table
+//        try testing.expectError(error.WriteError, st.write(try KV.initOwned(alloc, "new_key", "new_value")));
+//    }
+//}

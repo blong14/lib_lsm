@@ -1,7 +1,9 @@
 const std = @import("std");
 
+const Block = @import("block.zig").Block;
 const File = @import("file.zig");
-const MMap = @import("mmap.zig").MMap;
+const KV = @import("kv.zig").KV;
+const MMap = @import("mmap.zig").AppendOnlyMMap;
 
 const Allocator = std.mem.Allocator;
 const BufferedWriter = std.io.BufferedWriter;
@@ -27,25 +29,48 @@ pub const WalConfig = struct {
 pub const Store = struct {
     mtx: Mutex,
     file: std.fs.File,
-    buf: BufferedWriter(PageSize, std.fs.File.Writer),
-    size: u64,
+    buf: *MMap,
+    size: u64 = 0,
+    connected: bool = false,
 
     const Self = @This();
 
-    pub fn init(f: std.fs.File) !Self {
-        const stat = try f.stat();
-        const writer = bufferedWriter(f.writer());
+    pub fn init() !Self {
         return .{
             .mtx = Mutex{},
-            .file = f,
-            .buf = writer,
-            .size = stat.size,
+            .buf = undefined,
+            .file = undefined,
         };
+    }
+
+    pub fn open(self: *Self, alloc: Allocator, file: std.fs.File) !void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+
+        if (self.connected) {
+            return;
+        }
+
+        const stat = try file.stat();
+        const file_size = stat.size;
+
+        var stream = try MMap.init(alloc, file_size);
+        errdefer {
+            stream.deinit();
+            alloc.destroy(stream);
+        }
+
+        try stream.connect(file, 0);
+        stream.buf.reset();
+
+        self.*.connected = true;
+        self.*.file = file;
+        self.*.buf = stream;
     }
 
     pub fn close(self: *Self) !void {
         self.mtx.lock();
-        try self.buf.flush();
+        self.buf.deinit();
         self.file.close();
         self.mtx.unlock();
         self.* = undefined;
@@ -55,7 +80,8 @@ pub const Store = struct {
         self.mtx.lock();
         defer self.mtx.unlock();
 
-        try self.buf.flush();
+        var buf: [PageSize]u8 = undefined;
+        const result = try self.buf.read(pos, buf);
 
         const stream = fixedBufferStream(self.file.reader());
         stream.seekTo(pos);
@@ -70,21 +96,14 @@ pub const Store = struct {
         return out[0..len];
     }
 
-    pub fn append(self: *Self, data: []const u8) !struct { offset: u64, len: usize } {
+    pub fn append(self: *Self, kv: KV) !struct { offset: u64, len: usize } {
         self.mtx.lock();
         defer self.mtx.unlock();
 
-        var len: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-        writeInt(std.math.ByteAlignedInt(u64), &len, data.len, Endian);
+        const result = try self.buf.write(kv.raw_bytes);
+        self.size += result.len;
 
-        const pos = self.buf.end;
-
-        var byts = try self.buf.write(&len);
-        byts += try self.buf.write(data);
-
-        self.size += byts;
-
-        return .{ .len = byts, .offset = pos };
+        return .{ .len = result.len, .offset = result.idx };
     }
 };
 
@@ -207,6 +226,22 @@ pub const XWAL = struct {
             else => return err,
         };
     }
+
+    pub fn read(self: Self, offset: u64) ?[]const u8 {
+        var segment: ?Segment = null;
+        for (self.segments) |s| {
+            if (s.isInRange(offset)) {
+                segment = s;
+                break;
+            }
+        }
+
+        if (segment) |s| {
+            return s.read(s);
+        }
+
+        return null;
+    }
 };
 
 test XWAL {
@@ -228,6 +263,10 @@ test XWAL {
     const key: u64 = std.hash.Murmur2_64.hash("__key__");
     const expected: []const u8 = "__value__";
     try st.write(alloc, key, expected);
+
+    const actual = st.read(key);
+
+    try testing.expectEqualStrings(expected, actual.?);
 
     // then
     //var iter = st.iterator();
