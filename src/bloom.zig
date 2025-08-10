@@ -67,7 +67,7 @@ pub const BloomFilter = struct {
             const byte_index = bit_index / 8;
             const bit_offset = @as(u3, @intCast(bit_index % 8));
             
-            if ((self.bits[byte_index] >> bit_offset) & 1) == 0 {
+            if ((self.bits[byte_index] >> bit_offset) & 1 == 0) {
                 return false;
             }
         }
