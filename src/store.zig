@@ -572,9 +572,13 @@ pub const SSTableStore = struct {
             if (tables.len == 0) {
                 return;
             }
+            var sz: usize = 0;
             for (tables) |table| {
+                sz += table.block.size();
                 table.retain();
             }
+
+            sz = sz * 10;
 
             const start_time = std.time.nanoTimestamp();
 
@@ -585,6 +589,16 @@ pub const SSTableStore = struct {
                 new_table.deinit();
                 self.alloc.destroy(new_table);
             }
+
+            const filename = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/{s}.dat",
+                .{ new_table.data_dir, new_table.id },
+            );
+            defer self.alloc.free(filename);
+
+            const out_file = try file_utils.openAndTruncate(filename, sz);
+            try new_table.open(out_file);
 
             var count: usize = 0;
             var bytes_read: u64 = 0;
@@ -610,23 +624,7 @@ pub const SSTableStore = struct {
             }
 
             if (count > 0) {
-                var arena = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena.deinit();
-
-                const malloc = arena.allocator();
-
-                try new_table.block.freeze();
-
-                const sz = new_table.block.size();
-
-                const filename = try std.fmt.allocPrint(
-                    malloc,
-                    "{s}/{s}.dat",
-                    .{ new_table.data_dir, new_table.id },
-                );
-
-                const out_file = try file_utils.openAndTruncate(filename, sz);
-                try new_table.open(out_file);
+                // try new_table.block.freeze();
 
                 _ = new_table.block.flush();
 
@@ -828,6 +826,18 @@ pub const SSTableStore = struct {
             alloc.destroy(sstable);
         }
 
+        const filename = try std.fmt.allocPrint(
+            alloc,
+            "{s}/{s}.dat",
+            .{ sstable.data_dir, sstable.id },
+        );
+        defer alloc.free(filename);
+
+        const sz = mtable.size() * 10;
+        const out_file = try file_utils.openAndTruncate(filename, sz);
+
+        try sstable.open(out_file);
+
         var it = try mtable.iterator(alloc);
         defer it.deinit();
 
@@ -848,18 +858,7 @@ pub const SSTableStore = struct {
         }
 
         if (keys_written > 0) {
-            try sstable.block.freeze();
-
-            const filename = try std.fmt.allocPrint(
-                alloc,
-                "{s}/{s}.dat",
-                .{ sstable.data_dir, sstable.id },
-            );
-            defer alloc.free(filename);
-
-            const sz = sstable.block.size();
-            const out_file = try file_utils.openAndTruncate(filename, sz);
-            try sstable.open(out_file);
+            // try sstable.block.freeze();
 
             _ = sstable.block.flush();
 
@@ -887,333 +886,366 @@ pub const SSTableStore = struct {
     }
 };
 
-//test "SSTableStore flush and compaction" {
-//    const testing = std.testing;
-//    var alloc = testing.allocator;
-//    const testDir = testing.tmpDir(.{});
-//
-//    const pathname = try testDir.dir.realpathAlloc(alloc, ".");
-//    defer alloc.free(pathname);
-//    defer testDir.dir.deleteTree(pathname) catch {};
-//
-//    var arena = std.heap.ArenaAllocator.init(alloc);
-//    defer arena.deinit();
-//
-//    const allocator = arena.allocator();
-//
-//    var dopts = options.defaultOpts();
-//    dopts.data_dir = pathname;
-//    dopts.num_levels = 3;
-//
-//    var store = try SSTableStore.init(allocator, dopts);
-//    defer store.deinit(allocator);
-//
-//    var memtable = try Memtable.init(allocator, "level-0");
-//    defer allocator.destroy(memtable);
-//    defer memtable.deinit();
-//
-//    try memtable.put(try KV.initOwned(allocator, "flush_key1", "flush_value1"));
-//    try memtable.put(try KV.initOwned(allocator, "flush_key2", "flush_value2"));
-//    try memtable.put(try KV.initOwned(allocator, "flush_key3", "flush_value3"));
-//
-//    // Flush memtable to SSTable
-//    {
-//        try store.flush(allocator, memtable);
-//
-//        try testing.expect(memtable.isFlushed.load(.acquire));
-//        try testing.expectEqual(@as(usize, 1), store.get(0).len);
-//    }
-//
-//    // Read back the data
-//    {
-//        const kv = try store.read("flush_key1");
-//        try testing.expectEqualStrings("flush_value1", kv.?.value);
-//    }
-//
-//    // Test store iterator
-//    {
-//        var it = try store.iterator(allocator);
-//        defer it.deinit();
-//
-//        var count: usize = 0;
-//        while (it.next()) |_| {
-//            count += 1;
-//        }
-//        try testing.expectEqual(@as(usize, 3), count);
-//    }
-//
-//    // Test compaction
-//    {
-//        try store.compact(0);
-//
-//        // Level 0 should be empty, level 1 should have data
-//        try testing.expectEqual(@as(usize, 0), store.get(0).len);
-//        try testing.expectEqual(@as(usize, 1), store.get(1).len);
-//
-//        // Verify data is still accessible after compaction
-//        const kv = try store.read("flush_key2");
-//        try testing.expectEqualStrings("flush_value2", kv.?.value);
-//    }
-//}
-//
-//test "SSTableStore open" {
-//    const testing = std.testing;
-//
-//    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-//    defer arena.deinit();
-//
-//    const alloc = arena.allocator();
-//
-//    const testDir = testing.tmpDir(.{});
-//    const pathname = try testDir.dir.realpathAlloc(alloc, ".");
-//    defer alloc.free(pathname);
-//    defer testDir.dir.deleteTree(pathname) catch {};
-//
-//    var dopts = options.defaultOpts();
-//    dopts.data_dir = pathname;
-//    dopts.num_levels = 3;
-//
-//    // Create and persist some SSTables
-//    {
-//        var store = try SSTableStore.init(alloc, dopts);
-//        defer store.deinit(alloc);
-//
-//        // Create and add tables to different levels
-//        var table0 = try SSTable.init(alloc, 0, dopts);
-//        _ = try table0.write(try KV.initOwned(alloc, "key0", "value0"));
-//
-//        try store.add(table0, 0);
-//        _ = table0.release();
-//
-//        var table1 = try SSTable.init(alloc, 1, dopts);
-//        _ = try table1.write(try KV.initOwned(alloc, "key1", "value1"));
-//
-//        try store.add(table1, 1);
-//        _ = table1.release();
-//
-//        // Persist tables to disk
-//        for (0..2) |level| {
-//            for (store.get(level)) |table| {
-//                try table.block.freeze();
-//
-//                const filename = try std.fmt.allocPrint(
-//                    alloc,
-//                    "{s}/{s}.dat",
-//                    .{ table.data_dir, table.id },
-//                );
-//                defer alloc.free(filename);
-//
-//                const sz = table.block.size();
-//                const out_file = try file_utils.openAndTruncate(filename, sz);
-//                try table.open(out_file);
-//
-//                _ = table.block.flush();
-//                try table.file.sync();
-//
-//                table.mutable = false;
-//            }
-//        }
-//    }
-//
-//    // Now create a new store and test the open function
-//    {
-//        var store = try SSTableStore.init(alloc, dopts);
-//        defer store.deinit(alloc);
-//
-//        // Open the store to load tables from disk
-//        try store.open(alloc);
-//
-//        // Verify tables were loaded correctly
-//        try testing.expectEqual(@as(usize, 1), store.get(0).len);
-//        try testing.expectEqual(@as(usize, 1), store.get(1).len);
-//
-//        // Verify data in the tables
-//        var kv = try store.read("key0");
-//        try testing.expectEqualStrings("value0", kv.?.value);
-//
-//        kv = try store.read("key1");
-//        try testing.expectEqualStrings("value1", kv.?.value);
-//    }
-//}
-//
-//test "CompactionStrategies" {
-//    const testing = std.testing;
-//    var talloc = testing.allocator;
-//    const testDir = testing.tmpDir(.{});
-//
-//    const pathname = try testDir.dir.realpathAlloc(talloc, ".");
-//    defer talloc.free(pathname);
-//    defer testDir.dir.deleteTree(pathname) catch {};
-//
-//    const CompactionStrategy = SSTableStore.CompactionStrategy;
-//
-//    const createTestSSTable = struct {
-//        fn create(a: Allocator, level: usize, opts: Opts) !*SSTable {
-//            var table = try SSTable.init(a, level, opts);
-//            errdefer {
-//                table.deinit();
-//                a.destroy(table);
-//            }
-//
-//            // Add some test data
-//            _ = try table.write(try KV.initOwned(a, "key1", "value1"));
-//            _ = try table.write(try KV.initOwned(a, "key2", "value2"));
-//            _ = try table.write(try KV.initOwned(a, "key3", "value3"));
-//
-//            return table;
-//        }
-//    }.create;
-//
-//    const verifyCompactionResults = struct {
-//        fn verify(a: Allocator, tm: *SSTableStore, level: usize, expectedCount: usize) !void {
-//            const tables = tm.get(level);
-//            try testing.expectEqual(expectedCount, tables.len);
-//
-//            if (expectedCount > 0) {
-//                // Verify the data in the compacted table
-//                var it = try tm.iterator(a);
-//                defer it.deinit();
-//
-//                var count: usize = 0;
-//                while (it.next()) |_| {
-//                    count += 1;
-//                }
-//
-//                // We should have at least the number of keys we inserted
-//                try testing.expect(count >= 3);
-//            }
-//        }
-//    }.verify;
-//
-//    var arena = std.heap.ArenaAllocator.init(talloc);
-//    defer arena.deinit();
-//
-//    // Test SimpleCompactionStrategy
-//    {
-//        const alloc = arena.allocator();
-//
-//        var dopts = options.defaultOpts();
-//        dopts.data_dir = pathname;
-//        dopts.num_levels = 3;
-//
-//        var tm = try SSTableStore.init(alloc, dopts);
-//        defer tm.deinit(alloc);
-//
-//        // Create tables and add them to the store
-//        // The tables are now managed by the store with reference counting
-//        var table1 = try createTestSSTable(alloc, 0, dopts);
-//        try tm.add(table1, 0);
-//        _ = table1.release();
-//
-//        var table2 = try createTestSSTable(alloc, 0, dopts);
-//        try tm.add(table2, 0);
-//        _ = table2.release();
-//
-//        try tm.compact(0);
-//
-//        // level 0 should be empty, level 1 should have 1 table
-//        try verifyCompactionResults(alloc, &tm, 0, 0);
-//        try verifyCompactionResults(alloc, &tm, 1, 1);
-//    }
-//
-//    // Test TieredCompactionStrategy
-//    {
-//        const alloc = arena.allocator();
-//
-//        var dopts = options.defaultOpts();
-//        dopts.compaction_strategy = .tiered;
-//        dopts.data_dir = pathname;
-//        dopts.num_levels = 3;
-//
-//        var tm = try SSTableStore.init(alloc, dopts);
-//        defer tm.deinit(alloc);
-//
-//        var table1 = try createTestSSTable(alloc, 0, dopts);
-//        try tm.add(table1, 0);
-//        _ = table1.release();
-//
-//        var table2 = try createTestSSTable(alloc, 0, dopts);
-//        try tm.add(table2, 0);
-//        _ = table2.release();
-//
-//        try tm.compact(0);
-//
-//        // Since TieredCompactionStrategy is just a stub, we expect no changes
-//        try verifyCompactionResults(alloc, &tm, 0, 2);
-//        try verifyCompactionResults(alloc, &tm, 1, 0);
-//    }
-//
-//    // Test with a custom strategy (demonstrating extensibility)
-//    {
-//        const CustomCompactionStrategy = struct {
-//            alloc: Allocator,
-//
-//            pub fn init(alloc: Allocator) @This() {
-//                return .{ .alloc = alloc };
-//            }
-//
-//            fn deinit(self: *@This(), alloc: Allocator) void {
-//                alloc.destroy(self);
-//            }
-//
-//            pub fn compact(self: *@This(), tm: *SSTableStore, level: usize) !void {
-//                _ = self;
-//
-//                // Simple implementation that just moves tables to the next level
-//                // without merging
-//                if (level >= tm.num_levels - 1) {
-//                    return;
-//                }
-//
-//                const tables = tm.get(level);
-//                if (tables.len == 0) {
-//                    return;
-//                }
-//
-//                // Move all tables to the next level
-//                const next_level = level + 1;
-//                for (tables) |table| {
-//                    _ = table.release();
-//                    try tm.add(table, next_level);
-//                }
-//
-//                tm.levels.items[level].clearRetainingCapacity();
-//            }
-//        };
-//
-//        const alloc = arena.allocator();
-//
-//        var dopts = options.defaultOpts();
-//        dopts.data_dir = pathname;
-//        dopts.num_levels = 3;
-//
-//        var tm = try SSTableStore.init(alloc, dopts);
-//        defer tm.deinit(alloc);
-//
-//        var table1 = try createTestSSTable(alloc, 0, dopts);
-//        try tm.add(table1, 0);
-//        _ = table1.release();
-//
-//        var table2 = try createTestSSTable(alloc, 0, dopts);
-//        try tm.add(table2, 0);
-//        _ = table2.release();
-//
-//        const custom_strategy = try alloc.create(CustomCompactionStrategy);
-//        custom_strategy.* = CustomCompactionStrategy.init(talloc);
-//
-//        tm.setCompactionStrategy(
-//            alloc,
-//            CompactionStrategy.init(
-//                custom_strategy,
-//                CustomCompactionStrategy.compact,
-//                CustomCompactionStrategy.deinit,
-//            ),
-//        );
-//
-//        try tm.compact(0);
-//
-//        // level 0 should be empty, level 1 should have 2 tables
-//        try verifyCompactionResults(alloc, &tm, 0, 0);
-//        try verifyCompactionResults(alloc, &tm, 1, 2);
-//    }
-//}
+test "SSTableStore flush and compaction" {
+    const testing = std.testing;
+    var alloc = testing.allocator;
+    const testDir = testing.tmpDir(.{});
+
+    const pathname = try testDir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(pathname);
+    defer testDir.dir.deleteTree(pathname) catch {};
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    var dopts = options.defaultOpts();
+    dopts.data_dir = pathname;
+    dopts.num_levels = 3;
+
+    var store = try SSTableStore.init(allocator, dopts);
+    defer store.deinit(allocator);
+
+    try store.open(allocator);
+
+    var memtable = try Memtable.init(allocator, "level-0");
+    defer allocator.destroy(memtable);
+    defer memtable.deinit();
+
+    try memtable.put(try KV.initOwned(allocator, "flush_key1", "flush_value1"));
+    try memtable.put(try KV.initOwned(allocator, "flush_key2", "flush_value2"));
+    try memtable.put(try KV.initOwned(allocator, "flush_key3", "flush_value3"));
+
+    // Flush memtable to SSTable
+    {
+        try store.flush(allocator, memtable);
+
+        try testing.expect(memtable.isFlushed.load(.acquire));
+        try testing.expectEqual(@as(usize, 1), store.get(0).len);
+    }
+
+    // Read back the data
+    {
+        const kv = try store.read("flush_key1");
+        try testing.expectEqualStrings("flush_value1", kv.?.value);
+    }
+
+    // Test store iterator
+    {
+        var it = try store.iterator(allocator);
+        defer it.deinit();
+
+        var count: usize = 0;
+        while (it.next()) |_| {
+            count += 1;
+        }
+        try testing.expectEqual(@as(usize, 3), count);
+    }
+
+    // Test compaction
+    {
+        try store.compact(0);
+
+        // Level 0 should be empty, level 1 should have data
+        try testing.expectEqual(@as(usize, 0), store.get(0).len);
+        try testing.expectEqual(@as(usize, 1), store.get(1).len);
+
+        // Verify data is still accessible after compaction
+        const kv = try store.read("flush_key2");
+        try testing.expectEqualStrings("flush_value2", kv.?.value);
+    }
+}
+
+test "SSTableStore open" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    const testDir = testing.tmpDir(.{});
+    const pathname = try testDir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(pathname);
+    defer testDir.dir.deleteTree(pathname) catch {};
+
+    var dopts = options.defaultOpts();
+    dopts.data_dir = pathname;
+    dopts.num_levels = 3;
+
+    // Create and persist some SSTables
+    {
+        var store = try SSTableStore.init(alloc, dopts);
+        defer store.deinit(alloc);
+
+        // Create and add tables to different levels
+        var table0 = try SSTable.init(alloc, 0, dopts);
+
+        // Create a temporary file for the table
+        const filename0 = try std.fmt.allocPrint(
+            alloc,
+            "{s}/{s}.dat",
+            .{ table0.data_dir, table0.id },
+        );
+        defer alloc.free(filename0);
+
+        const sz0 = 1024; // Initial size
+        const out_file0 = try file_utils.openAndTruncate(filename0, sz0);
+        try table0.open(out_file0);
+
+        _ = try table0.write(try KV.initOwned(alloc, "key0", "value0"));
+        _ = try table0.write(try KV.initOwned(alloc, "key0", "value0"));
+
+        try store.add(table0, 0);
+        _ = table0.release();
+
+        var table1 = try SSTable.init(alloc, 1, dopts);
+
+        // Create a temporary file for table1
+        const filename1 = try std.fmt.allocPrint(
+            alloc,
+            "{s}/{s}.dat",
+            .{ table1.data_dir, table1.id },
+        );
+        defer alloc.free(filename1);
+
+        const sz1 = 1024; // Initial size
+        const out_file1 = try file_utils.openAndTruncate(filename1, sz1);
+        try table1.open(out_file1);
+
+        _ = try table1.write(try KV.initOwned(alloc, "key1", "value1"));
+
+        try store.add(table1, 1);
+        _ = table1.release();
+
+        // Persist tables to disk
+        for (0..2) |level| {
+            for (store.get(level)) |table| {
+                _ = table.block.flush();
+
+                try table.file.sync();
+
+                table.mutable = false;
+            }
+        }
+    }
+
+    // Now create a new store and test the open function
+    {
+        var store = try SSTableStore.init(alloc, dopts);
+        defer store.deinit(alloc);
+
+        // Open the store to load tables from disk
+        try store.open(alloc);
+
+        // Verify tables were loaded correctly
+        try testing.expectEqual(@as(usize, 1), store.get(0).len);
+        try testing.expectEqual(@as(usize, 1), store.get(1).len);
+
+        // Verify data in the tables
+        var kv = try store.read("key0");
+        try testing.expectEqualStrings("value0", kv.?.value);
+
+        kv = try store.read("key1");
+        try testing.expectEqualStrings("value1", kv.?.value);
+    }
+}
+
+test "CompactionStrategies" {
+    const testing = std.testing;
+    var talloc = testing.allocator;
+    const testDir = testing.tmpDir(.{});
+
+    const pathname = try testDir.dir.realpathAlloc(talloc, ".");
+    defer talloc.free(pathname);
+    defer testDir.dir.deleteTree(pathname) catch {};
+
+    const CompactionStrategy = SSTableStore.CompactionStrategy;
+
+    const createTestSSTable = struct {
+        fn create(a: Allocator, level: usize, opts: Opts) !*SSTable {
+            var table = try SSTable.init(a, level, opts);
+            errdefer {
+                table.deinit();
+                a.destroy(table);
+            }
+
+            // Create a file for the table
+            const filename = try std.fmt.allocPrint(
+                a,
+                "{s}/{s}.dat",
+                .{ table.data_dir, table.id },
+            );
+            defer a.free(filename);
+
+            const sz = 1024; // Initial size
+            const out_file = try file_utils.openAndTruncate(filename, sz);
+            try table.open(out_file);
+            errdefer {
+                table.deinit();
+                a.destroy(table);
+            }
+
+            // Add some test data
+            _ = try table.write(try KV.initOwned(a, "key1", "value1"));
+            _ = try table.write(try KV.initOwned(a, "key2", "value2"));
+            _ = try table.write(try KV.initOwned(a, "key3", "value3"));
+
+            return table;
+        }
+    }.create;
+
+    const verifyCompactionResults = struct {
+        fn verify(a: Allocator, tm: *SSTableStore, level: usize, expectedCount: usize) !void {
+            const tables = tm.get(level);
+            try testing.expectEqual(expectedCount, tables.len);
+
+            if (expectedCount > 0) {
+                // Verify the data in the compacted table
+                var it = try tm.iterator(a);
+                defer it.deinit();
+
+                var count: usize = 0;
+                while (it.next()) |_| {
+                    count += 1;
+                }
+
+                // We should have at least the number of keys we inserted
+                try testing.expect(count >= 3);
+            }
+        }
+    }.verify;
+
+    var arena = std.heap.ArenaAllocator.init(talloc);
+    defer arena.deinit();
+
+    // Test SimpleCompactionStrategy
+    {
+        const alloc = arena.allocator();
+
+        var dopts = options.defaultOpts();
+        dopts.data_dir = pathname;
+        dopts.num_levels = 3;
+
+        var tm = try SSTableStore.init(alloc, dopts);
+        defer tm.deinit(alloc);
+
+        // Create tables and add them to the store
+        // The tables are now managed by the store with reference counting
+        var table1 = try createTestSSTable(alloc, 0, dopts);
+        try tm.add(table1, 0);
+        _ = table1.release();
+
+        var table2 = try createTestSSTable(alloc, 0, dopts);
+        try tm.add(table2, 0);
+        _ = table2.release();
+
+        try tm.compact(0);
+
+        // level 0 should be empty, level 1 should have 1 table
+        try verifyCompactionResults(alloc, &tm, 0, 0);
+        try verifyCompactionResults(alloc, &tm, 1, 1);
+    }
+
+    // Test TieredCompactionStrategy
+    {
+        const alloc = arena.allocator();
+
+        var dopts = options.defaultOpts();
+        dopts.compaction_strategy = .tiered;
+        dopts.data_dir = pathname;
+        dopts.num_levels = 3;
+
+        var tm = try SSTableStore.init(alloc, dopts);
+        defer tm.deinit(alloc);
+
+        var table1 = try createTestSSTable(alloc, 0, dopts);
+        try tm.add(table1, 0);
+        _ = table1.release();
+
+        var table2 = try createTestSSTable(alloc, 0, dopts);
+        try tm.add(table2, 0);
+        _ = table2.release();
+
+        try tm.compact(0);
+
+        // Since TieredCompactionStrategy is just a stub, we expect no changes
+        try verifyCompactionResults(alloc, &tm, 0, 2);
+        try verifyCompactionResults(alloc, &tm, 1, 0);
+    }
+
+    // Test with a custom strategy (demonstrating extensibility)
+    {
+        const CustomCompactionStrategy = struct {
+            alloc: Allocator,
+
+            pub fn init(alloc: Allocator) @This() {
+                return .{ .alloc = alloc };
+            }
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                alloc.destroy(self);
+            }
+
+            pub fn compact(self: *@This(), tm: *SSTableStore, level: usize) !void {
+                _ = self;
+
+                // Simple implementation that just moves tables to the next level
+                // without merging
+                if (level >= tm.num_levels - 1) {
+                    return;
+                }
+
+                const tables = tm.get(level);
+                if (tables.len == 0) {
+                    return;
+                }
+
+                // Move all tables to the next level
+                const next_level = level + 1;
+                for (tables) |table| {
+                    _ = table.release();
+                    try tm.add(table, next_level);
+                }
+
+                tm.levels.items[level].clearRetainingCapacity();
+            }
+        };
+
+        const alloc = arena.allocator();
+
+        var dopts = options.defaultOpts();
+        dopts.data_dir = pathname;
+        dopts.num_levels = 3;
+
+        var tm = try SSTableStore.init(alloc, dopts);
+        defer tm.deinit(alloc);
+
+        var table1 = try createTestSSTable(alloc, 0, dopts);
+        try tm.add(table1, 0);
+        _ = table1.release();
+
+        var table2 = try createTestSSTable(alloc, 0, dopts);
+        try tm.add(table2, 0);
+        _ = table2.release();
+
+        const custom_strategy = try alloc.create(CustomCompactionStrategy);
+        custom_strategy.* = CustomCompactionStrategy.init(talloc);
+
+        tm.setCompactionStrategy(
+            alloc,
+            CompactionStrategy.init(
+                custom_strategy,
+                CustomCompactionStrategy.compact,
+                CustomCompactionStrategy.deinit,
+            ),
+        );
+
+        try tm.compact(0);
+
+        // level 0 should be empty, level 1 should have 2 tables
+        try verifyCompactionResults(alloc, &tm, 0, 0);
+        try verifyCompactionResults(alloc, &tm, 1, 2);
+    }
+}
