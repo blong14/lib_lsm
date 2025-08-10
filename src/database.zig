@@ -6,6 +6,7 @@ const lsm = @import("lib.zig");
 const mtbl = @import("memtable.zig");
 const opt = @import("opts.zig");
 const sst = @import("sstable.zig");
+const store = @import("store.zig");
 const tm = @import("tablemap.zig");
 
 const atomic = std.atomic;
@@ -26,7 +27,7 @@ const KV = keyvalue.KV;
 const Memtable = mtbl.Memtable;
 const Opts = opt.Opts;
 const SSTable = sst.SSTable;
-const SSTableStore = sst.SSTableStore;
+const SSTableStore = store.SSTableStore;
 
 pub const Database = struct {
     capacity: usize,
