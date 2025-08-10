@@ -177,7 +177,6 @@ pub const Block = struct {
         OffsetOverflow,
         MetadataOverflow,
         IndexOutOfBounds,
-        NoKeysStored,
     };
 
     pub fn init(allocator: Allocator, stream: *FixedBuffer([]align(PageSize) u8)) !*Block {
@@ -331,29 +330,6 @@ pub const Block = struct {
         return self.byte_count;
     }
 
-    pub fn freeze(self: *Block) Error!void {
-        if (self.first_key == null or self.last_key == null) {
-            return Error.NoKeysStored;
-        }
-
-        const block_meta_data = BlockMeta.init(self.first_key.?, self.last_key.?);
-        const meta_data = block_meta_data.encodeAlloc(self.alloc) catch return Error.MetadataOverflow;
-        defer self.alloc.free(meta_data);
-
-        if (meta_data.len > self.meta_section_size) {
-            return Error.MetadataOverflow;
-        }
-
-        const saved_pos = self.stream.pos;
-        self.stream.pos = self.meta_section_start;
-        _ = self.stream.write(meta_data) catch return Error.WriteError;
-
-        var count_bytes: [@sizeOf(u64)]u8 = undefined;
-        writeInt(u64, &count_bytes, self.count, Endian);
-        _ = self.stream.write(&count_bytes) catch return Error.WriteError;
-
-        self.stream.pos = saved_pos;
-    }
 
     pub fn decode(self: *Block, stream: *FixedBuffer([]align(PageSize) u8)) Error!usize {
         var meta = BlockMeta{ .len = 0, .first_key = "", .last_key = "" };
