@@ -19,7 +19,7 @@ pub const BloomFilter = struct {
         const ln2_squared = math.ln(@as(f64, 2.0)) * math.ln(@as(f64, 2.0));
         const bit_count_f = -@as(f64, @floatFromInt(expected_items)) * math.ln(false_positive_rate) / ln2_squared;
         const bit_count = @as(usize, @intFromFloat(math.ceil(bit_count_f)));
-        
+
         // Calculate optimal hash function count: k = (m/n) * ln(2)
         const hash_count_f = (@as(f64, @floatFromInt(bit_count)) / @as(f64, @floatFromInt(expected_items))) * math.ln(@as(f64, 2.0));
         const hash_count = @as(u8, @intFromFloat(math.round(hash_count_f)));
@@ -52,7 +52,7 @@ pub const BloomFilter = struct {
             const bit_index = (hash1 + @as(u64, @intCast(i)) * hash2) % self.bit_count;
             const byte_index = bit_index / 8;
             const bit_offset = @as(u3, @intCast(bit_index % 8));
-            
+
             self.bits[byte_index] |= (@as(u8, 1) << bit_offset);
         }
     }
@@ -66,7 +66,7 @@ pub const BloomFilter = struct {
             const bit_index = (hash1 + @as(u64, @intCast(i)) * hash2) % self.bit_count;
             const byte_index = bit_index / 8;
             const bit_offset = @as(u3, @intCast(bit_index % 8));
-            
+
             if ((self.bits[byte_index] >> bit_offset) & 1 == 0) {
                 return false;
             }
@@ -79,19 +79,19 @@ pub const BloomFilter = struct {
     fn hash(self: *Self, data: []const u8, seed: u64) u64 {
         _ = self;
         var hash_val = 14695981039346656037 +% seed; // FNV offset basis
-        
+
         for (data) |byte| {
             hash_val ^= byte;
             hash_val *%= 1099511628211; // FNV prime
         }
-        
+
         return hash_val;
     }
 };
 
 test "BloomFilter basic operations" {
     const alloc = testing.allocator;
-    
+
     var filter = try BloomFilter.init(alloc, 1000, 0.01);
     defer filter.deinit(alloc);
 
@@ -113,7 +113,7 @@ test "BloomFilter basic operations" {
 
 test "BloomFilter false positive rate" {
     const alloc = testing.allocator;
-    
+
     var filter = try BloomFilter.init(alloc, 100, 0.01);
     defer filter.deinit(alloc);
 
