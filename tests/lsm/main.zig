@@ -217,7 +217,6 @@ const MultiThreadedImpl = struct {
                             defer mtx.unlock();
 
                             outbox.put(node);
-
                             signal.broadcast();
                         }
 
@@ -248,7 +247,10 @@ const MultiThreadedImpl = struct {
                     .data = msg,
                 };
 
+                mtx.lock();
                 outbox.put(node);
+                signal.broadcast();
+                mtx.unlock();
             }
 
             {
@@ -268,13 +270,15 @@ const MultiThreadedImpl = struct {
             defer wg.finish();
 
             for (items) |item| {
+                defer allocator.free(item);
+                
                 var kv: KV = .{ .key = undefined, .value = undefined, .timestamp = 0 };
                 kv.decode(item) catch |err| {
                     debug.print(
                         "not able to decode kv {s} {any}\n",
                         .{ @errorName(err), item },
                     );
-                    return;
+                    continue;
                 };
 
                 db.write(allocator, kv.key, kv.value) catch |err| {
@@ -282,9 +286,11 @@ const MultiThreadedImpl = struct {
                         "db write error key {s} {s}\n",
                         .{ kv.key, @errorName(err) },
                     );
-                    return;
+                    continue;
                 };
             }
+            
+            allocator.free(items);
         }
 
         pub fn consume(opts: lsm.Opts, inbox: *MessageQueue) void {
@@ -326,17 +332,24 @@ const MultiThreadedImpl = struct {
                 }
 
                 while (!inbox.isEmpty()) {
-                    if (inbox.get()) |items| {
+                    if (inbox.get()) |node| {
                         thread_pool.spawn(
                             write,
-                            .{ &wait_group, db, items.data },
+                            .{ &wait_group, db, node.data },
                         ) catch |err| {
                             debug.print(
                                 "threadpool spawn error {s}\n",
                                 .{@errorName(err)},
                             );
+                            // Clean up the node if spawn fails
+                            for (node.data) |item| {
+                                allocator.free(item);
+                            }
+                            allocator.free(node.data);
+                            allocator.destroy(node);
                             return;
                         };
+                        allocator.destroy(node);
                         count += 1;
                     }
                 }

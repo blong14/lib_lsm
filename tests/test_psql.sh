@@ -13,7 +13,7 @@ echo "Testing PostgreSQL interface on $HOST:$PORT..."
 # Wait for server to be ready
 echo "Waiting for server to be ready..."
 timeout=30
-while ! nc -z $HOST $PORT 2>/dev/null; do
+while ! timeout 1 bash -c "echo >/dev/tcp/$HOST/$PORT" 2>/dev/null; do
     sleep 1
     timeout=$((timeout - 1))
     if [ $timeout -eq 0 ]; then
