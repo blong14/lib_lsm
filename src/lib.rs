@@ -48,7 +48,7 @@ pub extern "C" fn skiplist_insert(
     };
 
     let value_slice = unsafe { slice::from_raw_parts(value, value_len) };
-    
+
     // Pre-allocate with exact capacity to avoid reallocations
     let mut value_vec = Vec::with_capacity(value_len);
     value_vec.extend_from_slice(value_slice);

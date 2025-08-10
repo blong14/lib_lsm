@@ -80,7 +80,7 @@ type tableDefinition struct {
 func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	keyBuf := getKeyBuffer()
 	defer putKeyBuffer(keyBuf)
-	
+
 	keyBuf = append(keyBuf, "tables_"...)
 	keyBuf = append(keyBuf, name...)
 

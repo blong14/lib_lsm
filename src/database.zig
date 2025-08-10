@@ -148,7 +148,7 @@ pub const Database = struct {
             self.mtables_mutex.lock();
             const has_warm_tables = self.mtables.items.len > 0;
             self.mtables_mutex.unlock();
-            
+
             if (!has_warm_tables) {
                 return latest_kv;
             }
@@ -173,7 +173,7 @@ pub const Database = struct {
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 const temp_alloc = arena.allocator();
-                
+
                 snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
                     std.log.err("Failed to allocate snapshot tables array {s}", .{@errorName(err)});
                     return latest_kv; // Return what we have so far
