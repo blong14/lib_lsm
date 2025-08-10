@@ -330,7 +330,6 @@ pub const Block = struct {
         return self.byte_count;
     }
 
-
     pub fn decode(self: *Block, stream: *FixedBuffer([]align(PageSize) u8)) Error!usize {
         var meta = BlockMeta{ .len = 0, .first_key = "", .last_key = "" };
         meta.decode(stream.buffer) catch return Error.ReadError;
