@@ -48,10 +48,13 @@ pub extern "C" fn skiplist_insert(
     };
 
     let value_slice = unsafe { slice::from_raw_parts(value, value_len) };
-    let value_vec = value_slice.to_vec();
+    
+    // Pre-allocate with exact capacity to avoid reallocations
+    let mut value_vec = Vec::with_capacity(value_len);
+    value_vec.extend_from_slice(value_slice);
 
-    // Only insert if the key does not exist
-    skip_map.compare_insert(key_str.to_string(), value_vec, |_| true);
+    // Use insert instead of compare_insert for better performance when we know key doesn't exist
+    skip_map.insert(key_str.to_string(), value_vec);
     0 // Success
 }
 

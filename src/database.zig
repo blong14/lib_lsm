@@ -134,17 +134,28 @@ pub const Database = struct {
         var latest_kv: ?KV = null;
         var latest_timestamp: i128 = std.math.minInt(i128);
 
-        const hot_table = self.mtable.load(.seq_cst);
+        // Check hot table first (most likely to contain recent data)
+        const hot_table = self.mtable.load(.acquire); // Use acquire for better performance
         if (try hot_table.get(key)) |kv| {
             latest_kv = kv;
             latest_timestamp = kv.timestamp;
         }
 
-        // snapshot_tables: Create a safe snapshot of memtables for consistent reads
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const temp_alloc = arena.allocator();
+        // Early return if we found the key in hot table and it's very recent
+        // This optimization assumes recent writes are more likely to be queried
+        if (latest_kv != null and (std.time.nanoTimestamp() - latest_timestamp) < 1_000_000_000) { // 1 second
+            // Still check one level down for completeness, but with fast path
+            self.mtables_mutex.lock();
+            const has_warm_tables = self.mtables.items.len > 0;
+            self.mtables_mutex.unlock();
+            
+            if (!has_warm_tables) {
+                return latest_kv;
+            }
+        }
 
+        // Use stack allocation for small table counts to avoid heap allocation
+        var stack_snapshot: [16]*Memtable = undefined;
         var snapshot_tables: []*Memtable = undefined;
         var table_count: usize = 0;
 
@@ -153,27 +164,42 @@ pub const Database = struct {
             defer self.mtables_mutex.unlock();
 
             table_count = self.mtables.items.len;
-            if (table_count > 0) {
-                // Always use heap allocation for safety
-                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
-                    std.log.err("Failed to allocate snapshot tables array {s}", .{@errorName(err)});
-                    return null;
-                };
+            if (table_count <= stack_snapshot.len) {
+                // Use stack allocation for small counts
+                snapshot_tables = stack_snapshot[0..table_count];
                 @memcpy(snapshot_tables, self.mtables.items);
             } else {
-                snapshot_tables = &[_]*Memtable{};
+                // Fall back to arena allocation for large counts
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                const temp_alloc = arena.allocator();
+                
+                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
+                    std.log.err("Failed to allocate snapshot tables array {s}", .{@errorName(err)});
+                    return latest_kv; // Return what we have so far
+                };
+                @memcpy(snapshot_tables, self.mtables.items);
             }
         }
 
-        for (snapshot_tables[0..table_count]) |table| {
+        // Search warm tables in reverse order (newer first) for better cache locality
+        var i = table_count;
+        while (i > 0) {
+            i -= 1;
+            const table = snapshot_tables[i];
             if (try table.get(key)) |kv| {
                 if (latest_kv == null or kv.timestamp > latest_timestamp) {
                     latest_timestamp = kv.timestamp;
                     latest_kv = kv;
+                    // Early exit if we found a very recent entry
+                    if ((std.time.nanoTimestamp() - latest_timestamp) < 100_000_000) { // 100ms
+                        break;
+                    }
                 }
             }
         }
 
+        // TODO: Add bloom filter check before SSTable reads
         // if (try self.sstables.read(key)) |kv| {
         //     if (latest_kv == null or kv.timestamp > latest_timestamp) {
         //         latest_timestamp = kv.timestamp;

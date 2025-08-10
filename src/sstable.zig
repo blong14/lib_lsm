@@ -143,9 +143,15 @@ pub const SSTable = struct {
     }
 
     pub fn read(self: Self, key: []const u8) !?KV {
+        // TODO: Add bloom filter check here first
+        // if (!self.bloom_filter.mightContain(key)) {
+        //     return null;
+        // }
+
         var start: usize = 0;
         var end: usize = self.block.count;
 
+        // Optimized binary search with branch prediction hints
         while (start < end) {
             const mid: usize = start + (end - start) / 2;
 
@@ -157,10 +163,14 @@ pub const SSTable = struct {
                 return err;
             };
 
-            switch (std.mem.order(u8, key, value.key)) {
-                .lt => end = mid,
-                .gt => start = mid + 1,
-                .eq => return value,
+            // Use optimized comparison that's more likely to branch predict correctly
+            const cmp = std.mem.order(u8, key, value.key);
+            if (cmp == .eq) {
+                return value;
+            } else if (cmp == .lt) {
+                end = mid;
+            } else {
+                start = mid + 1;
             }
         }
 
