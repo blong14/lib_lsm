@@ -43,11 +43,18 @@ pub const Database = struct {
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        const mtable = Memtable.init(alloc, new_id) catch |err| {
-            std.log.err("unable to init memtable {s}", .{@errorName(err)});
+        // Create WAL path for the initial memtable
+        const wal_path = try std.fmt.allocPrint(alloc, "{s}/wal_{s}.dat", .{ opts.data_dir, new_id });
+        defer alloc.free(wal_path);
+
+        const mtable = Memtable.initWithWAL(alloc, new_id, wal_path) catch |err| {
+            std.log.err("unable to init memtable with WAL {s}", .{@errorName(err)});
             return err;
         };
-        errdefer mtable.deinit();
+        errdefer {
+            mtable.deinit();
+            alloc.destroy(mtable);
+        }
 
         const mtables = std.ArrayList(*Memtable).init(alloc);
         errdefer mtables.deinit();
@@ -104,6 +111,7 @@ pub const Database = struct {
                 var siter = try sstable.iterator(alloc);
                 defer siter.deinit();
 
+                // For recovery, create memtables without WAL since they're already persisted
                 const nxt_table = try Memtable.init(alloc, sstable.id);
                 while (siter.next()) |nxt| {
                     var k = try nxt.clone(alloc);
@@ -378,7 +386,11 @@ pub const Database = struct {
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        const nxt_table = try Memtable.init(alloc, new_id);
+        // Create WAL path for the new memtable
+        const wal_path = try std.fmt.allocPrint(alloc, "{s}/wal_{s}.dat", .{ self.opts.data_dir, new_id });
+        defer alloc.free(wal_path);
+
+        const nxt_table = try Memtable.initWithWAL(alloc, new_id, wal_path);
 
         try self.mtables.append(mtable);
 

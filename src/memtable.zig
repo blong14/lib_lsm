@@ -4,6 +4,7 @@ const keyvalue = @import("kv.zig");
 const iter = @import("iterator.zig");
 const skl = @import("skiplist.zig");
 const tbl = @import("tablemap.zig");
+const wal = @import("wal.zig");
 
 const Allocator = std.mem.Allocator;
 const AtomicValue = std.atomic.Value;
@@ -18,6 +19,7 @@ pub fn decodeInternalKey(a: []const u8) anyerror![]const u8 {
 
 const KeyValueSkipList = SkipList(KV, keyvalue.decode);
 const KeyValueSkipListIndex = SkipList([]const u8, decodeInternalKey);
+const WAL = wal.WAL;
 
 pub const Memtable = struct {
     init_alloc: Allocator,
@@ -26,6 +28,7 @@ pub const Memtable = struct {
 
     data: *KeyValueSkipList,
     user_key_index: KeyValueSkipListIndex,
+    wal_log: ?*WAL,
 
     mutable: AtomicValue(bool),
     isFlushed: AtomicValue(bool),
@@ -51,6 +54,7 @@ pub const Memtable = struct {
             .id = id_copy,
             .data = map,
             .user_key_index = try KeyValueSkipListIndex.init(),
+            .wal_log = null,
             .byte_count = AtomicValue(usize).init(0),
             .mutable = AtomicValue(bool).init(true),
             .isFlushed = AtomicValue(bool).init(false),
@@ -59,7 +63,25 @@ pub const Memtable = struct {
         return mtable;
     }
 
+    pub fn initWithWAL(alloc: Allocator, id: []const u8, wal_path: []const u8) !*Self {
+        const mtable = try init(alloc, id);
+        errdefer {
+            mtable.deinit();
+            alloc.destroy(mtable);
+        }
+
+        const wal_log = try WAL.init(alloc, wal_path, std.mem.page_size);
+        mtable.wal_log = wal_log;
+
+        return mtable;
+    }
+
     pub fn deinit(self: *Self) void {
+        if (self.wal_log) |wal_log| {
+            wal_log.deinit();
+            self.init_alloc.destroy(wal_log);
+        }
+
         self.user_key_index.deinit();
 
         self.data.deinit();
@@ -76,6 +98,13 @@ pub const Memtable = struct {
     pub fn put(self: *Self, item: KV) !void {
         if (self.frozen()) return error.MemtableImmutable;
 
+        // Write to WAL first for durability - if this fails, the entire operation fails
+        if (self.wal_log) |wal_log| {
+            const key_hash = std.hash.Murmur2_64.hash(item.key);
+            try wal_log.write(key_hash, item.raw_bytes);
+        }
+
+        // Only proceed with memtable writes if WAL write succeeded
         try self.user_key_index.put(item.userKey(), item.internalKey());
         try self.data.put(item.internalKey(), item.raw_bytes);
 
