@@ -21,7 +21,38 @@ const fixedBufferStream = std.io.fixedBufferStream;
 const print = std.debug.print;
 const writeInt = std.mem.writeInt;
 
-/// meta_data[len,kvlen1,key,kvlen2,key]
+/// BlockMeta represents metadata for a block containing key-value pairs.
+///
+/// ## Binary Format Layout
+/// The metadata is serialized in the following binary format:
+/// ```
+/// [total_length][first_key_length][first_key_data][last_key_length][last_key_data]
+/// ```
+///
+/// ## Field Details
+/// - `total_length`: u64 - Total size of the entire metadata structure in bytes
+/// - `first_key_length`: u64 - Length of the first key in bytes
+/// - `first_key_data`: []u8 - Raw bytes of the first key
+/// - `last_key_length`: u64 - Length of the last key in bytes
+/// - `last_key_data`: []u8 - Raw bytes of the last key
+///
+/// ## Encoding
+/// All integer fields are encoded as little-endian u64 values.
+///
+/// ## Usage
+/// BlockMeta is used to store boundary information for blocks in the LSM tree,
+/// enabling efficient range queries and block navigation without reading the
+/// entire block contents.
+///
+/// ## Example
+/// ```zig
+/// const meta = BlockMeta.init("apple", "zebra");
+/// const encoded = try meta.encodeAlloc(allocator);
+/// defer allocator.free(encoded);
+///
+/// var decoded_meta = BlockMeta{};
+/// try decoded_meta.decode(encoded);
+/// ```
 const BlockMeta = struct {
     len: u64,
     first_key: []const u8,
@@ -81,10 +112,50 @@ const BlockMeta = struct {
     }
 };
 
-/// block[meta_data, offset_data, kv_data]
-/// meta_data[len,kvlen1,key,kvlen2,key,count]
-/// offset_data[offset1,offset2,...]
-/// kv_data[kv1,kv2,...]
+/// Block represents a storage unit containing key-value pairs with metadata.
+///
+/// ## Binary Format Layout
+/// The block is organized into three sections:
+/// ```
+/// [meta_data][offset_data][kv_data]
+/// ```
+///
+/// ## Section Details
+/// - `meta_data`: Contains block metadata including length, first/last keys, and count
+///   - Format: [BlockMeta][count]
+///   - BlockMeta: [total_length][first_key_length][first_key_data][last_key_length][last_key_data]
+///   - count: u64 - Number of key-value pairs in the block
+/// - `offset_data`: Array of u64 offsets pointing to each KV pair in kv_data section
+///   - Format: [offset1][offset2]...[offsetN]
+/// - `kv_data`: Serialized key-value pairs stored sequentially
+///   - Format: [kv1][kv2]...[kvN]
+///
+/// ## Memory Layout
+/// The block uses a fixed-size buffer divided into three sections:
+/// - Meta section: 10% of total buffer size
+/// - Offset section: 20% of total buffer size
+/// - Data section: 70% of total buffer size
+///
+/// ## Encoding
+/// All integer fields are encoded as little-endian u64 values.
+///
+/// ## Usage
+/// Blocks are used as the fundamental storage unit in the LSM tree for organizing
+/// and accessing key-value pairs efficiently. They support both reading from
+/// existing data and writing new key-value pairs.
+///
+/// ## Example
+/// ```zig
+/// var stream = fixedBufferStream(buffer);
+/// var block = try Block.init(allocator, &stream);
+/// defer block.deinit();
+///
+/// const kv = try KV.initOwned(allocator, "key1", "value1");
+/// const index = try block.write(kv);
+/// const retrieved = try block.read(index);
+///
+/// try block.freeze(); // Finalize the block
+/// ```
 pub const Block = struct {
     alloc: Allocator,
     stream: *FixedBuffer([]align(PageSize) u8),
@@ -132,22 +203,17 @@ pub const Block = struct {
             .data_section_size = data_size,
         };
 
-        // Check if the stream has existing data (frozen block from disk)
-        // Only check if buffer is properly initialized and has data
         const has_existing_data = stream.buffer.len > 0 and
             @intFromPtr(stream.buffer.ptr) != 0 and
             stream.buffer[0] != 0;
 
         if (has_existing_data) {
-            // Try to decode existing metadata
             var meta = BlockMeta{ .len = 0, .first_key = "", .last_key = "" };
             meta.decode(stream.buffer[0..]) catch {
-                // If decode fails, treat as empty block
                 stream.pos = data_start;
                 return block;
             };
 
-            // Read the count from after the metadata
             const count_pos = meta.len;
             if (count_pos + @sizeOf(u64) <= stream.buffer.len) {
                 const count_bytes = stream.buffer[count_pos .. count_pos + @sizeOf(u64)];
@@ -155,20 +221,16 @@ pub const Block = struct {
                 block.first_key = meta.first_key;
                 block.last_key = meta.last_key;
 
-                // Calculate byte count based on existing data
                 block.byte_count = meta.len + @sizeOf(u64) + (block.count * @sizeOf(u64));
 
-                // Set stream position to end of data for potential writes
                 stream.pos = data_start;
 
-                // Find the actual end of data by reading offsets
                 if (block.count > 0) {
                     const last_offset_pos = block.offset_section_start + ((block.count - 1) * @sizeOf(u64));
                     if (last_offset_pos + @sizeOf(u64) <= stream.buffer.len) {
                         const last_offset_bytes = stream.buffer[last_offset_pos .. last_offset_pos + @sizeOf(u64)];
                         const last_data_offset = std.mem.readInt(u64, last_offset_bytes[0..@sizeOf(u64)], Endian);
 
-                        // Read the last KV to determine its size
                         const last_kv_pos = data_start + last_data_offset;
                         if (last_kv_pos < stream.buffer.len) {
                             const last_kv = keyvalue.decode(stream.buffer[last_kv_pos..]) catch {
@@ -182,7 +244,6 @@ pub const Block = struct {
                 }
             }
         } else {
-            // For new blocks, set the stream position to the data section start
             stream.pos = block.data_section_start;
         }
 
@@ -199,7 +260,6 @@ pub const Block = struct {
         const current_pos = self.stream.pos;
         const offset_pos = self.offset_section_start + (self.count * offset_size);
 
-        // Ensure we're writing in the data section
         if (current_pos < self.data_section_start) {
             self.stream.pos = self.data_section_start;
         }
@@ -213,7 +273,6 @@ pub const Block = struct {
         }
 
         const data_offset = adjusted_pos - self.data_section_start;
-        // Make sure we're at the right position before writing
         self.stream.pos = adjusted_pos;
         const bytes_written = self.stream.write(kv.raw_bytes) catch return Error.WriteError;
 
@@ -297,11 +356,9 @@ pub const Block = struct {
     }
 
     pub fn decode(self: *Block, stream: *FixedBuffer([]align(PageSize) u8)) Error!usize {
-        // Decode metadata from the beginning of the stream
         var meta = BlockMeta{ .len = 0, .first_key = "", .last_key = "" };
         meta.decode(stream.buffer) catch return Error.ReadError;
 
-        // Read count after metadata
         const count_pos = meta.len;
         if (count_pos + @sizeOf(u64) > stream.buffer.len) {
             return Error.ReadError;
@@ -312,7 +369,6 @@ pub const Block = struct {
         self.first_key = meta.first_key;
         self.last_key = meta.last_key;
 
-        // Calculate total bytes decoded
         const total_decoded = meta.len + @sizeOf(u64);
         self.byte_count = total_decoded + (self.count * @sizeOf(u64));
 
