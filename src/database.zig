@@ -155,8 +155,8 @@ pub const Database = struct {
             table_count = self.mtables.items.len;
             if (table_count > 0) {
                 // Always use heap allocation for safety
-                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch {
-                    std.log.err("Failed to allocate snapshot tables array");
+                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
+                    std.log.err("Failed to allocate snapshot tables array {s}", .{@errorName(err)});
                     return null;
                 };
                 @memcpy(snapshot_tables, self.mtables.items);
@@ -226,8 +226,8 @@ pub const Database = struct {
 
             table_count = self.mtables.items.len;
             if (table_count > 0) {
-                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch {
-                    std.log.err("Failed to allocate snapshot tables for iterator");
+                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
+                    std.log.err("Failed to allocate snapshot tables for iterator {s}", .{@errorName(err)});
                     return error.OutOfMemory;
                 };
                 @memcpy(snapshot_tables, self.mtables.items);
