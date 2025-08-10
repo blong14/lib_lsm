@@ -104,8 +104,8 @@ const SingleThreadedImpl = struct {
             debug.print("database init error {s}\n", .{@errorName(err)});
             return err;
         };
-        defer allocator.destroy(db);
         defer db.deinit(allocator);
+        defer allocator.destroy(db);
 
         var idx: usize = 0;
         var data = [2][]const u8{ undefined, undefined };
@@ -296,6 +296,7 @@ const MultiThreadedImpl = struct {
                 return;
             };
             defer db.deinit(allocator);
+            defer allocator.destroy(db);
 
             const Pool = std.Thread.Pool;
 

@@ -1,12 +1,27 @@
 #!/bin/bash
 # Test script for PostgreSQL interface
 
+set -e  # Exit on any error
+
 # Configuration
 HOST="localhost"
 PORT="54321"
 PSQL_CMD="psql -h $HOST -p $PORT"
 
 echo "Testing PostgreSQL interface on $HOST:$PORT..."
+
+# Wait for server to be ready
+echo "Waiting for server to be ready..."
+timeout=30
+while ! nc -z $HOST $PORT 2>/dev/null; do
+    sleep 1
+    timeout=$((timeout - 1))
+    if [ $timeout -eq 0 ]; then
+        echo "Error: Server not ready after 30 seconds"
+        exit 1
+    fi
+done
+echo "Server is ready!"
 
 echo -e "\n1. Creating users table..."
 $PSQL_CMD -c "create table users (age int, name text);"
