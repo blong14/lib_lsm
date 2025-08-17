@@ -123,22 +123,21 @@ pub const SSTable = struct {
 
         const reader = stream.buf.reader();
 
-        const block_size = try reader.readInt(u64, Endian);
-        if (block_size > 0) {
-            self.*.mutable = false;
-        }
-
+        const first_key_len = try reader.readInt(u64, Endian);
         stream.buf.reset();
 
-        const block = try Block.init(self.alloc, &stream.buf);
-        errdefer {
-            block.deinit();
-            self.alloc.destroy(block);
+        var blck: *Block = undefined;
+        if (first_key_len > 0) {
+            self.*.mutable = false;
+            blck = try Block.initFromData(self.alloc, stream.buf.buffer);
+        } else {
+            blck = try self.alloc.create(Block);
+            blck.* = Block.init(self.alloc, stream.buf.buffer);
         }
 
         self.*.connected = true;
         self.*.file = file;
-        self.*.block = block;
+        self.*.block = blck;
         self.*.stream = stream;
     }
 
@@ -149,9 +148,8 @@ pub const SSTable = struct {
         // }
 
         var start: usize = 0;
-        var end: usize = self.block.count;
+        var end: usize = self.block.len();
 
-        // Optimized binary search with branch prediction hints
         while (start < end) {
             const mid: usize = start + (end - start) / 2;
 
@@ -163,7 +161,6 @@ pub const SSTable = struct {
                 return err;
             };
 
-            // Use optimized comparison that's more likely to branch predict correctly
             const cmp = std.mem.order(u8, key, value.key);
             if (cmp == .eq) {
                 return value;
@@ -206,7 +203,7 @@ pub const SSTable = struct {
             const self: *SSTableIterator = @ptrCast(@alignCast(ctx));
 
             var kv: ?KV = null;
-            if (self.nxt < self.block.count) {
+            if (self.nxt < self.block.len()) {
                 kv = self.block.read(self.nxt) catch |err| {
                     std.log.err("sstable iter error {s}", .{@errorName(err)});
                     return null;
@@ -330,9 +327,7 @@ test "SSTable persistence and error handling" {
         _ = try st.write(try KV.initOwned(alloc, "key1", "value1"));
         _ = try st.write(try KV.initOwned(alloc, "key2", "value2"));
 
-        // try st.block.freeze();
-
-        _ = st.block.flush();
+        try st.block.flush();
         try st.file.sync();
     }
 

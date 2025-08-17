@@ -1,15 +1,18 @@
 const std = @import("std");
 
 const Block = @import("block.zig").Block;
-const File = @import("file.zig");
+const file_utils = @import("file.zig");
+const Iterator = @import("iterator.zig").Iterator;
 const KV = @import("kv.zig").KV;
 const MMap = @import("mmap.zig").AppendOnlyMMap;
 
 const Allocator = std.mem.Allocator;
 const BufferedWriter = std.io.BufferedWriter;
-const Endian = std.builtin.Endian.little;
 const FixedBuffer = std.io.FixedBufferStream;
 const Mutex = std.Thread.Mutex;
+
+const Endian = std.builtin.Endian.little;
+const MB = 1024 * 1024;
 const PageSize = std.mem.page_size;
 
 const bufferedWriter = std.io.bufferedWriter;
@@ -18,35 +21,32 @@ const writeInt = std.mem.writeInt;
 const readInt = std.mem.readInt;
 
 pub const WalConfig = struct {
-    Dir: std.fs.Dir,
+    Dir: []const u8,
     Segment: struct {
-        MaxStoreBytes: u64 = PageSize,
-        MaxIndexBytes: u64 = PageSize,
-        InitialOffset: u64 = 0,
+        MaxStoreBytes: u64 = MB,
     } = .{},
 };
 
 pub const Store = struct {
-    mtx: Mutex,
     file: std.fs.File,
-    buf: *MMap,
+    stream: *MMap,
+    block: *Block,
+    count: u64 = 0,
     size: u64 = 0,
     connected: bool = false,
+    mutable: bool = true,
 
     const Self = @This();
 
-    pub fn init() !Self {
+    pub fn init() Self {
         return .{
-            .mtx = Mutex{},
-            .buf = undefined,
+            .block = undefined,
+            .stream = undefined,
             .file = undefined,
         };
     }
 
     pub fn open(self: *Self, alloc: Allocator, file: std.fs.File) !void {
-        self.mtx.lock();
-        defer self.mtx.unlock();
-
         if (self.connected) {
             return;
         }
@@ -63,305 +63,240 @@ pub const Store = struct {
         try stream.connect(file, 0);
         stream.buf.reset();
 
+        const reader = stream.buf.reader();
+
+        const first_key_len = try reader.readInt(u64, Endian);
+        stream.buf.reset();
+
+        var blck: *Block = undefined;
+        if (first_key_len > 0) {
+            self.*.mutable = false;
+            std.debug.print("init wal block data\n", .{});
+            blck = try Block.initFromData(alloc, stream.buf.buffer);
+        } else {
+            blck = try alloc.create(Block);
+            blck.* = Block.init(alloc, stream.buf.buffer);
+        }
+
+        self.*.block = blck;
         self.*.connected = true;
         self.*.file = file;
-        self.*.buf = stream;
+        self.*.stream = stream;
     }
 
-    pub fn close(self: *Self) !void {
-        self.mtx.lock();
-        self.buf.deinit();
+    pub fn deinit(self: *Self, alloc: Allocator) void {
+        self.block.deinit();
+        alloc.destroy(self.block);
+        self.stream.deinit();
+        alloc.destroy(self.stream);
         self.file.close();
-        self.mtx.unlock();
         self.* = undefined;
     }
 
-    pub fn read(self: *Self, pos: u64) ![]const u8 {
-        self.mtx.lock();
-        defer self.mtx.unlock();
-
-        var buf: [PageSize]u8 = undefined;
-        const result = try self.buf.read(pos, buf);
-
-        const stream = fixedBufferStream(self.file.reader());
-        stream.seekTo(pos);
-
-        var reader = stream.reader();
-
-        const len = try reader.readInt(u64, Endian);
-
-        var out: [PageSize]u8 = undefined;
-        try reader.readAtLeast(out, len);
-
-        return out[0..len];
+    pub fn getCount(self: Self) u64 {
+        return self.count;
     }
 
-    pub fn append(self: *Self, kv: KV) !struct { offset: u64, len: usize } {
-        self.mtx.lock();
-        defer self.mtx.unlock();
-
-        const result = try self.buf.write(kv.raw_bytes);
-        self.size += result.len;
-
-        return .{ .len = result.len, .offset = result.idx };
-    }
-};
-
-pub const Index = struct {
-    const Row = extern struct {
-        offset: u64,
-        pos: u64,
-    };
-
-    file: std.fs.File,
-    mmap: *MMap(Row),
-    size: u64,
-
-    const Self = @This();
-
-    pub fn init(alloc: Allocator, f: std.fs.File) !Self {
-        const stat = try f.stat();
-
-        const data = try MMap(Row).init(alloc, stat.size);
-        try data.connect(f);
-
-        return .{
-            .file = f,
-            .mmap = data,
-            .size = stat.size,
-        };
+    pub fn read(self: *const Self, idx: u64) !KV {
+        return self.block.read(idx);
     }
 
-    pub fn deinit(self: *Self) !void {
-        try self.close();
-        self.* = undefined;
-    }
-
-    pub fn close(self: *Self) !void {
-        try self.file.sync();
-        defer self.file.close();
-
-        self.mmap.deinit();
-    }
-
-    pub fn read(self: *Self, in: u64) !Row {
-        try self.mmap.read(in);
-    }
-
-    pub fn write(self: *Self, off: u64, pos: u64) !void {
-        const row: Row = .{ .offset = off, .pos = pos };
-        try self.mmap.append(row);
+    pub fn append(self: *Self, data: KV) !void {
+        _ = try self.block.write(data);
+        self.size += data.len();
+        self.count += 1;
     }
 };
 
 pub const Segment = struct {
     conf: WalConfig,
-    index: Index,
     store: Store,
+    id: u64,
+    max_bytes: u64,
 
     const Self = @This();
 
-    pub fn init(alloc: Allocator, conf: WalConfig) !Self {
-        const idx_file = try conf.Dir.createFile("segment_idx.dat", .{ .read = true });
-        errdefer idx_file.close();
+    pub fn init(alloc: Allocator, id: u64, conf: WalConfig) !Self {
+        const wal_path = try std.fmt.allocPrint(
+            alloc,
+            "{s}/wal_{d}.dat",
+            .{
+                conf.Dir,
+                id,
+            },
+        );
+        defer alloc.free(wal_path);
 
-        try idx_file.setEndPos(conf.Segment.MaxIndexBytes);
+        const wal_file = try file_utils.open(wal_path);
+        try wal_file.setEndPos(conf.Segment.MaxStoreBytes);
 
-        const idx = try Index.init(alloc, idx_file);
+        const stat = try wal_file.stat();
 
-        const store_file = try conf.Dir.createFile("segment_store.dat", .{ .read = true });
-        errdefer store_file.close();
-
-        try store_file.setEndPos(conf.Segment.MaxStoreBytes);
-
-        const store = try Store.init(store_file);
+        var store = Store.init();
+        try store.open(alloc, wal_file);
 
         return .{
             .conf = conf,
-            .index = idx,
+            .id = id,
+            .max_bytes = stat.size,
             .store = store,
         };
     }
 
-    pub fn deinit(self: *Self) !void {
-        try self.index.deinit();
-        try self.store.close();
+    pub fn deinit(self: *Self, alloc: Allocator) void {
+        self.store.deinit(alloc);
         self.* = undefined;
     }
 
-    pub fn write(self: *Self, data: []const u8) !void {
-        const resp = try self.store.append(data);
-        try self.index.write(resp.offset, resp.len);
+    pub fn write(self: *Self, kv: KV) !void {
+        if (kv.len() >= self.max_bytes) {
+            return error.NoSpaceLeft;
+        }
+
+        _ = try self.store.append(kv);
+    }
+
+    pub fn read(self: Self, idx: u64) ?[]const u8 {
+        if (idx >= self.store.getCount()) return null;
+
+        return self.store.read(idx) catch null;
     }
 };
 
-pub const XWAL = struct {
+pub const WAL = struct {
     conf: WalConfig,
-    active_segment: Segment,
-    segments: std.ArrayList(Segment),
+    mtx: Mutex,
+    active_segment: *Segment,
+    segments: std.ArrayList(*Segment),
 
     const Self = @This();
 
     pub fn init(alloc: Allocator, conf: WalConfig) !Self {
+        const active_segment = try alloc.create(Segment);
+        active_segment.* = try Segment.init(alloc, 1, conf);
+
         return .{
+            .mtx = Mutex{},
             .conf = conf,
-            .active_segment = try Segment.init(alloc, conf),
-            .segments = std.ArrayList(Segment).init(alloc),
+            .active_segment = active_segment,
+            .segments = std.ArrayList(*Segment).init(alloc),
         };
     }
 
-    pub fn deinit(self: *Self) !void {
-        try self.active_segment.deinit();
+    pub fn deinit(self: *Self, alloc: Allocator) !void {
+        self.active_segment.deinit(alloc);
+        alloc.destroy(self.active_segment);
+        for (self.segments.items) |segment| {
+            segment.deinit(alloc);
+            alloc.destroy(segment);
+        }
         self.segments.deinit();
         self.* = undefined;
     }
 
-    pub fn write(self: *Self, alloc: Allocator, key: u64, data: []const u8) !void {
-        _ = key;
-        self.active_segment.write(data) catch |err| switch (err) {
-            error.WriteError => {
+    pub fn write(self: *Self, alloc: Allocator, kv: KV) !void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+
+        self.active_segment.write(kv) catch |err| switch (err) {
+            error.NoSpaceLeft => {
                 try self.segments.append(self.active_segment);
-                self.active_segment = try Segment.init(alloc, self.conf);
+
+                const current_id = self.active_segment.id;
+
+                const active_segment = try alloc.create(Segment);
+                active_segment.* = try Segment.init(
+                    alloc,
+                    current_id + 1,
+                    self.conf,
+                );
+
+                self.active_segment = active_segment;
+                try self.active_segment.write(kv);
             },
             else => return err,
         };
     }
 
-    pub fn read(self: Self, offset: u64) ?[]const u8 {
-        var segment: ?Segment = null;
-        for (self.segments) |s| {
-            if (s.isInRange(offset)) {
-                segment = s;
-                break;
+    fn read(self: *Self, idx: u64) !KV {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+
+        var current_idx: u64 = 0;
+        for (self.segments.items) |segment| {
+            const segment_count = segment.store.getCount();
+            if (idx >= current_idx and idx < current_idx + segment_count) {
+                const local_idx = idx - current_idx;
+                return segment.store.read(local_idx);
             }
+            current_idx += segment_count;
         }
 
-        if (segment) |s| {
-            return s.read(s);
+        const active_count = self.active_segment.store.getCount();
+        if (idx >= current_idx and idx < current_idx + active_count) {
+            const local_idx = idx - current_idx;
+            return self.active_segment.store.read(local_idx);
         }
 
-        return null;
-    }
-};
-
-test XWAL {
-    const testing = std.testing;
-    var alloc = testing.allocator;
-
-    const test_dir = testing.tmpDir(.{});
-    const pathname = try test_dir.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(pathname);
-    // defer test_dir.dir.deleteTree(pathname) catch {};
-
-    std.debug.print("{s}\n", .{pathname});
-
-    // given
-    var st = try XWAL.init(alloc, .{ .Dir = test_dir.dir });
-    defer st.deinit() catch unreachable;
-
-    // when
-    const key: u64 = std.hash.Murmur2_64.hash("__key__");
-    const expected: []const u8 = "__value__";
-    try st.write(alloc, key, expected);
-
-    const actual = st.read(key);
-
-    try testing.expectEqualStrings(expected, actual.?);
-
-    // then
-    //var iter = st.iterator();
-    //const actual = iter.next();
-    //try testing.expectEqualStrings(expected, actual.?.value);
-}
-
-pub const WAL = struct {
-    alloc: Allocator,
-    data: *MMap(Row),
-    file: std.fs.File,
-
-    const Row = extern struct {
-        key: u64,
-        value: [*c]const u8,
-    };
-
-    const Self = @This();
-
-    const Error = error{
-        NotFound,
-    } || MMap(Row).Error;
-
-    pub fn init(alloc: Allocator, path: []const u8, capacity: usize) !*Self {
-        const file = try File.openWithCapacity(path, capacity);
-        const data = try MMap(Row).init(alloc, capacity);
-        try data.connect(file);
-        const wal = try alloc.create(Self);
-        wal.* = .{ .alloc = alloc, .data = data, .file = file };
-        return wal;
+        return error.IndexOutOfBounds;
     }
 
-    pub fn deinit(self: *Self) void {
-        self.data.deinit();
-        self.file.close();
-        self.* = undefined;
-    }
+    const WalIter = struct {
+        alloc: Allocator,
+        wal: *WAL = undefined,
+        nxt: usize = 0,
 
-    pub fn write(self: *Self, key: u64, value: []const u8) !void {
-        return try self.data.append(Row{ .key = key, .value = value.ptr });
-    }
+        pub fn deinit(ctx: *anyopaque) void {
+            const self: *WalIter = @ptrCast(@alignCast(ctx));
+            self.alloc.destroy(self);
+        }
 
-    pub const Result = struct {
-        key: u64,
-        value: []const u8,
-    };
+        pub fn next(ctx: *anyopaque) ?KV {
+            const self: *WalIter = @ptrCast(@alignCast(ctx));
 
-    pub const Iterator = struct {
-        idx: usize,
-        data: *MMap(Row),
-
-        pub fn next(it: *Iterator) ?Result {
-            const row = it.data.read(it.*.idx) catch return null;
-            it.*.idx += 1;
-            const value = std.mem.span(row.value);
-            return .{
-                .key = row.key,
-                .value = value,
+            const kv = self.wal.read(self.nxt) catch |err| {
+                std.log.err("wal iter error {s}", .{@errorName(err)});
+                return null;
             };
-        }
 
-        pub fn reset(it: *Iterator) void {
-            it.*.idx = 0;
+            self.*.nxt += 1;
+
+            return kv;
         }
     };
 
-    pub fn iterator(self: Self) Iterator {
-        return .{ .idx = 0, .data = self.data };
+    pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
+        const wit = try alloc.create(WalIter);
+        wit.* = .{ .alloc = alloc, .wal = self };
+        return Iterator(KV).init(wit, WalIter.next, WalIter.deinit);
     }
 };
 
 test WAL {
     const testing = std.testing;
-    var alloc = testing.allocator;
+    const alloc = testing.allocator;
 
-    const testDir = testing.tmpDir(.{});
-    const pathname = try testDir.dir.realpathAlloc(alloc, ".");
+    const test_dir = testing.tmpDir(.{});
+    const pathname = try test_dir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
-    defer testDir.dir.deleteTree(pathname) catch {};
+    defer test_dir.dir.deleteTree(pathname) catch {};
 
     // given
-    const filename = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pathname, "wal.dat" });
-    defer alloc.free(filename);
+    var st = try WAL.init(alloc, .{ .Dir = pathname });
+    defer st.deinit(alloc) catch unreachable;
 
-    var st = try WAL.init(alloc, filename, std.mem.page_size);
-    defer alloc.destroy(st);
-    defer st.deinit();
+    const expected: []const u8 = "__value__";
 
     // when
-    const key: u64 = std.hash.Murmur2_64.hash("__key__");
-    const expected: []const u8 = "__value__";
-    try st.write(key, expected);
+    var kv = try KV.initOwned(alloc, "__key__", expected);
+    defer kv.deinit(alloc);
 
-    // then
-    var iter = st.iterator();
+    try st.write(alloc, kv);
+
+    var iter = try st.iterator(alloc);
+    defer iter.deinit();
+
     const actual = iter.next();
+
     try testing.expectEqualStrings(expected, actual.?.value);
 }

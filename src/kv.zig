@@ -104,7 +104,8 @@ pub const KV = struct {
         var offset: usize = 0;
 
         const key_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
-        if (key_len == 0 or key_len > max_key_size) {
+        if (key_len == 0 or key_len > max_key_size or key_len > data.len) {
+            std.debug.print("kv decode key len error\n", .{});
             return error.InvalidKeyLength;
         }
         offset += @sizeOf(u64);
@@ -153,6 +154,7 @@ pub const KV = struct {
     pub fn encode(self: Self, buf: []u8) ![]u8 {
         const max_key_size = 1024 * 1024; // 1MB
         if (self.key.len == 0 or self.key.len > max_key_size) {
+            std.debug.print("kv encode key len error\n", .{});
             return error.InvalidKeyLength;
         }
 
@@ -161,7 +163,7 @@ pub const KV = struct {
             return error.InvalidValueLength;
         }
 
-        if (self.timestamp <= 0) {
+        if (self.timestamp == 0) {
             return error.InvalidTimestamp;
         }
 

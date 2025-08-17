@@ -79,7 +79,7 @@ pub fn main() !void {
     };
 
     const db = try lsm.init(allocator, opts);
-    defer lsm.deinit(db);
+    defer lsm.deinit(allocator, db);
 
     if (res.args.read != 0) {
         read(allocator, db, res.args.input.?);
@@ -152,8 +152,9 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
 
             for (ctx.items, 0..) |key, i| {
                 const kv = lsm.read(ctx.db, key) catch |err| {
-                    std.log.debug("database read error for key {s} {s}", .{
+                    std.log.err("database read error for key '{s}' (len={d}): {s}", .{
                         key,
+                        key.len,
                         @errorName(err),
                     });
                     error_count += 1;

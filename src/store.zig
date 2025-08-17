@@ -113,8 +113,6 @@ pub const SSTableStore = struct {
         defer tables_to_release.deinit();
 
         try tables_to_release.appendSlice(self.get(level));
-
-        std.log.debug("releasing {d} tables", .{tables_to_release.items.len});
         for (tables_to_release.items) |table| {
             const fln = try std.fmt.allocPrint(
                 malloc,
@@ -165,8 +163,8 @@ pub const SSTableStore = struct {
         defer dir_iter.deinit();
 
         while (try dir_iter.next()) |f| {
-            // Skip temporary files (hidden files starting with .) and non-SSTable files
             if (std.mem.startsWith(u8, f.basename, ".") or
+                std.mem.startsWith(u8, f.basename, "wal_") or
                 std.mem.endsWith(u8, f.basename, "_temp.dat") or
                 !std.mem.endsWith(u8, f.basename, ".dat"))
             {
@@ -573,28 +571,27 @@ pub const SSTableStore = struct {
                 return;
             }
 
-            // Track retained tables for cleanup on error
-            var retained_tables = std.ArrayList(*SSTable).init(self.alloc);
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const temp_alloc = arena.allocator();
+
+            var retained_tables = std.ArrayList(*SSTable).init(temp_alloc);
             defer {
-                // Release all retained tables on exit
                 for (retained_tables.items) |table| {
                     _ = table.release();
                 }
-                retained_tables.deinit();
             }
 
-            var sz: usize = 0;
+            var current_level_bytes: usize = 0;
             for (tables) |table| {
-                sz += table.block.size();
+                current_level_bytes += table.block.size();
                 table.retain();
-                retained_tables.append(table) catch {
-                    // If we can't track it, release immediately
-                    _ = table.release();
-                    return error.OutOfMemory;
-                };
+                try retained_tables.append(table);
             }
 
-            sz = sz * 10;
+            const metadata_overhead = 1024; // Space for headers, offsets, etc.
+            const safety_buffer = current_level_bytes / 4; // 25% buffer for safety
+            const estimated_size = current_level_bytes + metadata_overhead + safety_buffer;
 
             const start_time = std.time.nanoTimestamp();
 
@@ -607,40 +604,34 @@ pub const SSTableStore = struct {
             }
 
             const filename = try std.fmt.allocPrint(
-                self.alloc,
+                temp_alloc,
                 "{s}/{s}.dat",
                 .{ new_table.data_dir, new_table.id },
             );
-            defer self.alloc.free(filename);
 
-            const out_file = try file_utils.openAndTruncate(filename, sz);
+            const out_file = try file_utils.openAndTruncate(filename, estimated_size);
             try new_table.open(out_file);
 
-            var count: usize = 0;
+            var keys_compacted: usize = 0;
             var bytes_read: u64 = 0;
 
             for (tables) |table| {
                 bytes_read += table.block.size();
 
-                var it = try table.iterator(self.alloc);
-                defer it.deinit();
+                var table_iterator = try table.iterator(self.alloc);
+                defer table_iterator.deinit();
 
-                while (it.next()) |kv| {
+                while (table_iterator.next()) |kv| {
                     var kv_copy = try kv.clone(self.alloc);
                     defer kv_copy.deinit(self.alloc);
 
                     _ = try new_table.write(kv_copy);
-                    count += 1;
+                    keys_compacted += 1;
                 }
             }
 
-            // Clear the retained_tables list since we're done with them
-            retained_tables.clearRetainingCapacity();
-
-            if (count > 0) {
-                // try new_table.block.freeze();
-
-                _ = new_table.block.flush();
+            if (keys_compacted > 0) {
+                try new_table.block.flush();
 
                 new_table.file.sync() catch |err| {
                     std.log.err(
@@ -662,9 +653,11 @@ pub const SSTableStore = struct {
                 const end_time = std.time.nanoTimestamp();
                 const latency = @as(u64, @intCast(end_time - start_time));
 
+                const duration_ms = @as(f64, @floatFromInt(latency)) / std.time.ns_per_ms;
+
                 std.log.info(
-                    "[simple] compacted {d} keys from level {d} to level {d} {d:.2} ms",
-                    .{ count, level, next_level, latency / std.time.ns_per_ms },
+                    "[simple] compacted {d} keys from level {d} to level {d} in {d:.2} ms",
+                    .{ keys_compacted, level, next_level, duration_ms },
                 );
 
                 try tm.stats.setCustomMetric("last_compaction_duration_ns", latency);
@@ -763,6 +756,8 @@ pub const SSTableStore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // TODO: Update to make sure we iterate over the most recent sstable for
+        // each level
         for (0..self.num_levels) |level| {
             for (self.levels.items[level].items) |sstable| {
                 if (try sstable.read(key)) |kv| {
@@ -832,6 +827,8 @@ pub const SSTableStore = struct {
     }
 
     pub fn flush(self: *Self, alloc: Allocator, mtable: *Memtable) !void {
+        if (mtable.size() == 0) return;
+
         const start_time = std.time.nanoTimestamp();
 
         var sstable = try SSTable.init(alloc, 0, self.opts);
@@ -848,7 +845,7 @@ pub const SSTableStore = struct {
         defer alloc.free(filename);
 
         const sz = mtable.size() * 10;
-        const out_file = try file_utils.openAndTruncate(filename, sz);
+        const out_file = try file_utils.openWithCapacity(filename, sz);
 
         try sstable.open(out_file);
 
@@ -872,9 +869,7 @@ pub const SSTableStore = struct {
         }
 
         if (keys_written > 0) {
-            // try sstable.block.freeze();
-
-            _ = sstable.block.flush();
+            try sstable.block.flush();
 
             sstable.file.sync() catch |err| {
                 std.log.err(
@@ -1005,11 +1000,11 @@ test "SSTableStore open" {
         defer alloc.free(filename0);
 
         const sz0 = 1024; // Initial size
-        const out_file0 = try file_utils.openAndTruncate(filename0, sz0);
+        const out_file0 = try file_utils.openWithCapacity(filename0, sz0);
         try table0.open(out_file0);
 
         _ = try table0.write(try KV.initOwned(alloc, "key0", "value0"));
-        _ = try table0.write(try KV.initOwned(alloc, "key0", "value0"));
+        _ = try table0.write(try KV.initOwned(alloc, "key1", "value1"));
 
         try store.add(table0, 0);
         _ = table0.release();
@@ -1025,7 +1020,7 @@ test "SSTableStore open" {
         defer alloc.free(filename1);
 
         const sz1 = 1024; // Initial size
-        const out_file1 = try file_utils.openAndTruncate(filename1, sz1);
+        const out_file1 = try file_utils.openWithCapacity(filename1, sz1);
         try table1.open(out_file1);
 
         _ = try table1.write(try KV.initOwned(alloc, "key1", "value1"));
@@ -1036,7 +1031,7 @@ test "SSTableStore open" {
         // Persist tables to disk
         for (0..2) |level| {
             for (store.get(level)) |table| {
-                _ = table.block.flush();
+                try table.block.flush();
 
                 try table.file.sync();
 

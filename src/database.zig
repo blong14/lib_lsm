@@ -43,12 +43,8 @@ pub const Database = struct {
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        // Create WAL path for the initial memtable
-        const wal_path = try std.fmt.allocPrint(alloc, "{s}/wal_{s}.dat", .{ opts.data_dir, new_id });
-        defer alloc.free(wal_path);
-
-        const mtable = Memtable.initWithWAL(alloc, new_id, wal_path) catch |err| {
-            std.log.err("unable to init memtable with WAL {s}", .{@errorName(err)});
+        const mtable = Memtable.init(alloc, new_id) catch |err| {
+            std.log.err("unable to init memtable {s}", .{@errorName(err)});
             return err;
         };
         errdefer {
@@ -106,18 +102,17 @@ pub const Database = struct {
             return err;
         };
 
+        var count: usize = 0;
         for (0..self.sstables.num_levels) |lvl| {
             for (self.sstables.get(lvl)) |sstable| {
                 var siter = try sstable.iterator(alloc);
                 defer siter.deinit();
 
-                // For recovery, create memtables without WAL since they're already persisted
                 const nxt_table = try Memtable.init(alloc, sstable.id);
                 while (siter.next()) |nxt| {
-                    var k = try nxt.clone(alloc);
-                    defer k.deinit(alloc);
-
+                    const k = try nxt.clone(alloc);
                     try nxt_table.put(k);
+                    count += 1;
                 }
 
                 nxt_table.isFlushed.store(true, .seq_cst);
@@ -127,42 +122,22 @@ pub const Database = struct {
             }
         }
 
-        std.log.info("database opened @ {s} w/ {d} warm tables", .{ self.opts.data_dir, self.mtables.items.len });
+        std.log.info(
+            "database opened @ {s} w/ {d} warm tables and {d} total keys",
+            .{ self.opts.data_dir, self.mtables.items.len, count },
+        );
     }
 
     pub fn read(self: *Self, key: []const u8) !?KV {
-        // MVCC Readiness: This implementation is well-positioned for multiversion concurrency control.
-        // Key MVCC foundations already present:
-        // 1. Timestamp-based versioning in KV pairs for conflict resolution
-        // 2. Immutable memtables (via freeze) supporting snapshot isolation
-        // 3. Point-in-time snapshots via snapshot_tables array
-        // 4. Latest version resolution by timestamp comparison
-        // The read path provides snapshot isolation by capturing a consistent view of memtables.
-
         var latest_kv: ?KV = null;
         var latest_timestamp: i128 = std.math.minInt(i128);
 
-        // Check hot table first (most likely to contain recent data)
-        const hot_table = self.mtable.load(.acquire); // Use acquire for better performance
+        const hot_table = self.mtable.load(.acquire);
         if (try hot_table.get(key)) |kv| {
             latest_kv = kv;
             latest_timestamp = kv.timestamp;
         }
 
-        // Early return if we found the key in hot table and it's very recent
-        // This optimization assumes recent writes are more likely to be queried
-        if (latest_kv != null and (std.time.nanoTimestamp() - latest_timestamp) < 1_000_000_000) { // 1 second
-            // Still check one level down for completeness, but with fast path
-            self.mtables_mutex.lock();
-            const has_warm_tables = self.mtables.items.len > 0;
-            self.mtables_mutex.unlock();
-
-            if (!has_warm_tables) {
-                return latest_kv;
-            }
-        }
-
-        // Use stack allocation for small table counts to avoid heap allocation
         var stack_snapshot: [16]*Memtable = undefined;
         var snapshot_tables: []*Memtable = undefined;
         var table_count: usize = 0;
@@ -173,24 +148,22 @@ pub const Database = struct {
 
             table_count = self.mtables.items.len;
             if (table_count <= stack_snapshot.len) {
-                // Use stack allocation for small counts
                 snapshot_tables = stack_snapshot[0..table_count];
                 @memcpy(snapshot_tables, self.mtables.items);
             } else {
-                // Fall back to arena allocation for large counts
+                // TODO: Update the allocator here
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 const temp_alloc = arena.allocator();
 
                 snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
                     std.log.err("Failed to allocate snapshot tables array {s}", .{@errorName(err)});
-                    return latest_kv; // Return what we have so far
+                    return latest_kv;
                 };
                 @memcpy(snapshot_tables, self.mtables.items);
             }
         }
 
-        // Search warm tables in reverse order (newer first) for better cache locality
         var i = table_count;
         while (i > 0) {
             i -= 1;
@@ -199,21 +172,9 @@ pub const Database = struct {
                 if (latest_kv == null or kv.timestamp > latest_timestamp) {
                     latest_timestamp = kv.timestamp;
                     latest_kv = kv;
-                    // Early exit if we found a very recent entry
-                    if ((std.time.nanoTimestamp() - latest_timestamp) < 100_000_000) { // 100ms
-                        break;
-                    }
                 }
             }
         }
-
-        // TODO: Add bloom filter check before SSTable reads
-        // if (try self.sstables.read(key)) |kv| {
-        //     if (latest_kv == null or kv.timestamp > latest_timestamp) {
-        //         latest_timestamp = kv.timestamp;
-        //         latest_kv = kv;
-        //     }
-        // }
 
         return latest_kv;
     }
@@ -246,7 +207,6 @@ pub const Database = struct {
             try merger.add(hot_iter);
         }
 
-        // Use arena allocator for safe snapshot management
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const temp_alloc = arena.allocator();
@@ -276,11 +236,6 @@ pub const Database = struct {
             const warm_iter = try mtable.iterator(alloc);
             try merger.add(warm_iter);
         }
-
-        // TODO: Add this back
-        //
-        //const siter = try self.sstables.iterator(alloc);
-        //try merger.add(siter);
 
         const wrapper = try alloc.create(MergeIteratorWrapper);
         errdefer alloc.destroy(wrapper);
@@ -386,11 +341,7 @@ pub const Database = struct {
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        // Create WAL path for the new memtable
-        const wal_path = try std.fmt.allocPrint(alloc, "{s}/wal_{s}.dat", .{ self.opts.data_dir, new_id });
-        defer alloc.free(wal_path);
-
-        const nxt_table = try Memtable.initWithWAL(alloc, new_id, wal_path);
+        const nxt_table = try Memtable.init(alloc, new_id);
 
         try self.mtables.append(mtable);
 
