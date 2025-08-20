@@ -81,6 +81,11 @@ export fn lsm_init() ?*anyopaque {
     return init(allocator, opts) catch return null;
 }
 
+export fn lsm_init_with_config(addr: *anyopaque) ?*anyopaque {
+    const opts: *Opts = @ptrCast(@alignCast(addr));
+    return init(allocator, opts.*) catch return null;
+}
+
 export fn lsm_read(addr: *anyopaque, k: [*c]const u8) [*c]const u8 {
     const db: *Database = @ptrCast(@alignCast(addr));
     const key = std.mem.span(k);
@@ -139,18 +144,7 @@ export fn lsm_deinit(addr: *anyopaque) bool {
     return true;
 }
 
-test "defaultDatabase creates database with default options" {
-    const db = try defaultDatabase(std.testing.allocator);
-    defer {
-        db.deinit(std.testing.allocator);
-        std.testing.allocator.destroy(db);
-    }
-
-    try std.testing.expect(db.capacity > 0);
-    try std.testing.expect(db.opts.data_dir.len > 0);
-}
-
-test "databaseFromOpts creates database with custom options" {
+test "C interface lsm_init_with_config" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -159,15 +153,14 @@ test "databaseFromOpts creates database with custom options" {
     const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
     defer testDir.dir.deleteTree(dir_name) catch {};
 
-    const opts = withDataDirOpts(dir_name);
-    const db = try databaseFromOpts(alloc, opts);
-    defer {
-        db.deinit(alloc);
-        alloc.destroy(db);
-    }
+    var opts = withDataDirOpts(dir_name);
+    const db = lsm_init_with_config(&opts);
 
-    try std.testing.expect(db.capacity > 0);
-    try std.testing.expectEqualStrings(dir_name, db.opts.data_dir);
+    const actual: *Database = @ptrCast(@alignCast(db));
+
+    try std.testing.expect(actual.capacity > 0);
+    try std.testing.expectEqualStrings(dir_name, actual.opts.data_dir);
+    try std.testing.expect(lsm_deinit(db.?));
 }
 
 test "C interface lsm_write with invalid data returns false" {
@@ -208,4 +201,47 @@ test "C interface lsm_read with non-existent key returns null" {
 
     const result = lsm_read(db, "non_existent_key");
     try std.testing.expect(result == null);
+}
+
+test "C interface lsm_scan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = std.testing.tmpDir(.{});
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const opts = withDataDirOpts(dir_name);
+    const db = try Database.init(alloc, opts);
+    defer {
+        db.deinit(alloc);
+        alloc.destroy(db);
+    }
+
+    const keys = [_]KV{
+        try KV.initOwned(alloc, "__key_c__", "__key_c__"),
+        try KV.initOwned(alloc, "__key_b__", "__key_b__"),
+        try KV.initOwned(alloc, "__key_a__", "__key_a__"),
+    };
+    for (keys) |expected| {
+        try db.write(expected);
+    }
+
+    const scanner = lsm_scan(db, "__key_a__", "__key_c__");
+
+    try std.testing.expectEqualStrings(
+        "__key_a__",
+        std.mem.span(lsm_iter_next(scanner.?)),
+    );
+    try std.testing.expectEqualStrings(
+        "__key_b__",
+        std.mem.span(lsm_iter_next(scanner.?)),
+    );
+    try std.testing.expectEqualStrings(
+        "__key_c__",
+        std.mem.span(lsm_iter_next(scanner.?)),
+    );
+    try std.testing.expectEqual(null, lsm_iter_next(scanner.?));
+    try std.testing.expect(lsm_iter_deinit(scanner.?));
 }
