@@ -138,6 +138,12 @@ pub const Database = struct {
             latest_timestamp = kv.timestamp;
         }
 
+        // TODO: Update the allocator here
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        const temp_alloc = arena.allocator();
+
         var stack_snapshot: [16]*Memtable = undefined;
         var snapshot_tables: []*Memtable = undefined;
         var table_count: usize = 0;
@@ -151,11 +157,6 @@ pub const Database = struct {
                 snapshot_tables = stack_snapshot[0..table_count];
                 @memcpy(snapshot_tables, self.mtables.items);
             } else {
-                // TODO: Update the allocator here
-                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                defer arena.deinit();
-                const temp_alloc = arena.allocator();
-
                 snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
                     std.log.err("Failed to allocate snapshot tables array {s}", .{@errorName(err)});
                     return latest_kv;
@@ -164,14 +165,16 @@ pub const Database = struct {
             }
         }
 
-        var i = table_count;
-        while (i > 0) {
-            i -= 1;
-            const table = snapshot_tables[i];
-            if (try table.get(key)) |kv| {
-                if (latest_kv == null or kv.timestamp > latest_timestamp) {
-                    latest_timestamp = kv.timestamp;
-                    latest_kv = kv;
+        if (table_count > 0) {
+            var i = table_count;
+            while (i > 0) {
+                i -= 1;
+                const table = snapshot_tables[i];
+                if (try table.get(key)) |kv| {
+                    if (latest_kv == null or kv.timestamp > latest_timestamp) {
+                        latest_timestamp = kv.timestamp;
+                        latest_kv = kv;
+                    }
                 }
             }
         }

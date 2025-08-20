@@ -44,7 +44,6 @@ const BlockMeta = struct {
 
         const first_key_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
         if (first_key_len == 0 or first_key_len > max_key_size) {
-            std.debug.print("block meta decode key len error\n", .{});
             return error.InvalidKeyLength;
         }
 
@@ -62,7 +61,6 @@ const BlockMeta = struct {
 
         const last_key_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
         if (last_key_len == 0 or last_key_len > max_key_size) {
-            std.debug.print("block meta decode key len error\n", .{});
             return error.InvalidKeyLength;
         }
 

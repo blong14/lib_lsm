@@ -10,10 +10,13 @@ const Allocator = std.mem.Allocator;
 
 const DatabaseSupervisor = spv.DatabaseSupervisor;
 const Iterator = iter.Iterator;
+const WAL = @import("wal.zig").WAL;
 
 const allocator = jemalloc.allocator;
 
 var supervisor: *DatabaseSupervisor = undefined;
+
+var wal: *WAL = undefined;
 
 // Public Interface
 
@@ -35,25 +38,30 @@ pub fn databaseFromOpts(alloc: Allocator, opts: Opts) !*Database {
 pub fn init(alloc: Allocator, opts: Opts) !*Database {
     const db = try databaseFromOpts(alloc, opts);
 
-    try db.open(allocator);
+    try db.open(alloc);
 
     supervisor = try DatabaseSupervisor.init(
-        allocator,
+        alloc,
         db,
         .{},
     );
-
     try supervisor.start();
+
+    // wal = try alloc.create(WAL);
+    // wal.* = try WAL.init(alloc, .{ .Dir = opts.data_dir });
 
     return db;
 }
 
-pub fn deinit(db: *Database) void {
+pub fn deinit(alloc: Allocator, db: *Database) void {
     supervisor.stop();
     supervisor.deinit();
 
-    db.deinit(allocator);
-    allocator.destroy(db);
+    // wal.deinit(alloc) catch unreachable;
+    // alloc.destroy(wal);
+
+    db.deinit(alloc);
+    alloc.destroy(db);
 }
 
 pub fn read(db: *Database, key: []const u8) !?KV {
@@ -61,6 +69,7 @@ pub fn read(db: *Database, key: []const u8) !?KV {
 }
 
 pub fn write(db: *Database, kv: KV) !void {
+    // try wal.write(allocator, kv);
     try db.write(kv);
     supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
 }
@@ -125,7 +134,7 @@ export fn lsm_iter_deinit(addr: *anyopaque) bool {
 export fn lsm_deinit(addr: *anyopaque) bool {
     const db: *Database = @ptrCast(@alignCast(addr));
 
-    deinit(db);
+    deinit(allocator, db);
 
     return true;
 }

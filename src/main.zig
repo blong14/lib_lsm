@@ -88,6 +88,7 @@ pub fn main() !void {
     } else if (res.args.bench != 0) {
         benchmark(allocator, db);
     } else if (res.args.perf != 0) {
+        // benchmark(allocator, db);
         write(allocator, db, res.args.input.?);
         read(allocator, db, res.args.input.?);
     } else {
