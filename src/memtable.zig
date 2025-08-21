@@ -1,9 +1,7 @@
 const std = @import("std");
 
-const ba = @import("bump_allocator.zig");
 const keyvalue = @import("kv.zig");
 const iter = @import("iterator.zig");
-const options = @import("opts.zig");
 const skl = @import("skiplist.zig");
 
 const Allocator = std.mem.Allocator;
@@ -11,50 +9,61 @@ const AtomicValue = std.atomic.Value;
 
 const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
-const Opts = options.Opts;
 const SkipList = skl.SkipList;
 
-const KeyValueSkipList = SkipList(KV, keyvalue.decode, keyvalue.encode);
+pub fn decodeInternalKey(a: []const u8) anyerror![]const u8 {
+    return a;
+}
+
+const KeyValueSkipList = SkipList(KV, keyvalue.decode);
+const KeyValueSkipListIndex = SkipList([]const u8, decodeInternalKey);
 
 pub const Memtable = struct {
     init_alloc: Allocator,
-    cap: usize,
     id: []const u8,
-    opts: Opts,
-
     byte_count: AtomicValue(usize),
-    data: AtomicValue(*KeyValueSkipList),
+
+    data: *KeyValueSkipList,
+    user_key_index: KeyValueSkipListIndex,
+
     mutable: AtomicValue(bool),
     isFlushed: AtomicValue(bool),
 
     const Self = @This();
 
-    pub fn init(alloc: Allocator, id: []const u8, opts: Opts) !*Self {
-        const cap = opts.sst_capacity;
-
+    pub fn init(alloc: Allocator, id: []const u8) !*Self {
         const id_copy = try alloc.alloc(u8, id.len);
+        errdefer alloc.free(id_copy);
+
         @memcpy(id_copy, id);
 
         const map = try alloc.create(KeyValueSkipList);
+        errdefer alloc.destroy(map);
+
         map.* = try KeyValueSkipList.init();
 
         const mtable = try alloc.create(Self);
+        errdefer alloc.destroy(mtable);
+
         mtable.* = .{
             .init_alloc = alloc,
-            .cap = cap,
             .id = id_copy,
-            .opts = opts,
+            .data = map,
+            .user_key_index = try KeyValueSkipListIndex.init(),
             .byte_count = AtomicValue(usize).init(0),
-            .data = AtomicValue(*KeyValueSkipList).init(map),
             .mutable = AtomicValue(bool).init(true),
             .isFlushed = AtomicValue(bool).init(false),
         };
+
         return mtable;
     }
 
     pub fn deinit(self: *Self) void {
-        const data = self.data.load(.acquire);
-        self.init_alloc.destroy(data);
+        self.user_key_index.deinit();
+
+        self.data.deinit();
+        self.init_alloc.destroy(self.data);
+
         self.init_alloc.free(self.id);
         self.* = undefined;
     }
@@ -63,52 +72,26 @@ pub const Memtable = struct {
         return self.id;
     }
 
-    pub fn put(self: *Self, alloc: Allocator, item: KV) !void {
-        if (!self.mutable.load(.acquire)) {
-            return error.MemtableImmutable;
-        }
+    pub fn put(self: *Self, item: KV) !void {
+        if (self.frozen()) return error.MemtableImmutable;
+        if (item.key.len == 0) return error.InvalidKey;
 
-        // We create a unique key for every valid put operation in the format
-        // {user_key}_{timestamp}. This allows us to maintain multiple versions
-        // of the same user key with different timestamps.
-        const key = try item.internalKey(alloc);
-        defer alloc.free(key);
-
-        var data = self.data.load(.acquire);
-        try data.put(alloc, key, item);
+        try self.user_key_index.put(item.userKey(), item.internalKey());
+        try self.data.put(item.internalKey(), item.raw_bytes);
 
         _ = self.byte_count.fetchAdd(item.len(), .release);
     }
 
-    pub fn get(self: Self, alloc: Allocator, key: []const u8) ?KV {
-        const data = self.data.load(.acquire);
+    pub fn get(self: *Self, user_key: []const u8) !?KV {
+        if (user_key.len == 0) return null;
 
-        var iter_obj = data.iterator(alloc) catch return null;
-        defer iter_obj.deinit();
+        const internal_key_opt = try self.user_key_index.get(user_key);
 
-        var latest_kv: ?KV = null;
-        var latest_timestamp: i128 = std.math.minInt(i128);
-
-        while (iter_obj.next()) |kv| {
-            if (std.mem.eql(u8, kv.userKey(), key)) {
-                const timestamp = kv.timestamp;
-
-                if (timestamp > latest_timestamp) {
-                    latest_kv = kv;
-                    latest_timestamp = timestamp;
-                }
-            }
-        }
-
-        if (latest_kv) |kv| {
-            return kv.clone(alloc) catch return null;
+        if (internal_key_opt) |internal_key| {
+            return try self.data.get(internal_key);
         }
 
         return null;
-    }
-
-    pub fn count(self: Self) usize {
-        return self.data.load(.acquire).count();
     }
 
     pub fn freeze(self: *Self) void {
@@ -148,7 +131,13 @@ pub const Memtable = struct {
 
     pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
         const it = try alloc.create(MemtableIterator);
-        it.* = .{ .alloc = alloc, .iter = try self.data.load(.acquire).iterator(alloc) };
+        errdefer alloc.destroy(it);
+
+        it.* = .{
+            .alloc = alloc,
+            .iter = try self.data.iterator(alloc),
+        };
+
         return Iterator(KV).init(it, MemtableIterator.next, MemtableIterator.deinit);
     }
 };
@@ -157,26 +146,29 @@ test Memtable {
     const testing = std.testing;
     const alloc = testing.allocator;
     // given
-    var mtable = try Memtable.init(alloc, "0", options.defaultOpts());
+    var mtable = try Memtable.init(alloc, "0");
     defer alloc.destroy(mtable);
     defer mtable.deinit();
 
     // when
-    const kv = KV.init("__key__", "__value__");
+    var kv = try KV.initOwned(alloc, "__key__", "__value__");
+    defer kv.deinit(alloc);
 
-    try mtable.put(alloc, kv);
+    try mtable.put(kv);
 
-    var actual = mtable.get(alloc, "__key__");
-    defer actual.?.deinit(alloc);
+    const actual = try mtable.get("__key__");
 
     // then
     try testing.expectEqualStrings(kv.value, actual.?.value);
+    try testing.expectEqual(keyvalue.KVOwnership.borrowed, actual.?.ownership);
 
-    const kv2 = KV.init("__key__", "__updated_value__");
-    try mtable.put(alloc, kv2);
+    var kv2 = try KV.initOwned(alloc, "__key__", "__updated_value__");
+    defer kv2.deinit(alloc);
 
-    var latest = mtable.get(alloc, "__key__");
-    defer latest.?.deinit(alloc);
+    try mtable.put(kv2);
+
+    const latest = try mtable.get("__key__");
 
     try testing.expectEqualStrings("__updated_value__", latest.?.value);
+    try testing.expectEqual(keyvalue.KVOwnership.borrowed, latest.?.ownership);
 }

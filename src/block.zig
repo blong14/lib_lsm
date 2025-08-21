@@ -6,7 +6,6 @@ const options = @import("opts.zig");
 
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const FixedBuffer = std.io.FixedBufferStream;
 
 const KV = keyvalue.KV;
 const MMap = map.AppendOnlyMMap;
@@ -16,268 +15,334 @@ const Endian = std.builtin.Endian.little;
 const PageSize = std.mem.page_size;
 
 const assert = std.debug.assert;
-const bufferedWriter = std.io.bufferedWriter;
-const fixedBufferStream = std.io.fixedBufferStream;
 const print = std.debug.print;
+const copyBackwards = std.mem.copyBackwards;
+const fixedBufferStream = std.io.fixedBufferStream;
 const writeInt = std.mem.writeInt;
+const readInt = std.mem.readInt;
 
-/// meta_data[len,kvlen1,key,kvlen2,key]
+/// BlockMeta represents metadata for a block containing key-value pairs.
 const BlockMeta = struct {
-    len: u64,
     first_key: []const u8,
     last_key: []const u8,
+    count: u64,
 
     const Self = @This();
 
-    pub fn init(first_key: []const u8, last_key: []const u8) Self {
-        return .{
-            .len = @sizeOf(u64) + @sizeOf(u64) + first_key.len + @sizeOf(u64) + last_key.len,
-            .first_key = first_key,
-            .last_key = last_key,
-        };
+    pub fn encode(self: Self, writer: anytype) !void {
+        try writer.writeInt(u64, self.first_key.len, Endian);
+        try writer.writeAll(self.first_key);
+        try writer.writeInt(u64, self.last_key.len, Endian);
+        try writer.writeAll(self.last_key);
+        try writer.writeInt(u64, self.count, Endian);
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {
-        var stream = fixedBufferStream(data);
-        var data_reader = stream.reader();
+        const max_key_size = 1024 * 1024; // 1MB
 
-        self.*.len = try data_reader.readInt(u64, Endian);
+        var offset: usize = 0;
 
-        const first_key_len = try data_reader.readInt(u64, Endian);
-        assert(first_key_len > 0);
+        const first_key_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
+        if (first_key_len == 0 or first_key_len > max_key_size) {
+            return error.InvalidKeyLength;
+        }
 
-        self.*.first_key = stream.buffer[stream.pos..][0..first_key_len];
+        offset += @sizeOf(u64);
+        if (offset + first_key_len > data.len) {
+            return error.InvalidData;
+        }
 
-        stream.pos += first_key_len;
+        self.*.first_key = data[offset .. offset + first_key_len];
 
-        const last_key_len = try data_reader.readInt(u64, Endian);
-        assert(last_key_len > 0);
+        offset += first_key_len;
+        if (offset + @sizeOf(u64) > data.len) {
+            return error.InvalidData;
+        }
 
-        self.*.last_key = stream.buffer[stream.pos..][0..last_key_len];
+        const last_key_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
+        if (last_key_len == 0 or last_key_len > max_key_size) {
+            return error.InvalidKeyLength;
+        }
+
+        offset += @sizeOf(u64);
+        if (offset + @sizeOf(u64) > data.len) {
+            return error.InvalidData;
+        }
+
+        self.*.last_key = data[offset .. offset + last_key_len];
+
+        offset += last_key_len;
+        if (offset + @sizeOf(u64) > data.len) {
+            return error.InvalidData;
+        }
+
+        self.*.count = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
     }
 
-    pub fn encodeAlloc(self: Self, alloc: Allocator) ![]const u8 {
-        const buf = try alloc.alloc(u8, self.len);
-        return try self.encode(buf);
-    }
-
-    pub fn encode(self: Self, buf: []u8) ![]u8 {
-        assert(self.len <= buf.len);
-
-        var stream = fixedBufferStream(buf);
-        var data_writer = stream.writer();
-
-        try data_writer.writeInt(u64, self.len, Endian);
-        try data_writer.writeInt(u64, self.first_key.len, Endian);
-        _ = try data_writer.write(self.first_key);
-        try data_writer.writeInt(u64, self.last_key.len, Endian);
-        _ = try data_writer.write(self.last_key);
-
-        return buf[0..self.len];
+    pub fn encodedSize(self: Self) usize {
+        return @sizeOf(u64) * 3 + self.first_key.len + self.last_key.len;
     }
 };
 
-/// block[meta_data, data]
-/// meta_data[len,kvlen1,key,kvlen2,key]
-/// data[count,offset1,offset2,kv1,kv2]
+/// Block represents a storage unit containing key-value pairs with metadata.
+/// Similar to FixedBufferStream but specialized for KV operations.
 pub const Block = struct {
-    alloc: Allocator,
-    byte_count: usize,
-    capacity: u64,
+    /// Buffer containing the block data
+    buffer: []align(PageSize) u8,
+    /// Current position for writing
+    pos: usize,
+    /// Number of KV pairs stored
     count: u64,
-    meta_data: ArrayList(u8),
-    offset_data: ArrayList(u8),
-    data: ArrayList(u8),
+    /// First key in the block (for range queries)
+    first_key: ?[]const u8,
+    /// Last key in the block (for range queries)
+    last_key: ?[]const u8,
+
+    pub const ReadError = error{
+        IndexOutOfBounds,
+        CorruptedData,
+        InvalidOffset,
+    };
+
+    pub const WriteError = error{
+        NoSpaceLeft,
+        BufferFull,
+    };
 
     const Self = @This();
 
-    const Error = error{
-        BlockReadError,
-        BlockWriteError,
-    };
-
-    pub fn init(allocator: Allocator, capacity: u64) !*Self {
-        const meta_data = try ArrayList(u8).initCapacity(allocator, capacity);
-        const offset_data = try ArrayList(u8).initCapacity(allocator, capacity);
-        const block_data = try ArrayList(u8).initCapacity(allocator, capacity);
-
-        const block = try allocator.create(Self);
-        block.* = .{
-            .alloc = allocator,
-            .byte_count = 0,
-            .capacity = capacity,
+    /// Initialize a new block with the given allocator and buffer
+    pub fn init(allocator: Allocator, buffer: []align(PageSize) u8) Self {
+        _ = allocator; // allocator parameter for API compatibility
+        return .{
+            .buffer = buffer,
+            .pos = 0,
             .count = 0,
-            .meta_data = meta_data,
-            .offset_data = offset_data,
-            .data = block_data,
+            .first_key = null,
+            .last_key = null,
         };
-        return block;
     }
 
-    pub fn deinit(self: *Self) void {
-        self.meta_data.deinit();
-        self.offset_data.deinit();
-        self.data.deinit();
-        self.* = undefined;
+    /// Initialize a block from existing data
+    pub fn initFromData(alloc: Allocator, buffer: []align(PageSize) u8) !*Self {
+        const blck = try alloc.create(Self);
+        blck.* = Self.init(alloc, buffer);
+
+        if (buffer.len == 0) return blck;
+
+        var meta: BlockMeta = undefined;
+        try meta.decode(buffer);
+
+        blck.*.count = meta.count;
+        blck.*.first_key = meta.first_key;
+        blck.*.last_key = meta.last_key;
+
+        // Skip to end of data
+        blck.*.pos = buffer.len - (blck.count * @sizeOf(u64));
+
+        return blck;
     }
 
-    pub fn blockMeta(self: Self) !BlockMeta {
-        var meta_data: BlockMeta = undefined;
-        try meta_data.decode(self.meta_data.items[0..]);
-        return meta_data;
-    }
+    /// Write a KV pair to the block
+    pub fn write(self: *Self, kv: KV) WriteError!usize {
+        if (kv.raw_bytes.len == 0) return WriteError.BufferFull;
 
-    pub fn read(self: *Self, idx: usize) !KV {
-        var kv: KV = undefined;
-        try kv.decode(self.data.items[idx..]);
-        return kv;
-    }
+        const kv_size = kv.raw_bytes.len;
+        const offset_size = @sizeOf(u64);
+        const meta_size = if (self.count == 0) self.estimateMetaSize(kv.key, kv.key) else 0;
 
-    pub fn write(self: *Self, kv: KV) !usize {
-        var offset_data_writer = self.offset_data.writer();
-
-        const offset = self.data.items.len;
-        try offset_data_writer.writeInt(u64, offset, Endian);
-
-        const data_writer = self.data.writer();
-
-        const encoded_kv = try kv.encodeAlloc(self.alloc);
-        defer self.alloc.free(encoded_kv);
-
-        const byte_count = try data_writer.write(encoded_kv);
-        assert(byte_count == encoded_kv.len);
-
-        self.*.count += 1;
-        self.*.byte_count += @sizeOf(u64) + byte_count;
-
-        return offset;
-    }
-
-    pub fn size(self: Self) u64 {
-        const meta_data_count = self.meta_data.items.len;
-        const offset_count = self.offset_data.items.len;
-        const data_count = self.data.items.len;
-
-        return @sizeOf(u64) + @sizeOf(u64) + meta_data_count + @sizeOf(u64) + offset_count + data_count;
-    }
-
-    pub fn flush(self: *Self, stream: *FixedBuffer([]align(PageSize) u8)) !usize {
-        const total_bytes = self.size();
-        if (total_bytes > stream.buffer.len) {
-            print(
-                "flush error: trying to write {d} bytes into {d}\n",
-                .{ total_bytes, stream.buffer.len },
-            );
-            return error.BlockWriteError;
+        if (self.pos + kv_size + offset_size + meta_size > self.buffer.len) {
+            return WriteError.NoSpaceLeft;
         }
 
-        var block_size: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-        writeInt(std.math.ByteAlignedInt(u64), &block_size, total_bytes, Endian);
+        const kv_offset = self.pos;
 
-        var meta_data_size: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-        writeInt(std.math.ByteAlignedInt(u64), &meta_data_size, self.meta_data.items.len, Endian);
+        @memcpy(self.buffer[self.pos..][0..kv_size], kv.raw_bytes);
+        self.pos += kv_size;
 
-        var count: [@divExact(@typeInfo(u64).Int.bits, 8)]u8 = undefined;
-        writeInt(std.math.ByteAlignedInt(u64), &count, self.count, Endian);
+        const offset_pos = self.buffer.len - ((self.count + 1) * offset_size);
+        writeInt(u64, self.buffer[offset_pos..][0..offset_size], kv_offset, Endian);
 
-        var bytes = try stream.write(&block_size);
-        bytes += try stream.write(&meta_data_size);
-        bytes += try stream.write(self.meta_data.items);
-        bytes += try stream.write(&count);
-        bytes += try stream.write(self.offset_data.items);
-        bytes += try stream.write(self.data.items);
+        if (self.first_key == null) self.*.first_key = kv.key;
+        self.*.last_key = kv.key;
 
-        return bytes;
+        const index = self.count;
+        self.count += 1;
+
+        return index;
     }
 
-    pub fn freeze(self: *Self) !void {
-        var offset_data_stream = fixedBufferStream(self.offset_data.items);
-        var offset_data_reader = offset_data_stream.reader();
+    /// Read a KV pair by index
+    pub fn read(self: *const Self, index: usize) ReadError!KV {
+        if (index >= self.count) {
+            return ReadError.IndexOutOfBounds;
+        }
 
-        const first_kv = try self.read(0);
+        const offset_size = @sizeOf(u64);
+        const offset_pos = self.buffer.len - ((index + 1) * offset_size);
 
-        try offset_data_reader.skipBytes((self.count - 1) * @sizeOf(u64), .{});
-        const last_key_offset = try offset_data_reader.readInt(u64, Endian);
-        const last_kv = try self.read(last_key_offset);
+        if (offset_pos < self.pos) {
+            return ReadError.InvalidOffset;
+        }
 
-        const block_meta_data = BlockMeta.init(first_kv.key, last_kv.key);
+        const offset_bytes = self.buffer[offset_pos..][0..offset_size];
+        const kv_offset = readInt(u64, offset_bytes, Endian);
 
-        const meta_data = try block_meta_data.encodeAlloc(self.alloc);
-        defer self.alloc.free(meta_data);
+        if (kv_offset >= self.pos) {
+            return ReadError.InvalidOffset;
+        }
 
-        try self.meta_data.appendSlice(meta_data[0..]);
+        return keyvalue.decode(self.buffer[kv_offset..]) catch ReadError.CorruptedData;
     }
 
-    pub fn decode(self: *Self, stream: *FixedBuffer([]align(PageSize) u8)) !usize {
-        var stream_reader = stream.reader();
+    /// Get the number of KV pairs in the block
+    pub fn len(self: Self) u64 {
+        return self.count;
+    }
 
-        const meta_data_start = try stream.getPos();
+    /// Get the current size of data in the block
+    pub fn size(self: Self) usize {
+        return self.pos + (self.count * @sizeOf(u64));
+    }
 
-        const meta_data_len = try stream_reader.readInt(u64, Endian);
-        assert(meta_data_len > 0);
+    /// Check if the block is empty
+    pub fn isEmpty(self: Self) bool {
+        return self.count == 0;
+    }
 
-        const meta_data = stream.buffer[meta_data_start..meta_data_len];
+    /// Reset the block to empty state
+    pub fn reset(self: *Self) void {
+        self.pos = 0;
+        self.count = 0;
+        self.first_key = null;
+        self.last_key = null;
+    }
 
-        try self.meta_data.appendSlice(meta_data);
+    /// Flush metadata to the beginning of the buffer
+    pub fn flush(self: *Self) WriteError!void {
+        if (self.count == 0) return;
 
-        stream.pos += meta_data_len;
+        const meta = BlockMeta{
+            .first_key = self.first_key.?,
+            .last_key = self.last_key.?,
+            .count = self.count,
+        };
 
-        self.*.count = try stream_reader.readInt(u64, Endian);
+        const meta_size = meta.encodedSize();
+        if (meta_size == 0 or (meta_size > self.buffer.len - self.size())) {
+            return WriteError.NoSpaceLeft;
+        }
 
-        const offset_len = self.count * @sizeOf(u64);
-        const offset_data = stream.buffer[stream.pos..][0..offset_len];
+        const data_size = self.pos;
+        copyBackwards(u8, self.buffer[meta_size..][0..data_size], self.buffer[0..data_size]);
 
-        try self.offset_data.appendSlice(offset_data);
+        // Write metadata at the beginning
+        var stream = fixedBufferStream(self.buffer[0..meta_size]);
 
-        stream.pos += offset_len;
+        const writer = stream.writer();
+        try meta.encode(writer);
 
-        try self.data.appendSlice(stream.buffer[stream.pos..]);
+        const offset_size = @sizeOf(u64);
+        for (0..self.count) |i| {
+            const offset_pos = self.buffer.len - ((i + 1) * offset_size);
+            const offset_bytes = self.buffer[offset_pos..][0..offset_size];
+            const old_offset = readInt(u64, offset_bytes, Endian);
+            writeInt(u64, offset_bytes, old_offset + meta_size, Endian);
+        }
 
-        return self.size();
+        self.pos += meta_size;
+    }
+
+    /// Cleanup method for API compatibility with sstable.zig
+    /// Block doesn't allocate memory, so this is a no-op
+    pub fn deinit(self: *Self) void {
+        _ = self; // Block manages a provided buffer, no cleanup needed
+    }
+
+    fn estimateMetaSize(self: Self, first_key: []const u8, last_key: []const u8) usize {
+        _ = self;
+        return @sizeOf(u64) * 3 + first_key.len + last_key.len;
     }
 };
 
-test Block {
+/// Create a block with the given buffer
+pub fn block(buffer: []align(PageSize) u8) Block {
+    return Block.init(std.heap.page_allocator, buffer);
+}
+
+test "Block basic operations" {
     const testing = std.testing;
-    const alloc = testing.allocator;
+    const allocator = testing.allocator;
 
-    {
-        const expected = KV.init("__key__", "__value__");
+    var buffer: [PageSize]u8 align(PageSize) = undefined;
+    var test_block = block(&buffer);
 
-        // given
-        var block = try Block.init(alloc, PageSize);
-        defer alloc.destroy(block);
-        defer block.deinit();
+    var kv1 = try KV.initOwned(allocator, "key1", "value1");
+    defer kv1.deinit(allocator);
 
-        // when
-        const idx = try block.write(expected);
-        const item = try block.read(idx);
+    var kv2 = try KV.initOwned(allocator, "key2", "value2");
+    defer kv2.deinit(allocator);
 
-        // then
-        try testing.expectEqualStrings(expected.key, item.key);
-        try testing.expectEqualStrings(expected.value, item.value);
-        try testing.expectEqual(expected.len(), item.len());
-    }
+    // Test writing
+    const idx1 = try test_block.write(kv1);
+    const idx2 = try test_block.write(kv2);
 
-    {
-        // given
-        var block = try Block.init(alloc, PageSize);
-        defer alloc.destroy(block);
-        defer block.deinit();
+    try testing.expectEqual(@as(usize, 0), idx1);
+    try testing.expectEqual(@as(usize, 1), idx2);
+    try testing.expectEqual(@as(u64, 2), test_block.len());
 
-        const first_kv = KV.init("__key__", "__value__");
-        const last_kv = KV.init("__key_2__", "__value_2__");
+    // Test reading
+    const read_kv1 = try test_block.read(0);
+    const read_kv2 = try test_block.read(1);
 
-        // when
-        _ = try block.write(first_kv);
-        _ = try block.write(last_kv);
+    try testing.expectEqualStrings(kv1.key, read_kv1.key);
+    try testing.expectEqualStrings(kv1.value, read_kv1.value);
+    try testing.expectEqualStrings(kv2.key, read_kv2.key);
+    try testing.expectEqualStrings(kv2.value, read_kv2.value);
 
-        try block.freeze();
+    // Test metadata
+    try testing.expectEqualStrings("key1", test_block.first_key.?);
+    try testing.expectEqualStrings("key2", test_block.last_key.?);
+}
 
-        // then
-        const meta_data = try block.blockMeta();
+test "Block error conditions" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
 
-        try testing.expectEqualStrings(first_kv.key, meta_data.first_key);
-        try testing.expectEqualStrings(last_kv.key, meta_data.last_key);
-    }
+    var small_buffer: [64]u8 align(PageSize) = undefined;
+    var test_block = block(&small_buffer);
+
+    // Test index out of bounds
+    try testing.expectError(Block.ReadError.IndexOutOfBounds, test_block.read(0));
+
+    // Test buffer full
+    var large_kv = try KV.initOwned(
+        allocator,
+        "very_long_key_that_should_not_fit",
+        "very_long_value_that_should_definitely_not_fit_in_small_buffer",
+    );
+    defer large_kv.deinit(allocator);
+
+    try testing.expectError(Block.WriteError.NoSpaceLeft, test_block.write(large_kv));
+}
+
+test "Block reset and reuse" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var buffer: [PageSize]u8 align(PageSize) = undefined;
+    var test_block = block(&buffer);
+
+    var kv = try KV.initOwned(allocator, "test_key", "test_value");
+    defer kv.deinit(allocator);
+
+    _ = try test_block.write(kv);
+    try testing.expectEqual(@as(u64, 1), test_block.len());
+    try testing.expectEqual(false, test_block.isEmpty());
+
+    test_block.reset();
+    try testing.expectEqual(@as(u64, 0), test_block.len());
+    try testing.expectEqual(true, test_block.isEmpty());
+    try testing.expectEqual(@as(?[]const u8, null), test_block.first_key);
+    try testing.expectEqual(@as(?[]const u8, null), test_block.last_key);
 }

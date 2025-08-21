@@ -1,13 +1,12 @@
 const std = @import("std");
 
-const ba = @import("bump_allocator.zig");
-const file = @import("file.zig");
 const iter = @import("iterator.zig");
 const keyvalue = @import("kv.zig");
 const lsm = @import("lib.zig");
 const mtbl = @import("memtable.zig");
 const opt = @import("opts.zig");
 const sst = @import("sstable.zig");
+const store = @import("store.zig");
 const tm = @import("tablemap.zig");
 
 const atomic = std.atomic;
@@ -21,7 +20,6 @@ const AtomicValue = atomic.Value;
 const Mutex = std.Thread.Mutex;
 const Order = math.Order;
 
-const ThreadSafeBumpAllocator = ba.ThreadSafeBumpAllocator;
 const Iterator = iter.Iterator;
 const MergeIterator = iter.MergeIterator;
 const ScanIterator = iter.ScanIterator;
@@ -29,323 +27,13 @@ const KV = keyvalue.KV;
 const Memtable = mtbl.Memtable;
 const Opts = opt.Opts;
 const SSTable = sst.SSTable;
-const SSTableStore = sst.SSTableStore;
-
-var mtx: Mutex = .{};
-
-/// Events that can trigger agent decisions
-pub const DatabaseEvent = union(enum) {
-    write_completed: struct { bytes: u64 },
-    read_completed: struct { bytes: u64 },
-    memtable_frozen: struct { id: []const u8 },
-    sstable_created: struct { level: usize, id: []const u8 },
-    compaction_completed: struct { level: usize, duration_ns: u64 },
-    system_idle: struct { duration_ms: u64 },
-};
-
-/// Actions the agent can decide to take
-pub const AgentAction = union(enum) {
-    flush_memtable: struct { id: []const u8 },
-    compact_level: struct { level: usize },
-    no_action: void,
-};
-
-/// Configurable policy parameters
-pub const AgentPolicy = struct {
-    max_level0_files: u32 = 16,
-    max_unflushed_memtables: usize = 4,
-    min_write_cooldown_ms: u64 = 500,
-    compaction_level_threshold: f64 = 0.8,
-    idle_compact_threshold_ms: u64 = 5000,
-};
-
-pub const DatabaseAgent = struct {
-    alloc: Allocator,
-    db: *Database,
-    policy: AgentPolicy,
-
-    action_mutex: std.Thread.Mutex,
-    action_queue: std.fifo.LinearFifo(AgentAction, .Dynamic),
-
-    mutex: std.Thread.Mutex,
-    event_queue: std.fifo.LinearFifo(DatabaseEvent, .Dynamic),
-
-    thread: ?std.Thread = null,
-    running: std.atomic.Value(bool),
-
-    const Self = @This();
-
-    pub fn init(alloc: Allocator, db: *Database, policy: AgentPolicy) !*Self {
-        const agent = try alloc.create(Self);
-        agent.* = .{
-            .alloc = alloc,
-            .db = db,
-            .policy = policy,
-            .event_queue = std.fifo.LinearFifo(DatabaseEvent, .Dynamic).init(alloc),
-            .action_queue = std.fifo.LinearFifo(AgentAction, .Dynamic).init(alloc),
-            .running = std.atomic.Value(bool).init(false),
-            .action_mutex = std.Thread.Mutex{},
-            .mutex = std.Thread.Mutex{},
-        };
-        return agent;
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.event_queue.deinit();
-        self.action_queue.deinit();
-        self.alloc.destroy(self);
-    }
-
-    pub fn start(self: *Self) !void {
-        if (self.isRunning()) return;
-
-        self.running.store(true, .release);
-        self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
-    }
-
-    pub fn stop(self: *Self) void {
-        if (!self.isRunning()) return;
-
-        self.running.store(false, .release);
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
-        }
-    }
-
-    pub fn isRunning(self: Self) bool {
-        return self.running.load(.acquire);
-    }
-
-    /// Runs the database agent targeting 120 FPS rate.
-    /// This function implements a game loop pattern with:
-    /// 1. Event processing, state evaluation, and action processing every frame
-    /// 2. Sleep management to maintain consistent frame rate when possible
-    /// 3. Time tracking to monitor performance and detect frame rate drops
-    fn run(self: *Self) void {
-        // For 120 FPS, each frame should take approximately 8.33ms
-        const target_frame_time_ns: i128 = @divTrunc(std.time.ns_per_s, 120);
-
-        var previous = std.time.nanoTimestamp();
-
-        while (self.isRunning()) {
-            const current = std.time.nanoTimestamp();
-            previous = current;
-
-            self.processEvents();
-            self.evaluateState();
-            self.processActions();
-
-            // Calculate how long this frame took
-            const frame_time = std.time.nanoTimestamp() - current;
-
-            // Sleep if we're ahead of schedule to maintain 120 FPS
-            if (frame_time < target_frame_time_ns) {
-                const sleep_time_ns = target_frame_time_ns - frame_time;
-                std.time.sleep(@intCast(sleep_time_ns));
-            } else {
-                // We're running behind schedule - log a warning if significantly behind
-                const frame_time_ms = @divFloor(frame_time, std.time.ns_per_ms);
-                if (frame_time > target_frame_time_ns * 2) {
-                    std.log.warn("frame time ({d:.2}ms) exceeded target ({d:.2}ms) by more than 2x", .{
-                        frame_time_ms,
-                        @divFloor(target_frame_time_ns, std.time.ns_per_ms),
-                    });
-                }
-            }
-        }
-    }
-
-    fn queueAction(self: *Self, action: AgentAction) void {
-        self.action_mutex.lock();
-        defer self.action_mutex.unlock();
-
-        self.action_queue.writeItem(action) catch |err| {
-            std.log.err("failed to queue action: {s}", .{@errorName(err)});
-        };
-    }
-
-    fn processActions(self: *Self) void {
-        self.action_mutex.lock();
-        defer self.action_mutex.unlock();
-
-        if (self.action_queue.readItem()) |action| {
-            switch (action) {
-                .flush_memtable => |_| {
-                    std.log.debug("flush_memtable", .{});
-
-                    self.db.xflush(self.alloc) catch |err| switch (err) {
-                        error.NothingToFlush => return,
-                        else => {
-                            std.log.err(
-                                "agent not able to flush memtable {s}",
-                                .{@errorName(err)},
-                            );
-                            return;
-                        },
-                    };
-                },
-                .compact_level => |data| {
-                    std.log.debug("compact_level {d}", .{data.level});
-
-                    self.db.sstables.compact(data.level) catch |err| {
-                        std.log.err(
-                            "agent not able to compact level {d} {s}",
-                            .{ data.level, @errorName(err) },
-                        );
-                        return;
-                    };
-                },
-                .no_action => return,
-            }
-        }
-    }
-
-    pub fn submitEvent(self: *Self, event: DatabaseEvent) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        self.event_queue.writeItem(event) catch |err| {
-            std.log.err("failed to submit event: {s}", .{@errorName(err)});
-        };
-    }
-
-    fn processEvents(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (self.event_queue.readItem()) |event| {
-            switch (event) {
-                .write_completed => |data| {
-                    // std.log.debug("{s} {s} write_completed {d}", .{ TAG, event, data.bytes });
-
-                    _ = data;
-                },
-                .read_completed => |data| {
-                    std.log.debug("read_completed", .{});
-
-                    // Update read statistics if needed
-                    _ = data;
-                },
-                .memtable_frozen => |data| {
-                    std.log.debug("memtable_frozen {s}", .{data.id});
-
-                    self.considerFlushingMemtable(data.id);
-                },
-                .sstable_created => |data| {
-                    std.log.debug("sstable_created", .{});
-
-                    self.considerCompactingLevel(data.level);
-                },
-                .compaction_completed => |data| {
-                    std.log.debug("compaction_completed", .{});
-
-                    // Update compaction statistics
-                    _ = data;
-                },
-                .system_idle => |data| {
-                    std.log.debug("system_idle", .{});
-
-                    // Consider background maintenance during idle time
-                    self.considerIdleCompaction(data.duration_ms);
-                },
-            }
-        }
-    }
-
-    fn evaluateState(self: *Self) void {
-        // Periodically evaluate the overall state of the database
-        // and make decisions based on the current statistics
-
-        // Check level 0 file count
-        const level0_files = self.db.sstables.stats.getFilesCount(0);
-        if (level0_files > self.policy.max_level0_files) {
-            std.log.debug(
-                "level 0 files ({d}) exceeds policy {d}",
-                .{ level0_files, self.policy.max_level0_files },
-            );
-            self.queueAction(.{ .compact_level = .{ .level = 0 } });
-        }
-
-        // Check other levels based on size ratios
-        for (1..self.db.sstables.num_levels) |level| {
-            const level_stats = self.db.sstables.getLevelStats(level) orelse continue;
-            const next_level_stats = self.db.sstables.getLevelStats(level + 1) orelse continue;
-
-            // If this level is getting too full compared to the next level
-            if (level_stats.files_count > 0 and next_level_stats.files_count > 0) {
-                const ratio = @as(f64, @floatFromInt(level_stats.files_count)) /
-                    @as(f64, @floatFromInt(next_level_stats.files_count));
-
-                if (ratio > self.policy.compaction_level_threshold) {
-                    std.log.debug(
-                        "level {d} file ratio ({d}) exceeds policy {d}",
-                        .{ level, ratio, self.policy.compaction_level_threshold },
-                    );
-                    self.queueAction(.{ .compact_level = .{ .level = level } });
-                }
-            }
-        }
-    }
-
-    fn considerFlushingMemtable(self: *Self, id: []const u8) void {
-        // Simple policy: if we have too many unflushed memtables, flush this one
-        const count = self.db.memtableCount();
-        if (count >= self.policy.max_unflushed_memtables) {
-            std.log.debug(
-                "memtable count ({d}) exceeds policy {d}",
-                .{ count, self.policy.max_unflushed_memtables },
-            );
-            self.queueAction(.{ .flush_memtable = .{ .id = id } });
-        }
-    }
-
-    fn considerCompactingLevel(self: *Self, level: usize) void {
-        // Check if this level needs compaction based on file count
-        const files_count = self.db.sstables.stats.getFilesCount(level);
-        const max_files = self.policy.max_level0_files * std.math.pow(u32, 10, @intCast(level));
-
-        if (files_count > max_files) {
-            std.log.debug(
-                "level {d} file count ({d}) exceeds max files {d}",
-                .{ level, files_count, max_files },
-            );
-            self.queueAction(.{ .compact_level = .{ .level = level } });
-        }
-    }
-
-    fn considerIdleCompaction(self: *Self, idle_ms: u64) void {
-        if (idle_ms < self.policy.idle_compact_threshold_ms) return;
-
-        // Find a level that hasn't been compacted in a while
-        var oldest_level: usize = 0;
-        var oldest_time: i64 = std.time.timestamp();
-
-        for (0..self.db.sstables.num_levels) |level| {
-            const last_compaction = self.db.sstables.stats.getLastCompactionTime(level);
-            if (last_compaction > 0 and last_compaction < oldest_time) {
-                oldest_time = last_compaction;
-                oldest_level = level;
-            }
-        }
-
-        // If we found a level that hasn't been compacted in a while
-        const now = std.time.timestamp();
-        if (now - oldest_time > @as(i64, @intCast(self.policy.idle_compact_threshold_ms / 1000))) {
-            std.log.debug(
-                "level {d} compaction time exceeds ({d}) policy {d}",
-                .{ oldest_level, now - oldest_time, @as(i64, @intCast(self.policy.idle_compact_threshold_ms / 1000)) },
-            );
-            self.queueAction(.{ .compact_level = .{ .level = oldest_level } });
-        }
-    }
-};
+const SSTableStore = store.SSTableStore;
 
 pub const Database = struct {
-    agent: *DatabaseAgent,
     capacity: usize,
     mtable: AtomicValue(*Memtable),
     opts: Opts,
+    mtables_mutex: Mutex,
     mtables: std.ArrayList(*Memtable),
     sstables: *SSTableStore,
 
@@ -355,11 +43,14 @@ pub const Database = struct {
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        const mtable = Memtable.init(alloc, new_id, opts) catch |err| {
+        const mtable = Memtable.init(alloc, new_id) catch |err| {
             std.log.err("unable to init memtable {s}", .{@errorName(err)});
             return err;
         };
-        errdefer mtable.deinit();
+        errdefer {
+            mtable.deinit();
+            alloc.destroy(mtable);
+        }
 
         const mtables = std.ArrayList(*Memtable).init(alloc);
         errdefer mtables.deinit();
@@ -374,34 +65,26 @@ pub const Database = struct {
             return err;
         };
 
-        const agent = try DatabaseAgent.init(alloc, db, .{});
-
         db.* = .{
-            .agent = agent,
             .capacity = capacity,
             .mtable = AtomicValue(*Memtable).init(mtable),
             .mtables = mtables,
+            .mtables_mutex = Mutex{},
             .opts = opts,
             .sstables = sstables,
         };
-
-        try db.agent.start();
 
         return db;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        mtx.lock();
-        defer mtx.unlock();
-
-        self.agent.stop();
-        self.agent.deinit();
-
+        self.mtables_mutex.lock();
         for (self.mtables.items) |mtable| {
             mtable.deinit();
             alloc.destroy(mtable);
         }
         self.mtables.deinit();
+        self.mtables_mutex.unlock();
 
         var mtable = self.mtable.load(.seq_cst);
         mtable.deinit();
@@ -419,14 +102,17 @@ pub const Database = struct {
             return err;
         };
 
+        var count: usize = 0;
         for (0..self.sstables.num_levels) |lvl| {
             for (self.sstables.get(lvl)) |sstable| {
                 var siter = try sstable.iterator(alloc);
                 defer siter.deinit();
 
-                const nxt_table = try Memtable.init(alloc, sstable.id, self.opts);
+                const nxt_table = try Memtable.init(alloc, sstable.id);
                 while (siter.next()) |nxt| {
-                    try nxt_table.put(alloc, nxt);
+                    const k = try nxt.clone(alloc);
+                    try nxt_table.put(k);
+                    count += 1;
                 }
 
                 nxt_table.isFlushed.store(true, .seq_cst);
@@ -436,34 +122,63 @@ pub const Database = struct {
             }
         }
 
-        std.log.info("database opened @ {s} w/ {d} warm tables", .{ self.opts.data_dir, self.mtables.items.len });
-        std.log.info("current hot table key count {d}", .{self.mtable.load(.seq_cst).count()});
+        std.log.info(
+            "database opened @ {s} w/ {d} warm tables and {d} total keys",
+            .{ self.opts.data_dir, self.mtables.items.len, count },
+        );
     }
 
-    pub fn read(self: *Self, alloc: Allocator, key: []const u8) !KV {
-        const hot_table = self.mtable.load(.seq_cst);
-        if (hot_table.get(alloc, key)) |kv| {
-            return kv;
+    pub fn read(self: *Self, key: []const u8) !?KV {
+        if (key.len == 0) return null;
+
+        var latest_kv: ?KV = null;
+        var latest_timestamp: i128 = std.math.minInt(i128);
+
+        const hot_table = self.mtable.load(.acquire);
+        if (try hot_table.get(key)) |kv| {
+            latest_kv = kv;
+            latest_timestamp = kv.timestamp;
         }
 
-        mtx.lock();
-        const warm_tables = try self.mtables.clone();
-        mtx.unlock();
-        defer warm_tables.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
 
-        for (warm_tables.items) |mtable| {
-            if (mtable.get(alloc, key)) |kv| {
-                return kv;
+        var stack_snapshot: [16]*Memtable = undefined;
+        var snapshot_tables: []*Memtable = undefined;
+        var table_count: usize = 0;
+
+        {
+            self.mtables_mutex.lock();
+            defer self.mtables_mutex.unlock();
+
+            table_count = self.mtables.items.len;
+            if (table_count <= stack_snapshot.len) {
+                snapshot_tables = stack_snapshot[0..table_count];
+                @memcpy(snapshot_tables, self.mtables.items);
+            } else {
+                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch {
+                    return latest_kv;
+                };
+                @memcpy(snapshot_tables, self.mtables.items);
             }
         }
 
-        const internal_key = try keyvalue.encodeInternalKey(alloc, key, null);
-        defer alloc.free(internal_key);
+        if (table_count > 0) {
+            var i = table_count;
+            while (i > 0) {
+                i -= 1;
+                const table = snapshot_tables[i];
+                if (try table.get(key)) |kv| {
+                    if (latest_kv == null or kv.timestamp > latest_timestamp) {
+                        latest_timestamp = kv.timestamp;
+                        latest_kv = kv;
+                    }
+                }
+            }
+        }
 
-        var kv: KV = undefined;
-        try self.sstables.read(key, &kv);
-
-        return kv.clone(alloc);
+        return latest_kv;
     }
 
     const MergeIteratorWrapper = struct {
@@ -489,26 +204,40 @@ pub const Database = struct {
         merger.* = try MergeIterator(KV, keyvalue.compare).init(alloc);
 
         const hot_table = self.mtable.load(.seq_cst);
-        if (hot_table.count() > 0) {
+        if (hot_table.size() > 0) {
             const hot_iter = try hot_table.iterator(alloc);
             try merger.add(hot_iter);
         }
 
-        var warm_tables: std.ArrayList(*Memtable) = undefined;
-        {
-            mtx.lock();
-            defer mtx.unlock();
-            warm_tables = try self.mtables.clone();
-        }
-        defer warm_tables.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
 
-        for (warm_tables.items) |mtable| {
+        var snapshot_tables: []*Memtable = undefined;
+        var table_count: usize = 0;
+
+        {
+            self.mtables_mutex.lock();
+            defer self.mtables_mutex.unlock();
+
+            table_count = self.mtables.items.len;
+            if (table_count > 0) {
+                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
+                    std.log.err("Failed to allocate snapshot tables for iterator {s}", .{@errorName(err)});
+                    return error.OutOfMemory;
+                };
+                @memcpy(snapshot_tables, self.mtables.items);
+            } else {
+                snapshot_tables = &[_]*Memtable{};
+            }
+        }
+
+        const warm_tables = snapshot_tables[0..table_count];
+
+        for (warm_tables) |mtable| {
             const warm_iter = try mtable.iterator(alloc);
             try merger.add(warm_iter);
         }
-
-        //const siter = try self.sstables.iterator(alloc);
-        //try merger.add(siter);
 
         const wrapper = try alloc.create(MergeIteratorWrapper);
         errdefer alloc.destroy(wrapper);
@@ -532,6 +261,12 @@ pub const Database = struct {
         pub fn deinit(ctx: *anyopaque) void {
             const sw: *Wrapper = @ptrCast(@alignCast(ctx));
             sw.iterator.deinit();
+            if (sw.scanner.start) |start| {
+                @constCast(&start).deinit(sw.alloc);
+            }
+            if (sw.scanner.end) |end| {
+                @constCast(&end).deinit(sw.alloc);
+            }
             sw.alloc.destroy(sw.scanner);
             sw.alloc.destroy(sw);
         }
@@ -550,8 +285,8 @@ pub const Database = struct {
         start_key: []const u8,
         end_key: []const u8,
     ) !Iterator(KV) {
-        const start = KV.init(start_key, "");
-        const end = KV.init(end_key, "");
+        const start = try KV.initOwned(alloc, start_key, "");
+        const end = try KV.initOwned(alloc, end_key, "");
 
         const base_iter = try self.iterator(alloc);
 
@@ -570,35 +305,35 @@ pub const Database = struct {
         return Iterator(KV).init(wrapper, ScanWrapper.next, ScanWrapper.deinit);
     }
 
-    pub fn write(self: *Self, alloc: Allocator, key: []const u8, value: []const u8) anyerror!void {
-        if (key.len == 0 or !std.unicode.utf8ValidateSlice(key)) {
+    pub fn write(self: *Self, kv: KV) anyerror!void {
+        if (kv.key.len == 0) {
             return error.InvalidKeyData;
         }
-
-        const item = KV.init(key, value);
-
-        var mtable = self.mtable.load(.seq_cst);
-        if ((mtable.size() + item.len()) >= self.capacity) {
-            mtx.lock();
-            defer mtx.unlock();
-            try self.freeze(alloc, mtable);
+        if (kv.value.len == 0) {
+            return error.InvalidValueData;
         }
 
-        while (true) {
-            mtable = self.mtable.load(.seq_cst);
-            mtable.put(alloc, item) catch |err| switch (err) {
-                error.MemtableImmutable => continue,
+        var retry_count: u8 = 0;
+        const max_retries = 10;
+
+        while (retry_count < max_retries) {
+            const mtable = self.mtable.load(.seq_cst);
+            mtable.put(kv) catch |err| switch (err) {
+                error.MemtableImmutable => {
+                    retry_count += 1;
+                    continue;
+                },
                 else => return err,
             };
-            break;
+            return;
         }
 
-        self.agent.submitEvent(.{ .write_completed = .{ .bytes = item.len() } });
+        return error.TooManyRetries;
     }
 
-    fn memtableCount(self: Self) usize {
-        mtx.lock();
-        defer mtx.unlock();
+    pub fn memtableCount(self: *Self) usize {
+        self.mtables_mutex.lock();
+        defer self.mtables_mutex.unlock();
 
         var count: usize = 0;
         for (self.mtables.items) |table| {
@@ -608,6 +343,21 @@ pub const Database = struct {
         }
 
         return count;
+    }
+
+    pub fn freeze(self: *Self, alloc: Allocator, mtable: *Memtable) !void {
+        if (mtable.frozen()) return;
+
+        mtable.freeze();
+
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
+
+        const nxt_table = try Memtable.init(alloc, new_id);
+
+        try self.mtables.append(mtable);
+
+        self.mtable.store(nxt_table, .seq_cst);
     }
 
     pub fn flush(self: *Self, alloc: Allocator) void {
@@ -622,8 +372,8 @@ pub const Database = struct {
     }
 
     pub fn xflush(self: *Self, alloc: Allocator) !void {
-        mtx.lock();
-        defer mtx.unlock();
+        self.mtables_mutex.lock();
+        defer self.mtables_mutex.unlock();
 
         if (self.mtables.items.len == 0) {
             std.log.debug("nothing to flush", .{});
@@ -642,23 +392,6 @@ pub const Database = struct {
             }
         }
     }
-
-    fn freeze(self: *Self, alloc: Allocator, mtable: *Memtable) !void {
-        if (mtable.frozen()) return;
-
-        mtable.freeze();
-
-        var new_id_buf: [64]u8 = undefined;
-        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
-
-        const nxt_table = try Memtable.init(alloc, new_id, self.opts);
-
-        try self.mtables.append(mtable);
-
-        self.mtable.store(nxt_table, .seq_cst);
-
-        self.agent.submitEvent(.{ .memtable_frozen = .{ .id = mtable.getId() } });
-    }
 };
 
 test Database {
@@ -675,60 +408,55 @@ test Database {
     defer db.deinit(alloc);
 
     // given
-    const key = "__key__";
-    const value = "__value__";
+    var expected = try KV.initOwned(alloc, "__key__", "__value__");
+    defer expected.deinit(alloc);
 
     // when
-    try db.write(alloc, key, value);
+    try db.write(expected);
 
     // then
-    var actual = try db.read(alloc, key);
-    defer actual.deinit(alloc); // Make sure to free the memory when done
+    const actual = try db.read(expected.key);
 
-    try testing.expectEqualStrings(value, actual.value);
+    try testing.expectEqualStrings(expected.value, actual.?.value);
 }
 
 test "basic functionality with many items" {
-    const alloc = testing.allocator;
-    const testDir = testing.tmpDir(.{});
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
+    const alloc = arena.allocator();
+
+    const testDir = testing.tmpDir(.{});
     const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(dir_name);
     defer testDir.dir.deleteTree(dir_name) catch {};
 
     const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
-    defer alloc.destroy(db);
-    defer db.deinit(alloc);
+    defer {
+        db.deinit(alloc);
+        alloc.destroy(db);
+    }
 
     // given
-    const kvs = [5]KV{
-        KV.init("__key_c__", "__value_c__"),
-        KV.init("__key_b__", "__value_b__"),
-        KV.init("__key_d__", "__value_d__"),
-        KV.init("__key_a__", "__value_a__"),
-        KV.init("__key_e__", "__value_e__"),
-    };
+    const keys = [_][]const u8{ "__key_c__", "__key_b__", "__key_d__", "__key_a__", "__key_e__" };
+    const values = [_][]const u8{ "__value_c__", "__value_b__", "__value_d__", "__value_a__", "__value_e__" };
 
     // when
-    for (kvs) |kv| {
-        try db.write(alloc, kv.key, kv.value);
+    for (keys, values) |key, value| {
+        var expected = try KV.initOwned(alloc, key, value);
+        defer expected.deinit(alloc);
+
+        try db.write(expected);
     }
 
     // then
-    var byte_allocator = try ThreadSafeBumpAllocator.init(alloc, 4096);
-    defer byte_allocator.deinit();
-
-    const balloc = byte_allocator.allocator();
-
-    for (kvs) |kv| {
-        var actual = try db.read(balloc, kv.key);
-        defer actual.deinit(balloc);
-
-        try testing.expectEqualStrings(kv.value, actual.value);
+    for (keys, values) |key, expected_value| {
+        const actual = try db.read(key);
+        try testing.expectEqualStrings(expected_value, actual.?.value);
     }
 
     // then
-    var it = try db.iterator(balloc);
+    var it = try db.iterator(alloc);
     defer it.deinit();
 
     var count: usize = 0;
@@ -736,12 +464,12 @@ test "basic functionality with many items" {
         count += 1;
     }
 
-    try testing.expectEqual(kvs.len, count);
+    try testing.expectEqual(keys.len, count);
 
     var items = std.ArrayList(KV).init(alloc);
     defer items.deinit();
 
-    var scan_iter = try db.scan(balloc, "__key_b__", "__key_d__");
+    var scan_iter = try db.scan(alloc, "__key_b__", "__key_d__");
     defer scan_iter.deinit();
 
     while (scan_iter.next()) |nxt| {
@@ -749,4 +477,126 @@ test "basic functionality with many items" {
     }
 
     try testing.expectEqual(3, items.items.len);
+}
+
+test "write with empty key returns error" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // Create a KV with empty key directly to bypass KV validation
+    const kv = KV{
+        .key = "",
+        .value = "some_value",
+        .raw_bytes = "",
+        .timestamp = std.time.nanoTimestamp(),
+        .ownership = .borrowed,
+    };
+
+    // when/then
+    try testing.expectError(error.InvalidKeyData, db.write(kv));
+}
+
+test "memtableCount returns correct count" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // initially should be 0
+    try testing.expectEqual(@as(usize, 0), db.memtableCount());
+
+    // write some data and freeze to create memtables
+    var kv = try KV.initOwned(alloc, "test_key", "test_value");
+    defer kv.deinit(alloc);
+
+    try db.write(kv);
+
+    const hot_table = db.mtable.load(.seq_cst);
+    try db.freeze(alloc, hot_table);
+
+    // should now have 1 unflushed memtable
+    try testing.expectEqual(@as(usize, 1), db.memtableCount());
+}
+
+test "flush with no memtables" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // xflush should return error when no memtables to flush
+    try testing.expectError(error.NothingToFlush, db.xflush(alloc));
+}
+
+test "read returns null for non-existent key" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // when
+    const result = try db.read("non_existent_key");
+
+    // then
+    try testing.expect(result == null);
+}
+
+test "freeze already frozen memtable" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // write some data
+    var kv = try KV.initOwned(alloc, "test_key", "test_value");
+    defer kv.deinit(alloc);
+    try db.write(kv);
+
+    const hot_table = db.mtable.load(.seq_cst);
+
+    // freeze once
+    try db.freeze(alloc, hot_table);
+
+    // freeze again - should be no-op
+    try db.freeze(alloc, hot_table);
+
+    // should still work without error
+    try testing.expect(hot_table.frozen());
 }

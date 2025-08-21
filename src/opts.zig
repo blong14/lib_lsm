@@ -1,10 +1,10 @@
 const std = @import("std");
 
-const sstable = @import("sstable.zig");
+const store = @import("store.zig");
 
 const PageSize = std.mem.page_size;
 
-const CompactionStrategyType = sstable.SSTableStore.CompactionStrategyType;
+const CompactionStrategyType = store.SSTableStore.CompactionStrategyType;
 
 pub const Opts = struct {
     data_dir: []const u8,

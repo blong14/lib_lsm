@@ -27,6 +27,40 @@ import (
 	pgquery "github.com/pganalyze/pg_query_go/v2"
 )
 
+// Pre-allocated byte pools to reduce GC pressure
+var (
+	keyPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 256)
+		},
+	}
+	valuePool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 1024)
+		},
+	}
+)
+
+func getKeyBuffer() []byte {
+	return keyPool.Get().([]byte)[:0]
+}
+
+func putKeyBuffer(buf []byte) {
+	if cap(buf) <= 512 { // Don't pool overly large buffers
+		keyPool.Put(buf)
+	}
+}
+
+func getValueBuffer() []byte {
+	return valuePool.Get().([]byte)[:0]
+}
+
+func putValueBuffer(buf []byte) {
+	if cap(buf) <= 2048 { // Don't pool overly large buffers
+		valuePool.Put(buf)
+	}
+}
+
 type LSM = unsafe.Pointer
 
 type pgEngine struct {
@@ -44,16 +78,20 @@ type tableDefinition struct {
 }
 
 func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
-	keyBytes := []byte("tables_" + name)
-	cKey := C.CString(string(keyBytes))
+	keyBuf := getKeyBuffer()
+	defer putKeyBuffer(keyBuf)
+
+	keyBuf = append(keyBuf, "tables_"...)
+	keyBuf = append(keyBuf, name...)
+
+	cKey := C.CString(string(keyBuf))
 	defer C.free(unsafe.Pointer(cKey))
 	key := (*C.uchar)(unsafe.Pointer(cKey))
 
 	resp := C.lsm_read(pe.db, key)
 	if resp == nil {
-		return nil, fmt.Errorf("%#v -- key not found %s", pe.db, keyBytes)
+		return nil, fmt.Errorf("%#v -- key not found %s", pe.db, keyBuf)
 	}
-	defer C.lsm_value_deinit(resp)
 
 	valBytes := []byte(C.GoString((*C.char)(unsafe.Pointer(resp))))
 
@@ -76,29 +114,37 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 	tbl := tableDefinition{}
 	tbl.Name = stmt.Relation.Relname
 
+	// Pre-allocate slices with estimated capacity
+	tbl.ColumnNames = make([]string, 0, len(stmt.TableElts))
+	tbl.ColumnTypes = make([]string, 0, len(stmt.TableElts))
+
 	for _, c := range stmt.TableElts {
 		cd := c.GetColumnDef()
 
 		tbl.ColumnNames = append(tbl.ColumnNames, cd.Colname)
 
-		// Names is namespaced. So `INT` is pg_catalog.int4. `BIGINT` is pg_catalog.int8.
-		var columnType string
-		for _, n := range cd.TypeName.Names {
-			if columnType != "" {
-				columnType += "."
+		// Use strings.Builder for efficient string concatenation
+		var columnType strings.Builder
+		for i, n := range cd.TypeName.Names {
+			if i > 0 {
+				columnType.WriteByte('.')
 			}
-			columnType += n.GetString_().Str
+			columnType.WriteString(n.GetString_().Str)
 		}
-		tbl.ColumnTypes = append(tbl.ColumnTypes, columnType)
+		tbl.ColumnTypes = append(tbl.ColumnTypes, columnType.String())
 	}
 
-	keyBytes := []byte("tables_" + tbl.Name)
+	keyBuf := getKeyBuffer()
+	defer putKeyBuffer(keyBuf)
+	keyBuf = append(keyBuf, "tables_"...)
+	keyBuf = append(keyBuf, tbl.Name...)
+
 	tableBytes, err := json.Marshal(tbl)
 	if err != nil {
 		return nil, fmt.Errorf("could not marshal table key: %s", err)
 	}
 
-	cKey := C.CString(string(keyBytes))
+	cKey := C.CString(string(keyBuf))
 	defer C.free(unsafe.Pointer(cKey))
 	key := (*C.uchar)(unsafe.Pointer(cKey))
 
@@ -107,7 +153,7 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 	value := (*C.uchar)(unsafe.Pointer(cValue))
 
 	if ok := C.lsm_write(pe.db, key, value); !ok {
-		return nil, fmt.Errorf("could not write %s to %s", tableBytes, keyBytes)
+		return nil, fmt.Errorf("could not write %s to %s", tableBytes, keyBuf)
 	}
 
 	results := &pgResult{}
