@@ -87,19 +87,12 @@ pub const DatabaseSupervisor = struct {
         return self.running.load(.acquire);
     }
 
-    /// Runs the database supervisor targeting 120 FPS rate.
-    /// This function implements a game loop pattern with:
-    /// 1. Event processing, state evaluation, and action processing every frame
-    /// 2. Sleep management to maintain consistent frame rate when possible
-    /// 3. Time tracking to monitor performance and detect frame rate drops
     fn run(self: *Self) void {
-        // For 120 FPS, each frame should take approximately 8.33ms
         const target_frame_time_ns: i128 = @divTrunc(std.time.ns_per_s, 120);
 
         while (self.isRunning()) {
             const frame_start = std.time.nanoTimestamp();
 
-            // Check if we should still be running before processing
             if (!self.isRunning()) break;
 
             self.processEvents();
@@ -114,19 +107,15 @@ pub const DatabaseSupervisor = struct {
 
             const frame_time = std.time.nanoTimestamp() - frame_start;
 
-            // Sleep if we're ahead of schedule to maintain 120 FPS
             if (frame_time < target_frame_time_ns) {
                 const sleep_time_ns = target_frame_time_ns - frame_time;
                 std.time.sleep(@intCast(sleep_time_ns));
-            } else {
-                // We're running behind schedule - log a warning if significantly behind
+            } else if (frame_time > target_frame_time_ns * 2) {
                 const frame_time_ms = @divFloor(frame_time, std.time.ns_per_ms);
-                if (frame_time > target_frame_time_ns * 2) {
-                    std.log.warn("frame time ({d:.2}ms) exceeded target ({d:.2}ms) by more than 2x", .{
-                        frame_time_ms,
-                        @divFloor(target_frame_time_ns, std.time.ns_per_ms),
-                    });
-                }
+                std.log.warn("frame time ({d:.2}ms) exceeded target ({d:.2}ms) by more than 2x", .{
+                    frame_time_ms,
+                    @divFloor(target_frame_time_ns, std.time.ns_per_ms),
+                });
             }
         }
     }

@@ -87,10 +87,15 @@ export fn lsm_init_with_config(addr: *anyopaque) ?*anyopaque {
 }
 
 export fn lsm_read(addr: *anyopaque, k: [*c]const u8) [*c]const u8 {
+    if (k == null) return null;
+
     const db: *Database = @ptrCast(@alignCast(addr));
     const key = std.mem.span(k);
 
+    if (key.len == 0) return null;
+
     if (read(db, key) catch return null) |kv| {
+        if (kv.value.len == 0) return null;
         return &kv.value[0];
     }
 
@@ -114,18 +119,28 @@ export fn lsm_write(addr: *anyopaque, k: [*c]const u8, v: [*c]const u8) bool {
 }
 
 export fn lsm_scan(addr: *anyopaque, start_key: [*c]const u8, end_key: [*c]const u8) ?*anyopaque {
+    if (start_key == null or end_key == null) return null;
+
     const db: *Database = @ptrCast(@alignCast(addr));
     const start = std.mem.span(start_key);
     const end = std.mem.span(end_key);
 
+    if (start.len == 0 or end.len == 0) return null;
+
     const it = allocator.create(Iterator(KV)) catch return null;
-    it.* = db.scan(allocator, start, end) catch return null;
+    it.* = db.scan(allocator, start, end) catch {
+        allocator.destroy(it);
+        return null;
+    };
     return it;
 }
 
 export fn lsm_iter_next(addr: *anyopaque) [*c]const u8 {
     const it: *Iterator(KV) = @ptrCast(@alignCast(addr));
-    if (it.next()) |nxt| return &nxt.value[0];
+    if (it.next()) |nxt| {
+        if (nxt.value.len == 0) return null;
+        return &nxt.value[0];
+    }
     return null;
 }
 

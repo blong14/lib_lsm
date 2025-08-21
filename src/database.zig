@@ -129,6 +129,8 @@ pub const Database = struct {
     }
 
     pub fn read(self: *Self, key: []const u8) !?KV {
+        if (key.len == 0) return null;
+
         var latest_kv: ?KV = null;
         var latest_timestamp: i128 = std.math.minInt(i128);
 
@@ -138,10 +140,8 @@ pub const Database = struct {
             latest_timestamp = kv.timestamp;
         }
 
-        // TODO: Update the allocator here
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-
         const temp_alloc = arena.allocator();
 
         var stack_snapshot: [16]*Memtable = undefined;
@@ -157,8 +157,7 @@ pub const Database = struct {
                 snapshot_tables = stack_snapshot[0..table_count];
                 @memcpy(snapshot_tables, self.mtables.items);
             } else {
-                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
-                    std.log.err("Failed to allocate snapshot tables array {s}", .{@errorName(err)});
+                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch {
                     return latest_kv;
                 };
                 @memcpy(snapshot_tables, self.mtables.items);
@@ -310,16 +309,26 @@ pub const Database = struct {
         if (kv.key.len == 0) {
             return error.InvalidKeyData;
         }
+        if (kv.value.len == 0) {
+            return error.InvalidValueData;
+        }
 
-        var mtable = self.mtable.load(.seq_cst);
-        while (true) {
-            mtable = self.mtable.load(.seq_cst);
+        var retry_count: u8 = 0;
+        const max_retries = 10;
+
+        while (retry_count < max_retries) {
+            const mtable = self.mtable.load(.seq_cst);
             mtable.put(kv) catch |err| switch (err) {
-                error.MemtableImmutable => continue,
+                error.MemtableImmutable => {
+                    retry_count += 1;
+                    continue;
+                },
                 else => return err,
             };
-            break;
+            return;
         }
+
+        return error.TooManyRetries;
     }
 
     pub fn memtableCount(self: *Self) usize {

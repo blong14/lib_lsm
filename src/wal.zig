@@ -71,7 +71,6 @@ pub const Store = struct {
         var blck: *Block = undefined;
         if (first_key_len > 0) {
             self.*.mutable = false;
-            std.debug.print("init wal block data\n", .{});
             blck = try Block.initFromData(alloc, stream.buf.buffer);
         } else {
             blck = try alloc.create(Block);
@@ -254,10 +253,7 @@ pub const WAL = struct {
         pub fn next(ctx: *anyopaque) ?KV {
             const self: *WalIter = @ptrCast(@alignCast(ctx));
 
-            const kv = self.wal.read(self.nxt) catch |err| {
-                std.log.err("wal iter error {s}", .{@errorName(err)});
-                return null;
-            };
+            const kv = self.wal.read(self.nxt) catch return null;
 
             self.*.nxt += 1;
 

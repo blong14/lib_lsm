@@ -48,10 +48,8 @@ pub fn SkipList(
                 @ptrCast(&value_ptr),
                 &value_len,
             );
-            if (result == -1) {
+            if (result != 0) {
                 return null;
-            } else if (result != 0) {
-                return SkipListError.NotFound;
             }
 
             const value_slice = @as(
@@ -59,10 +57,7 @@ pub fn SkipList(
                 @ptrCast(value_ptr),
             )[0..value_len];
 
-            return decodeFn(value_slice) catch |err| {
-                std.log.err("skiplist value decode failed: {}", .{err});
-                return null;
-            };
+            return decodeFn(value_slice) catch return null;
         }
 
         pub fn put(self: *Self, key: []const u8, value_bytes: []const u8) !void {
@@ -97,10 +92,7 @@ pub fn SkipList(
                 var entry: c.SkipMapEntry = undefined;
 
                 const result = c.skiplist_iterator_next(it.impl, &entry);
-                if (result == -1) {
-                    return null;
-                } else if (result != 0) {
-                    std.log.err("skiplist iterator error: {d}", .{result});
+                if (result != 0) {
                     return null;
                 }
 
@@ -109,10 +101,7 @@ pub fn SkipList(
                     @ptrCast(entry.value_ptr),
                 )[0..entry.value_len];
 
-                return decodeFn(value_slice) catch |err| {
-                    std.log.err("skiplist value decode failed: {}", .{err});
-                    return null;
-                };
+                return decodeFn(value_slice) catch return null;
             }
         };
 

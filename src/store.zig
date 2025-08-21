@@ -207,24 +207,19 @@ pub const SSTableStore = struct {
         self.compaction_strategy = strategy;
     }
 
-    // Statistics tracking for each level to support compaction decisions
     pub const LevelStats = struct {
         alloc: Allocator,
-        // Core metrics
         bytes_written: []std.atomic.Value(u64),
         bytes_read: []std.atomic.Value(u64),
         files_count: []std.atomic.Value(u32),
         total_keys: []std.atomic.Value(u64),
 
-        // Time-based metrics
         last_compaction: []std.atomic.Value(i64),
         compaction_count: []std.atomic.Value(u32),
 
-        // Performance metrics
         avg_read_latency_ns: []std.atomic.Value(u64),
         avg_write_latency_ns: []std.atomic.Value(u64),
 
-        // Custom metrics storage for strategy-specific needs
         custom_metrics: std.StringHashMap(u64),
         mutex: std.Thread.Mutex,
 

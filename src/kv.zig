@@ -92,26 +92,21 @@ pub const KV = struct {
     }
 
     pub fn decode(self: *Self, data: []const u8) !void {
-        // key len key timestamp value len value
         const min_size = @sizeOf(u64) + @sizeOf(i128) + @sizeOf(u64);
         if (data.len < min_size) {
             return error.InvalidData;
         }
 
-        const max_key_size = 1024 * 1024; // 1MB
-        const max_value_size = 16 * 1024 * 1024; // 16MB
+        const max_key_size = 1024 * 1024;
+        const max_value_size = 16 * 1024 * 1024;
 
         var offset: usize = 0;
 
         const key_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
-        if (key_len == 0 or key_len > max_key_size or key_len > data.len) {
-            std.debug.print("kv decode key len error\n", .{});
-            return error.InvalidKeyLength;
-        }
         offset += @sizeOf(u64);
 
-        if (offset + key_len > data.len) {
-            return error.InvalidData;
+        if (key_len == 0 or key_len > max_key_size or offset + key_len > data.len) {
+            return error.InvalidKeyLength;
         }
         const key = data[offset .. offset + key_len];
         offset += key_len;
@@ -129,14 +124,10 @@ pub const KV = struct {
             return error.InvalidData;
         }
         const value_len = readInt(u64, data[offset..][0..@sizeOf(u64)], Endian);
-        if (value_len > max_value_size) {
+        if (value_len > max_value_size or offset + @sizeOf(u64) + value_len > data.len) {
             return error.InvalidValueLength;
         }
         offset += @sizeOf(u64);
-
-        if (offset + value_len > data.len) {
-            return error.InvalidData;
-        }
         const value = data[offset .. offset + value_len];
 
         self.key = key;
@@ -152,13 +143,12 @@ pub const KV = struct {
     }
 
     pub fn encode(self: Self, buf: []u8) ![]u8 {
-        const max_key_size = 1024 * 1024; // 1MB
+        const max_key_size = 1024 * 1024;
         if (self.key.len == 0 or self.key.len > max_key_size) {
-            std.debug.print("kv encode key len error\n", .{});
             return error.InvalidKeyLength;
         }
 
-        const max_value_size = 16 * 1024 * 1024; // 16MB
+        const max_value_size = 16 * 1024 * 1024;
         if (self.value.len > max_value_size) {
             return error.InvalidValueLength;
         }

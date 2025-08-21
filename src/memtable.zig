@@ -74,6 +74,7 @@ pub const Memtable = struct {
 
     pub fn put(self: *Self, item: KV) !void {
         if (self.frozen()) return error.MemtableImmutable;
+        if (item.key.len == 0) return error.InvalidKey;
 
         try self.user_key_index.put(item.userKey(), item.internalKey());
         try self.data.put(item.internalKey(), item.raw_bytes);
@@ -82,6 +83,8 @@ pub const Memtable = struct {
     }
 
     pub fn get(self: *Self, user_key: []const u8) !?KV {
+        if (user_key.len == 0) return null;
+
         const internal_key_opt = try self.user_key_index.get(user_key);
 
         if (internal_key_opt) |internal_key| {
