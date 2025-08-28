@@ -266,8 +266,8 @@ pub const Block = struct {
 };
 
 /// Create a block with the given buffer
-pub fn block(buffer: []align(PageSize) u8) Block {
-    return Block.init(std.heap.page_allocator, buffer);
+pub fn block(alloc: Allocator, buffer: []align(PageSize) u8) Block {
+    return Block.init(alloc, buffer);
 }
 
 test "Block basic operations" {
@@ -275,7 +275,7 @@ test "Block basic operations" {
     const allocator = testing.allocator;
 
     var buffer: [PageSize]u8 align(PageSize) = undefined;
-    var test_block = block(&buffer);
+    var test_block = block(allocator, &buffer);
 
     var kv1 = try KV.initOwned(allocator, "key1", "value1");
     defer kv1.deinit(allocator);
@@ -310,7 +310,7 @@ test "Block error conditions" {
     const allocator = testing.allocator;
 
     var small_buffer: [64]u8 align(PageSize) = undefined;
-    var test_block = block(&small_buffer);
+    var test_block = block(allocator, &small_buffer);
 
     // Test index out of bounds
     try testing.expectError(Block.ReadError.IndexOutOfBounds, test_block.read(0));
@@ -331,7 +331,7 @@ test "Block reset and reuse" {
     const allocator = testing.allocator;
 
     var buffer: [PageSize]u8 align(PageSize) = undefined;
-    var test_block = block(&buffer);
+    var test_block = block(allocator, &buffer);
 
     var kv = try KV.initOwned(allocator, "test_key", "test_value");
     defer kv.deinit(allocator);
