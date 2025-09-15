@@ -86,7 +86,7 @@ pub fn SkipList(
                 c.skiplist_iterator_free(self.impl);
             }
 
-            pub fn next(ctx: *anyopaque) ?KV {
+            pub fn next(ctx: *anyopaque) ?V {
                 const it: *SkiplistIterator = @ptrCast(@alignCast(ctx));
 
                 var entry: c.SkipMapEntry = undefined;
@@ -105,13 +105,13 @@ pub fn SkipList(
             }
         };
 
-        pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
+        pub fn iterator(self: *Self, alloc: Allocator) !Iterator(V) {
             const it = try alloc.create(SkiplistIterator);
             errdefer alloc.destroy(it);
 
             it.* = try SkiplistIterator.init(self.impl.?);
 
-            return Iterator(KV).init(it, SkiplistIterator.next, SkiplistIterator.deinit);
+            return Iterator(V).init(it, SkiplistIterator.next, SkiplistIterator.deinit);
         }
     };
 }
