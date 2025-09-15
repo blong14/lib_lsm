@@ -145,14 +145,11 @@ pub extern "C" fn skiplist_iterator_next(
     let iterator = unsafe { &mut *iter_ptr };
     let skip_map = unsafe { &*iterator.skiplist };
 
-    // Get the next entry based on current position
     let next_entry = match &iterator.current_key {
         None => {
-            // First iteration - get the first entry
             skip_map.front()
         }
         Some(current_key) => {
-            // Get the entry after the current key
             skip_map
                 .range::<str, _>((
                     std::ops::Bound::Excluded(current_key.as_str()),
@@ -167,11 +164,9 @@ pub extern "C" fn skiplist_iterator_next(
             let entry_key = entry.key();
             let entry_value = entry.value();
 
-            // Store the key and value in the iterator to keep them alive
             iterator.current_entry_key = entry_key.as_bytes().to_vec();
             iterator.current_entry_value = entry_value.clone();
 
-            // Update iterator position for next call
             iterator.current_key = Some(entry_key.clone());
 
             unsafe {
