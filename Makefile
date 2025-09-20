@@ -37,7 +37,7 @@ help:
 	@echo "make fmt            - Format code"
 	@echo "make test           - Run tests"
 	@echo "make run            - Run lsmctl with default options"
-	@echo "make profile        - Run with profiling enabled"
+	@echo "make perf           - Run with profiling enabled"
 	@echo "make debug          - Run in debug mode"
 	@echo "make help           - Display this help message"
 

@@ -3,7 +3,6 @@ const std = @import("std");
 const blk = @import("block.zig");
 const iter = @import("iterator.zig");
 const keyvalue = @import("kv.zig");
-const mmap = @import("mmap.zig");
 const options = @import("opts.zig");
 const file_utils = @import("file.zig");
 
@@ -14,10 +13,10 @@ const AtomicU32 = std.atomic.Value(u32);
 const Block = blk.Block;
 const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
-const MMap = mmap.AppendOnlyMMap;
 const Opts = options.Opts;
 
 const Endian = std.builtin.Endian.little;
+const PageSize = std.mem.page_size;
 
 /// SSTable - Sorted String Table implementation
 ///
@@ -31,7 +30,7 @@ pub const SSTable = struct {
     file: File,
     id: []const u8,
     mutable: bool,
-    stream: *MMap,
+    stream: []align(PageSize) u8,
     ref_count: AtomicU32,
 
     const Self = @This();
@@ -79,8 +78,7 @@ pub const SSTable = struct {
             self.block.deinit();
             self.alloc.destroy(self.block);
 
-            self.stream.deinit();
-            self.alloc.destroy(self.stream);
+            std.posix.munmap(self.stream);
 
             self.file.close();
             self.connected = false;
@@ -113,26 +111,27 @@ pub const SSTable = struct {
         const stat = try file.stat();
         const file_size = stat.size;
 
-        var stream = try MMap.init(self.alloc, file_size);
-        errdefer {
-            stream.deinit();
-            self.alloc.destroy(stream);
-        }
+        const stream = try std.posix.mmap(
+            null,
+            file_size,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .SHARED, .ANONYMOUS = false },
+            file.handle,
+            0,
+        );
 
-        try stream.connect(file, 0);
+        var fbs = std.io.fixedBufferStream(stream);
 
-        const reader = stream.buf.reader();
-
+        var reader = fbs.reader();
         const first_key_len = try reader.readInt(u64, Endian);
-        stream.buf.reset();
 
         var blck: *Block = undefined;
         if (first_key_len > 0) {
             self.*.mutable = false;
-            blck = try Block.initFromData(self.alloc, stream.buf.buffer);
+            blck = try Block.initFromData(self.alloc, stream);
         } else {
             blck = try self.alloc.create(Block);
-            blck.* = Block.init(self.alloc, stream.buf.buffer);
+            blck.* = Block.init(self.alloc, stream);
         }
 
         self.*.connected = true;
