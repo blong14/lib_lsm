@@ -610,19 +610,24 @@ pub const SSTableStore = struct {
             var keys_compacted: usize = 0;
             var bytes_read: u64 = 0;
 
+            var merger = try MergeIterator(KV, keyvalue.compare).init(temp_alloc);
+            defer MergeIterator(KV, keyvalue.compare).deinit(&merger);
+
             for (tables) |table| {
-                bytes_read += table.block.size();
+                const table_iterator = try table.iterator(temp_alloc);
+                try merger.add(table_iterator);
+            }
 
-                var table_iterator = try table.iterator(self.alloc);
-                defer table_iterator.deinit();
+            var merge_iter = merger.iterator();
 
-                while (table_iterator.next()) |kv| {
-                    var kv_copy = try kv.clone(self.alloc);
-                    defer kv_copy.deinit(self.alloc);
+            while (merge_iter.next()) |nxt| {
+                var kv_copy = try nxt.clone(temp_alloc);
+                defer kv_copy.deinit(temp_alloc);
 
-                    _ = try new_table.write(kv_copy);
-                    keys_compacted += 1;
-                }
+                _ = try new_table.write(kv_copy);
+
+                keys_compacted += 1;
+                bytes_read += kv_copy.len();
             }
 
             if (keys_compacted > 0) {
@@ -877,7 +882,7 @@ pub const SSTableStore = struct {
             sstable.mutable = false;
         }
 
-        mtable.isFlushed.store(true, .release);
+        mtable.flush();
 
         _ = sstable.release();
         try self.add(sstable, 0);
@@ -915,7 +920,7 @@ test "SSTableStore flush and compaction" {
 
     var memtable = try Memtable.init(allocator, "level-0");
     defer allocator.destroy(memtable);
-    defer memtable.deinit();
+    defer memtable.deinit(allocator);
 
     try memtable.put(try KV.initOwned(allocator, "flush_key1", "flush_value1"));
     try memtable.put(try KV.initOwned(allocator, "flush_key2", "flush_value2"));
@@ -925,7 +930,7 @@ test "SSTableStore flush and compaction" {
     {
         try store.flush(allocator, memtable);
 
-        try testing.expect(memtable.isFlushed.load(.acquire));
+        try testing.expect(memtable.flushed());
         try testing.expectEqual(@as(usize, 1), store.get(0).len);
     }
 

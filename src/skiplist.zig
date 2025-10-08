@@ -74,16 +74,22 @@ pub fn SkipList(
         }
 
         const SkiplistIterator = struct {
+            alloc: Allocator,
             impl: *c.SkipMapIterator,
 
-            pub fn init(ctx: *anyopaque) !SkiplistIterator {
+            pub fn init(ctx: *anyopaque, alloc: Allocator) !*SkiplistIterator {
                 const iter_ptr = c.skiplist_iterator_create(ctx) orelse return error.IteratorCreationFailed;
-                return .{ .impl = iter_ptr };
+
+                const it = try alloc.create(SkiplistIterator);
+                it.* = .{ .alloc = alloc, .impl = iter_ptr };
+
+                return it;
             }
 
             pub fn deinit(ctx: *anyopaque) void {
                 const self: *SkiplistIterator = @ptrCast(@alignCast(ctx));
                 c.skiplist_iterator_free(self.impl);
+                self.alloc.destroy(self);
             }
 
             pub fn next(ctx: *anyopaque) ?V {
@@ -106,10 +112,7 @@ pub fn SkipList(
         };
 
         pub fn iterator(self: *Self, alloc: Allocator) !Iterator(V) {
-            const it = try alloc.create(SkiplistIterator);
-            errdefer alloc.destroy(it);
-
-            it.* = try SkiplistIterator.init(self.impl.?);
+            const it = try SkiplistIterator.init(self.impl.?, alloc);
 
             return Iterator(V).init(it, SkiplistIterator.next, SkiplistIterator.deinit);
         }

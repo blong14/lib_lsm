@@ -47,8 +47,8 @@ pub fn init(alloc: Allocator, opts: Opts) !*Database {
     );
     try supervisor.start();
 
-    // wal = try alloc.create(WAL);
-    // wal.* = try WAL.init(alloc, .{ .Dir = opts.data_dir });
+    wal = try alloc.create(WAL);
+    wal.* = try WAL.init(alloc, .{ .Dir = opts.data_dir });
 
     return db;
 }
@@ -57,8 +57,8 @@ pub fn deinit(alloc: Allocator, db: *Database) void {
     supervisor.stop();
     supervisor.deinit();
 
-    // wal.deinit(alloc) catch unreachable;
-    // alloc.destroy(wal);
+    wal.deinit(alloc) catch unreachable;
+    alloc.destroy(wal);
 
     db.deinit(alloc);
     alloc.destroy(db);
@@ -69,7 +69,7 @@ pub fn read(db: *Database, key: []const u8) !?KV {
 }
 
 pub fn write(db: *Database, kv: KV) !void {
-    // try wal.write(allocator, kv);
+    try wal.write(allocator, kv);
     try db.write(kv);
     supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
 }
@@ -89,16 +89,20 @@ export fn lsm_init_with_config(addr: *anyopaque) ?*anyopaque {
 export fn lsm_read(addr: *anyopaque, k: [*c]const u8) [*c]const u8 {
     if (k == null) return null;
 
-    const db: *Database = @ptrCast(@alignCast(addr));
     const key = std.mem.span(k);
 
     if (key.len == 0) return null;
 
+    const db: *Database = @ptrCast(@alignCast(addr));
+
     if (read(db, key) catch return null) |kv| {
         if (kv.value.len == 0) return null;
-        return &kv.value[0];
-    }
 
+        const c_str = allocator.allocSentinel(u8, kv.value.len, 0) catch return null;
+        @memcpy(c_str, kv.value);
+
+        return c_str.ptr;
+    }
     return null;
 }
 
@@ -121,11 +125,12 @@ export fn lsm_write(addr: *anyopaque, k: [*c]const u8, v: [*c]const u8) bool {
 export fn lsm_scan(addr: *anyopaque, start_key: [*c]const u8, end_key: [*c]const u8) ?*anyopaque {
     if (start_key == null or end_key == null) return null;
 
-    const db: *Database = @ptrCast(@alignCast(addr));
     const start = std.mem.span(start_key);
     const end = std.mem.span(end_key);
 
     if (start.len == 0 or end.len == 0) return null;
+
+    const db: *Database = @ptrCast(@alignCast(addr));
 
     const it = allocator.create(Iterator(KV)) catch return null;
     it.* = db.scan(allocator, start, end) catch {
@@ -139,7 +144,11 @@ export fn lsm_iter_next(addr: *anyopaque) [*c]const u8 {
     const it: *Iterator(KV) = @ptrCast(@alignCast(addr));
     if (it.next()) |nxt| {
         if (nxt.value.len == 0) return null;
-        return &nxt.value[0];
+
+        const c_str = allocator.allocSentinel(u8, nxt.value.len, 0) catch return null;
+        @memcpy(c_str, nxt.value);
+
+        return c_str.ptr;
     }
     return null;
 }
@@ -235,26 +244,26 @@ test "C interface lsm_scan" {
     }
 
     const keys = [_]KV{
-        try KV.initOwned(alloc, "__key_c__", "__key_c__"),
-        try KV.initOwned(alloc, "__key_b__", "__key_b__"),
-        try KV.initOwned(alloc, "__key_a__", "__key_a__"),
+        try KV.initOwned(alloc, "__3__", "__key_3__"),
+        try KV.initOwned(alloc, "__2__", "__key_2__"),
+        try KV.initOwned(alloc, "__1__", "__key_1__"),
     };
     for (keys) |expected| {
         try db.write(expected);
     }
 
-    const scanner = lsm_scan(db, "__key_a__", "__key_c__");
+    const scanner = lsm_scan(db, "__1__", "__3__");
 
     try std.testing.expectEqualStrings(
-        "__key_a__",
+        "__key_1__",
         std.mem.span(lsm_iter_next(scanner.?)),
     );
     try std.testing.expectEqualStrings(
-        "__key_b__",
+        "__key_2__",
         std.mem.span(lsm_iter_next(scanner.?)),
     );
     try std.testing.expectEqualStrings(
-        "__key_c__",
+        "__key_3__",
         std.mem.span(lsm_iter_next(scanner.?)),
     );
     try std.testing.expectEqual(null, lsm_iter_next(scanner.?));

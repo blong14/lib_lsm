@@ -1,10 +1,8 @@
 const std = @import("std");
 
-const Block = @import("block.zig").Block;
 const file_utils = @import("file.zig");
 const Iterator = @import("iterator.zig").Iterator;
 const KV = @import("kv.zig").KV;
-const MMap = @import("mmap.zig").AppendOnlyMMap;
 
 const Allocator = std.mem.Allocator;
 const BufferedWriter = std.io.BufferedWriter;
@@ -15,6 +13,7 @@ const Endian = std.builtin.Endian.little;
 const MB = 1024 * 1024;
 const PageSize = std.mem.page_size;
 
+const assert = std.debug.assert;
 const bufferedWriter = std.io.bufferedWriter;
 const fixedBufferStream = std.io.fixedBufferStream;
 const writeInt = std.mem.writeInt;
@@ -23,14 +22,17 @@ const readInt = std.mem.readInt;
 pub const WalConfig = struct {
     Dir: []const u8,
     Segment: struct {
-        MaxStoreBytes: u64 = MB,
+        MaxStoreBytes: u64 = 16 * MB,
     } = .{},
 };
 
-pub const Store = struct {
+pub const Segment = struct {
+    conf: WalConfig,
     file: std.fs.File,
-    stream: *MMap,
-    block: *Block,
+    stream: FixedBuffer([]align(PageSize) u8),
+    id: u64,
+    max_bytes: u64,
+    pos: u64 = 0,
     count: u64 = 0,
     size: u64 = 0,
     connected: bool = false,
@@ -38,91 +40,11 @@ pub const Store = struct {
 
     const Self = @This();
 
-    pub fn init() Self {
-        return .{
-            .block = undefined,
-            .stream = undefined,
-            .file = undefined,
-        };
-    }
-
-    pub fn open(self: *Self, alloc: Allocator, file: std.fs.File) !void {
-        if (self.connected) {
-            return;
-        }
-
-        const stat = try file.stat();
-        const file_size = stat.size;
-
-        var stream = try MMap.init(alloc, file_size);
-        errdefer {
-            stream.deinit();
-            alloc.destroy(stream);
-        }
-
-        try stream.connect(file, 0);
-        stream.buf.reset();
-
-        const reader = stream.buf.reader();
-
-        const first_key_len = try reader.readInt(u64, Endian);
-        stream.buf.reset();
-
-        var blck: *Block = undefined;
-        if (first_key_len > 0) {
-            self.*.mutable = false;
-            blck = try Block.initFromData(alloc, stream.buf.buffer);
-        } else {
-            blck = try alloc.create(Block);
-            blck.* = Block.init(alloc, stream.buf.buffer);
-        }
-
-        self.*.block = blck;
-        self.*.connected = true;
-        self.*.file = file;
-        self.*.stream = stream;
-    }
-
-    pub fn deinit(self: *Self, alloc: Allocator) void {
-        self.block.deinit();
-        alloc.destroy(self.block);
-        self.stream.deinit();
-        alloc.destroy(self.stream);
-        self.file.close();
-        self.* = undefined;
-    }
-
-    pub fn getCount(self: Self) u64 {
-        return self.count;
-    }
-
-    pub fn read(self: *const Self, idx: u64) !KV {
-        return self.block.read(idx);
-    }
-
-    pub fn append(self: *Self, data: KV) !void {
-        _ = try self.block.write(data);
-        self.size += data.len();
-        self.count += 1;
-    }
-};
-
-pub const Segment = struct {
-    conf: WalConfig,
-    store: Store,
-    id: u64,
-    max_bytes: u64,
-
-    const Self = @This();
-
     pub fn init(alloc: Allocator, id: u64, conf: WalConfig) !Self {
         const wal_path = try std.fmt.allocPrint(
             alloc,
             "{s}/wal_{d}.dat",
-            .{
-                conf.Dir,
-                id,
-            },
+            .{ conf.Dir, id },
         );
         defer alloc.free(wal_path);
 
@@ -130,35 +52,72 @@ pub const Segment = struct {
         try wal_file.setEndPos(conf.Segment.MaxStoreBytes);
 
         const stat = try wal_file.stat();
+        const file_size = stat.size;
 
-        var store = Store.init();
-        try store.open(alloc, wal_file);
+        const stream = try std.posix.mmap(
+            null,
+            file_size,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .SHARED, .ANONYMOUS = false },
+            wal_file.handle,
+            0,
+        );
 
         return .{
+            .file = wal_file,
+            .stream = fixedBufferStream(stream),
             .conf = conf,
+            .connected = true,
             .id = id,
-            .max_bytes = stat.size,
-            .store = store,
+            .max_bytes = file_size,
         };
     }
 
-    pub fn deinit(self: *Self, alloc: Allocator) void {
-        self.store.deinit(alloc);
+    pub fn deinit(self: *Self) void {
+        self.file.sync() catch unreachable;
+        self.file.close();
         self.* = undefined;
     }
 
     pub fn write(self: *Self, kv: KV) !void {
-        if (kv.len() >= self.max_bytes) {
+        const kv_size = kv.len();
+        if ((self.size + (kv_size + 1)) >= self.max_bytes) {
             return error.NoSpaceLeft;
         }
 
-        _ = try self.store.append(kv);
+        const kv_written = try self.stream.write(kv.raw_bytes);
+        assert(kv_written == kv_size);
+
+        const sep_written = try self.stream.write(&[_]u8{'\n'});
+        assert(sep_written == 1);
+
+        self.pos = try self.stream.getPos();
+        self.count += 1;
+        self.size += kv_written + sep_written;
     }
 
-    pub fn read(self: Self, idx: u64) ?[]const u8 {
-        if (idx >= self.store.getCount()) return null;
+    pub fn read(self: Self, idx: u64) !KV {
+        if (idx >= self.count) {
+            return error.IndexOutOfBounds;
+        }
 
-        return self.store.read(idx) catch null;
+        // TODO: fix this impl
+        var current_idx: u64 = 0;
+        var it = std.mem.splitSequence(u8, self.stream.buffer, &[_]u8{'\n'});
+        while (it.next()) |nxt| {
+            if (current_idx == idx) {
+                var kv: KV = undefined;
+                kv.decode(nxt) catch return error.CorruptedData;
+                return kv;
+            }
+            current_idx += 1;
+        }
+
+        return error.NotFound;
+    }
+
+    pub fn getCount(self: Self) u64 {
+        return self.count;
     }
 };
 
@@ -183,10 +142,10 @@ pub const WAL = struct {
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) !void {
-        self.active_segment.deinit(alloc);
+        self.active_segment.deinit();
         alloc.destroy(self.active_segment);
         for (self.segments.items) |segment| {
-            segment.deinit(alloc);
+            segment.deinit();
             alloc.destroy(segment);
         }
         self.segments.deinit();
@@ -209,6 +168,7 @@ pub const WAL = struct {
                     current_id + 1,
                     self.conf,
                 );
+                errdefer alloc.destroy(active_segment);
 
                 self.active_segment = active_segment;
                 try self.active_segment.write(kv);
@@ -223,18 +183,18 @@ pub const WAL = struct {
 
         var current_idx: u64 = 0;
         for (self.segments.items) |segment| {
-            const segment_count = segment.store.getCount();
+            const segment_count = segment.getCount();
             if (idx >= current_idx and idx < current_idx + segment_count) {
                 const local_idx = idx - current_idx;
-                return segment.store.read(local_idx);
+                return try segment.read(local_idx);
             }
             current_idx += segment_count;
         }
 
-        const active_count = self.active_segment.store.getCount();
+        const active_count = self.active_segment.getCount();
         if (idx >= current_idx and idx < current_idx + active_count) {
             const local_idx = idx - current_idx;
-            return self.active_segment.store.read(local_idx);
+            return try self.active_segment.read(local_idx);
         }
 
         return error.IndexOutOfBounds;

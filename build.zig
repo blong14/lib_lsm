@@ -161,7 +161,7 @@ pub fn build(b: *std.Build) void {
     lib.step.dependOn(&lsm_headers.step);
     lib.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
     lib.addIncludePath(fast_csv.path(""));
-    lib.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"} });
+    lib.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"}, .flags = &.{} });
     lib.addIncludePath(b.path("zig-out/include"));
     lib.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
     lib.linkSystemLibrary("jemalloc");
@@ -217,7 +217,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("lsm", lsm);
     exe.root_module.addImport("clap", clap.module("clap"));
     exe.addIncludePath(fast_csv.path(""));
-    exe.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"} });
+    exe.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"}, .flags = &.{} });
     exe.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
     exe.linkSystemLibrary("jemalloc");
     exe.linkLibC();

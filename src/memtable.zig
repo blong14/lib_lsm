@@ -11,23 +11,12 @@ const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
 const SkipList = skl.SkipList;
 
-pub fn decodeInternalKey(a: []const u8) anyerror![]const u8 {
-    return a;
-}
-
-const KeyValueSkipList = SkipList(KV, keyvalue.decode);
-const KeyValueSkipListIndex = SkipList([]const u8, decodeInternalKey);
-
 pub const Memtable = struct {
-    init_alloc: Allocator,
     id: []const u8,
+    index: SkipList(KV, keyvalue.decode),
     byte_count: AtomicValue(usize),
-
-    data: *KeyValueSkipList,
-    user_key_index: KeyValueSkipListIndex,
-
     mutable: AtomicValue(bool),
-    isFlushed: AtomicValue(bool),
+    is_flushed: AtomicValue(bool),
 
     const Self = @This();
 
@@ -37,34 +26,23 @@ pub const Memtable = struct {
 
         @memcpy(id_copy, id);
 
-        const map = try alloc.create(KeyValueSkipList);
-        errdefer alloc.destroy(map);
+        const self = try alloc.create(Self);
+        errdefer alloc.destroy(self);
 
-        map.* = try KeyValueSkipList.init();
-
-        const mtable = try alloc.create(Self);
-        errdefer alloc.destroy(mtable);
-
-        mtable.* = .{
-            .init_alloc = alloc,
+        self.* = .{
             .id = id_copy,
-            .data = map,
-            .user_key_index = try KeyValueSkipListIndex.init(),
+            .index = try SkipList(KV, keyvalue.decode).init(),
             .byte_count = AtomicValue(usize).init(0),
             .mutable = AtomicValue(bool).init(true),
-            .isFlushed = AtomicValue(bool).init(false),
+            .is_flushed = AtomicValue(bool).init(false),
         };
 
-        return mtable;
+        return self;
     }
 
-    pub fn deinit(self: *Self) void {
-        self.user_key_index.deinit();
-
-        self.data.deinit();
-        self.init_alloc.destroy(self.data);
-
-        self.init_alloc.free(self.id);
+    pub fn deinit(self: *Self, alloc: Allocator) void {
+        self.index.deinit();
+        alloc.free(self.id);
         self.* = undefined;
     }
 
@@ -76,8 +54,7 @@ pub const Memtable = struct {
         if (self.frozen()) return error.MemtableImmutable;
         if (item.key.len == 0) return error.InvalidKey;
 
-        try self.user_key_index.put(item.userKey(), item.internalKey());
-        try self.data.put(item.internalKey(), item.raw_bytes);
+        try self.index.put(item.key, item.raw_bytes);
 
         _ = self.byte_count.fetchAdd(item.len(), .release);
     }
@@ -85,13 +62,7 @@ pub const Memtable = struct {
     pub fn get(self: *Self, user_key: []const u8) !?KV {
         if (user_key.len == 0) return null;
 
-        const internal_key_opt = try self.user_key_index.get(user_key);
-
-        if (internal_key_opt) |internal_key| {
-            return try self.data.get(internal_key);
-        }
-
-        return null;
+        return try self.index.get(user_key);
     }
 
     pub fn freeze(self: *Self) void {
@@ -102,53 +73,32 @@ pub const Memtable = struct {
         return !self.mutable.load(.acquire);
     }
 
+    pub fn flush(self: *Self) void {
+        self.freeze();
+        self.is_flushed.store(true, .release);
+    }
+
     pub fn flushed(self: Self) bool {
-        return self.isFlushed.load(.acquire);
+        return self.is_flushed.load(.acquire);
     }
 
     pub fn size(self: Self) usize {
         return self.byte_count.load(.acquire);
     }
 
-    const MemtableIterator = struct {
-        alloc: Allocator,
-        iter: Iterator(KV),
-
-        pub fn deinit(ctx: *anyopaque) void {
-            const self: *MemtableIterator = @ptrCast(@alignCast(ctx));
-            self.iter.deinit();
-            self.alloc.destroy(self);
-        }
-
-        pub fn next(ctx: *anyopaque) ?KV {
-            const self: *MemtableIterator = @ptrCast(@alignCast(ctx));
-            if (self.iter.next()) |nxt| {
-                return nxt;
-            }
-            return null;
-        }
-    };
-
     pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
-        const it = try alloc.create(MemtableIterator);
-        errdefer alloc.destroy(it);
-
-        it.* = .{
-            .alloc = alloc,
-            .iter = try self.data.iterator(alloc),
-        };
-
-        return Iterator(KV).init(it, MemtableIterator.next, MemtableIterator.deinit);
+        return try self.index.iterator(alloc);
     }
 };
 
 test Memtable {
     const testing = std.testing;
     const alloc = testing.allocator;
+
     // given
     var mtable = try Memtable.init(alloc, "0");
     defer alloc.destroy(mtable);
-    defer mtable.deinit();
+    defer mtable.deinit(alloc);
 
     // when
     var kv = try KV.initOwned(alloc, "__key__", "__value__");
