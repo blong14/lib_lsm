@@ -31,7 +31,7 @@ const usage =
 ;
 
 pub const std_options = .{
-    .log_level = .info,
+    .log_level = .debug,
 };
 
 pub fn main() !void {
@@ -86,16 +86,14 @@ pub fn main() !void {
     } else if (res.args.write != 0) {
         write(allocator, db, res.args.input.?);
     } else if (res.args.bench != 0) {
+        xbenchmark(allocator, db);
         benchmark(allocator, db);
     } else if (res.args.perf != 0) {
-        // benchmark(allocator, db);
         write(allocator, db, res.args.input.?);
         read(allocator, db, res.args.input.?);
     } else {
         // Fallback runnable used for simple scanning of the database files.
-        // write(allocator, db, res.args.input.?);
-        iterator(allocator, db);
-        // scan(allocator, db, "Atlanta", "New York");
+        scan(allocator, db, "Atlanta", "New York");
     }
 }
 
@@ -210,14 +208,15 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     // Start timer and launch threads
     timer.reset();
 
+    var i: usize = 0;
     while (csv.CsvReadNextRow(handle)) |row| {
         if (csv.CsvReadNextCol(row, handle)) |val| {
-            const key = mem.span(val);
+            defer i += 1;
 
-            const k = arena_alloc.alloc(u8, key.len) catch unreachable;
-            @memcpy(k, key[0..]);
+            const k = mem.span(val);
+            const key = std.fmt.allocPrint(arena_alloc, "{s}_{d}", .{ k, i }) catch unreachable;
 
-            kvs.append(k) catch return;
+            kvs.append(key) catch return;
         }
 
         if (kvs.items.len >= ops_per_thread) {
@@ -230,8 +229,7 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             };
 
             const ctx = arena_alloc.create(ReadThreadContext) catch unreachable;
-            // pass in original allocator here not the arena
-            ctx.* = ReadThreadContext.init(alloc, wait_group, thread_id, db, items);
+            ctx.* = ReadThreadContext.init(allocator, wait_group, thread_id, db, items);
 
             thread_pool.spawn(readWorker, .{ctx}) catch |err| {
                 debug.print(
@@ -256,8 +254,7 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         };
 
         const ctx = arena_alloc.create(ReadThreadContext) catch unreachable;
-        // pass in original allocator here not the arena
-        ctx.* = ReadThreadContext.init(alloc, wait_group, thread_id, db, items);
+        ctx.* = ReadThreadContext.init(allocator, wait_group, thread_id, db, items);
 
         thread_pool.spawn(readWorker, .{ctx}) catch |err| {
             debug.print(
@@ -271,6 +268,9 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         threads.append(ctx) catch unreachable;
     }
 
+    // stutter to make sure threads are schehduled. must be a better way
+    std.time.sleep(1000);
+    
     thread_pool.waitAndWork(wait_group);
 
     read_time = timer.read();
@@ -298,6 +298,7 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     const num_ops = 1_000_000;
     const num_cpus: u64 = std.Thread.getCpuCount() catch 4;
     const ops_per_thread = num_ops / num_cpus;
+    const write_cnt = 1000; // ops_per_thread;
 
     std.log.info("Starting write tests with {d} operations per thread...", .{ops_per_thread});
 
@@ -354,7 +355,7 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
                         @errorName(err),
                     });
                     error_count += 1;
-                    continue;
+                    @panic(@errorName(err));
                 };
 
                 success_count += 1;
@@ -403,10 +404,12 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     // Start timer and launch threads
     timer.reset();
 
+    var i: usize = 0;
     while (csv.CsvReadNextRow(handle)) |row| {
-        var key: []const u8 = undefined;
+        defer i += 1;
+        var k: []const u8 = undefined;
         if (csv.CsvReadNextCol(row, handle)) |val| {
-            key = mem.span(val);
+            k = mem.span(val);
         } else {
             break;
         }
@@ -418,10 +421,12 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             break;
         }
 
+        const key = std.fmt.allocPrint(arena_alloc, "{s}_{d}", .{ k, i }) catch unreachable;
+
         const item = KV.initOwned(arena_alloc, key, value) catch unreachable;
         kvs.append(item) catch return;
 
-        if (kvs.items.len >= ops_per_thread) {
+        if (kvs.items.len >= write_cnt) {
             const items = kvs.toOwnedSlice() catch |err| {
                 debug.print(
                     "not able to publish items {s}\n",
@@ -444,6 +449,7 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
 
             thread_id += 1;
             threads.append(ctx) catch unreachable;
+            break;
         }
     }
 
@@ -471,6 +477,7 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         threads.append(ctx) catch unreachable;
     }
 
+    std.time.sleep(1000);
     thread_pool.waitAndWork(wait_group);
 
     // Calculate total counts
@@ -716,6 +723,76 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
     });
 }
 
+fn xbenchmark(alloc: Allocator, db: *lsm.Database) void {
+    const num_ops = 1_000_000;
+
+    std.log.info("Starting xbenchmark with {d} operations...", .{num_ops});
+
+    var timer = std.time.Timer.start() catch unreachable;
+    var write_time: u64 = 0;
+
+    var success_count: u64 = 0;
+    var error_count: u64 = 0;
+
+    for (0..num_ops) |i| {
+        const key = std.fmt.allocPrint(alloc, "key_{d}", .{i}) catch unreachable;
+        const value = std.fmt.allocPrint(alloc, "value_{d}", .{i}) catch unreachable;
+
+        const kv = KV.initOwned(alloc, key, value) catch unreachable;
+
+        lsm.write(db, kv) catch |err| {
+            std.log.debug("database write error for key {s} {s}\n", .{
+                key,
+                @errorName(err),
+            });
+            error_count += 1;
+            continue;
+        };
+
+        success_count += 1;
+    }
+
+    write_time = timer.read();
+
+    // Ensure all writes are flushed
+    db.flush(alloc);
+
+    std.log.info("Write phase completed: {d} successful, {d} errors", .{ success_count, error_count });
+
+    const write_ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(write_time)) / std.time.ns_per_s);
+
+    std.log.info("Benchmark Results:", .{});
+    std.log.info("  Write: {d:.2} ops/sec ({d:.2} ms total)", .{
+        write_ops_per_sec, @as(f64, @floatFromInt(write_time)) / std.time.ns_per_ms,
+    });
+
+    success_count = 0;
+    error_count = 0;
+
+    var read_time: u64 = 0;
+    timer.reset();
+
+    var it = db.iterator(alloc) catch |err| @panic(@errorName(err));
+    defer it.deinit();
+
+    var count: usize = 0;
+    while (it.next()) |kv| {
+        _ = kv;
+        count += 1;
+    }
+
+    read_time = timer.read();
+
+    std.log.info("Read phase completed: read {d} key value pairs", .{count});
+
+    const read_ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(read_time)) / std.time.ns_per_s);
+
+    std.log.info("Benchmark Results:", .{});
+    std.log.info("  Read: {d:.2} ops/sec ({d:.2} ms total)", .{
+        read_ops_per_sec, @as(f64, @floatFromInt(read_time)) / std.time.ns_per_ms,
+    });
+}
+
 fn scan(alloc: Allocator, db: *lsm.Database, start: []const u8, end: []const u8) void {
     var it = db.scan(alloc, start, end) catch |err| @panic(@errorName(err));
     defer it.deinit();
@@ -724,7 +801,7 @@ fn scan(alloc: Allocator, db: *lsm.Database, start: []const u8, end: []const u8)
 
     var count: usize = 0;
     while (it.next()) |kv| {
-        const out = std.fmt.allocPrint(alloc, "{s}\n", .{kv}) catch unreachable;
+        const out = std.fmt.allocPrint(alloc, "{d} - {s}\n", .{ count, kv }) catch unreachable;
         _ = w.write(out) catch unreachable;
         count += 1;
     }
@@ -742,9 +819,9 @@ fn iterator(alloc: Allocator, db: *lsm.Database) void {
 
     var count: usize = 0;
     while (it.next()) |kv| {
-        const out = std.fmt.allocPrint(alloc, "{s}\n", .{kv}) catch unreachable;
-        _ = w.write(out) catch unreachable;
         count += 1;
+        const out = std.fmt.allocPrint(alloc, "{d} - {s}\n", .{ count, kv }) catch unreachable;
+        _ = w.write(out) catch unreachable;
     }
 
     w.flush() catch unreachable;
