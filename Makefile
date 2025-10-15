@@ -23,6 +23,8 @@ MODE := singlethreaded
 # MODE := multithreaded
 SST_CAPACITY := 1000000
 
+EXEC := $(BUILD_OUT)/bin/lsmctl
+
 # Help command
 .PHONY: help
 help:
@@ -51,7 +53,7 @@ build: $(TARGET)
 	@echo "Build finished"
 
 # Library target
-$(TARGET): $(SOURCES)
+$(TARGET): build.zig build.zig.zon $(SOURCES)
 	$(ZIG) build $(ZIG_RELEASE_OPTS) $(ZIG_COMMON_FLAGS)
 
 # Language-specific builds
@@ -127,6 +129,15 @@ poop: build
 		'./$(EXEC) --data_dir .tmp/data/data1 --mode singlethreaded --input data/measurements.txt --sst_capacity 1_000_000' \
 		'./$(EXEC) --data_dir .tmp/data/data2 --mode multithreaded --input data/measurements.txt --sst_capacity 1_000_000'
 
+massif.o: $(EXEC)
+	# ms_print
+	valgrind --tool=massif --time-unit=B --massif-out-file=$@ \
+		./$(EXEC) --read --data_dir $(DATA_DIR) --input data/measurements.txt
+
+callgrind.o: $(EXEC)
+	# kcachegrind
+	valgrind --tool=callgrind --callgrind-out-file=$@ \
+		./$(EXEC) --read --data_dir $(DATA_DIR) --input data/measurements.txt
 # Debug notes:
 # gdb --tui zig-out/bin/lsm
 # b src/tablemap.zig:76
