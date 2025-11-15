@@ -17,6 +17,7 @@ pub fn SkipList(
 ) type {
     return struct {
         impl: ?*anyopaque,
+        count: u64 = 0,
 
         const Self = @This();
 
@@ -71,6 +72,7 @@ pub fn SkipList(
             if (result != 0) {
                 return SkipListError.FailedInsert;
             }
+            self.count += 1;
         }
 
         const SkiplistIterator = struct {

@@ -181,10 +181,6 @@ pub const Block = struct {
         const offset_size = @sizeOf(u64);
         const offset_pos = self.buffer.len - ((index + 1) * offset_size);
 
-        if (offset_pos < self.pos) {
-            return ReadError.InvalidOffset;
-        }
-
         const offset_bytes = self.buffer[offset_pos..][0..offset_size];
         const kv_offset = readInt(u64, offset_bytes, Endian);
 

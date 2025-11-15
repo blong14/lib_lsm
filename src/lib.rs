@@ -146,17 +146,13 @@ pub extern "C" fn skiplist_iterator_next(
     let skip_map = unsafe { &*iterator.skiplist };
 
     let next_entry = match &iterator.current_key {
-        None => {
-            skip_map.front()
-        }
-        Some(current_key) => {
-            skip_map
-                .range::<str, _>((
-                    std::ops::Bound::Excluded(current_key.as_str()),
-                    std::ops::Bound::Unbounded,
-                ))
-                .next()
-        }
+        None => skip_map.front(),
+        Some(current_key) => skip_map
+            .range::<str, _>((
+                std::ops::Bound::Excluded(current_key.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .next(),
     };
 
     match next_entry {

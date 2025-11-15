@@ -15,11 +15,13 @@ pub const Opts = struct {
     enable_agent: ?bool = null,
 };
 
+const MB = 1024 * 1024;
+
 pub fn defaultOpts() Opts {
     return .{
         .data_dir = ".tmp/data",
         // TODO: temp
-        .sst_capacity = 1_000_000,
+        .sst_capacity = 256 * MB,
         .wal_capacity = PageSize * PageSize,
         .num_levels = 3,
         .compaction_strategy = .simple,
