@@ -8,6 +8,7 @@ const opt = @import("opts.zig");
 const sst = @import("sstable.zig");
 const store = @import("store.zig");
 const tm = @import("tablemap.zig");
+const log = @import("wal.zig");
 
 const atomic = std.atomic;
 const math = std.math;
@@ -28,14 +29,24 @@ const Memtable = mtbl.Memtable;
 const Opts = opt.Opts;
 const SSTable = sst.SSTable;
 const SSTableStore = store.SSTableStore;
+const WAL = log.WAL;
+
+var tsa: std.heap.ThreadSafeAllocator = .{
+    .child_allocator = std.heap.c_allocator,
+};
+var allocator = tsa.allocator();
 
 pub const Database = struct {
     capacity: usize,
-    mtable: AtomicValue(*Memtable),
+
     opts: Opts,
-    mtables_mutex: Mutex,
-    mtables: std.ArrayList(*Memtable),
-    sstables: *SSTableStore,
+
+    // in-memory
+    memory: AtomicValue(*Memtable),
+
+    // on disk
+    wal: *WAL,
+    io: *SSTableStore,
 
     const Self = @This();
 
@@ -43,20 +54,18 @@ pub const Database = struct {
         var new_id_buf: [64]u8 = undefined;
         const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
 
-        const mtable = Memtable.init(alloc, new_id) catch |err| {
+        const memory = Memtable.init(alloc, new_id) catch |err| {
             std.log.err("unable to init memtable {s}", .{@errorName(err)});
             return err;
         };
         errdefer {
-            mtable.deinit();
-            alloc.destroy(mtable);
+            memory.deinit(alloc);
+            alloc.destroy(memory);
         }
 
-        const mtables = std.ArrayList(*Memtable).init(alloc);
-        errdefer mtables.deinit();
-
-        const sstables = try alloc.create(SSTableStore);
-        sstables.* = try SSTableStore.init(alloc, opts);
+        const io = try alloc.create(SSTableStore);
+        io.* = try SSTableStore.init(alloc, opts);
+        errdefer alloc.destroy(io);
 
         const capacity = opts.sst_capacity;
 
@@ -65,120 +74,107 @@ pub const Database = struct {
             return err;
         };
 
+        // TODO: update allocator usage in WAL
+        const wal = try allocator.create(WAL);
+        wal.* = try WAL.init(allocator, .{ .Dir = opts.data_dir });
+
         db.* = .{
             .capacity = capacity,
-            .mtable = AtomicValue(*Memtable).init(mtable),
-            .mtables = mtables,
-            .mtables_mutex = Mutex{},
             .opts = opts,
-            .sstables = sstables,
+            .wal = wal,
+            .memory = AtomicValue(*Memtable).init(memory),
+            .io = io,
         };
 
         return db;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        self.mtables_mutex.lock();
-        for (self.mtables.items) |mtable| {
-            mtable.deinit();
-            alloc.destroy(mtable);
-        }
-        self.mtables.deinit();
-        self.mtables_mutex.unlock();
-
-        var mtable = self.mtable.load(.seq_cst);
-        mtable.deinit();
+        var mtable = self.memory.load(.seq_cst);
+        mtable.deinit(alloc);
         alloc.destroy(mtable);
 
-        self.sstables.deinit(alloc);
-        alloc.destroy(self.sstables);
+        self.wal.deinit(allocator) catch unreachable;
+        allocator.destroy(self.wal);
+
+        self.io.deinit(alloc);
+        alloc.destroy(self.io);
 
         self.* = undefined;
     }
 
     pub fn open(self: *Self, alloc: Allocator) !void {
-        self.sstables.open(alloc) catch |err| {
+        const data_dir = try std.fs.cwd().openDir(self.opts.data_dir, .{ .iterate = true });
+        var dir_iter = data_dir.iterate();
+
+        while (try dir_iter.next()) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".mtab")) {
+                var file_path_buf: [256]u8 = undefined;
+                const file_path = try std.fmt.bufPrint(
+                    &file_path_buf,
+                    "{s}/{s}",
+                    .{ self.opts.data_dir, entry.name },
+                );
+
+                const memtable = Memtable.deserializeFromDisk(alloc, file_path) catch |err| @panic(@errorName(err));
+
+                self.memory.store(memtable, .seq_cst);
+
+                std.log.info("loaded serialized memtable {s} from {s}", .{ memtable.getId(), file_path });
+
+                break;
+            }
+        }
+
+        // TODO: Open wal
+
+        self.io.open(alloc) catch |err| {
             std.log.err("not able to open sstables data directory {s}", .{@errorName(err)});
             return err;
         };
 
-        var count: usize = 0;
-        for (0..self.sstables.num_levels) |lvl| {
-            for (self.sstables.get(lvl)) |sstable| {
-                var siter = try sstable.iterator(alloc);
-                defer siter.deinit();
-
-                const nxt_table = try Memtable.init(alloc, sstable.id);
-                while (siter.next()) |nxt| {
-                    const k = try nxt.clone(alloc);
-                    try nxt_table.put(k);
-                    count += 1;
-                }
-
-                nxt_table.isFlushed.store(true, .seq_cst);
-                nxt_table.mutable.store(false, .seq_cst);
-
-                try self.mtables.append(nxt_table);
-            }
-        }
+        const cnt = self.memory.load(.seq_cst).index.count;
 
         std.log.info(
-            "database opened @ {s} w/ {d} warm tables and {d} total keys",
-            .{ self.opts.data_dir, self.mtables.items.len, count },
+            "database opened @ {s} w/ {d} hot keys",
+            .{ self.opts.data_dir, cnt },
         );
+    }
+
+    pub fn shutdown(self: *Self, alloc: Allocator) !void {
+        const memory = self.memory.load(.seq_cst);
+        if (!memory.flushed() and memory.size() > 0) {
+            var file_path_buf: [256]u8 = undefined;
+            const file_path = try std.fmt.bufPrint(
+                &file_path_buf,
+                "{s}/memtable_{s}.mtab",
+                .{ self.opts.data_dir, memory.getId() },
+            );
+
+            memory.flush();
+            try memory.serializeToDisk(alloc, file_path);
+
+            try self.xflush(alloc, memory);
+
+            std.log.info("hot memtable {s} successfully serialized to disk at {s}", .{ memory.getId(), file_path });
+        }
+
+        // TODO: snapsot wal
     }
 
     pub fn read(self: *Self, key: []const u8) !?KV {
         if (key.len == 0) return null;
 
-        var latest_kv: ?KV = null;
-        var latest_timestamp: i128 = std.math.minInt(i128);
-
-        const hot_table = self.mtable.load(.acquire);
-        if (try hot_table.get(key)) |kv| {
-            latest_kv = kv;
-            latest_timestamp = kv.timestamp;
+        const memory = self.memory.load(.acquire);
+        if (try memory.get(key)) |kv| {
+            return kv;
         }
 
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const temp_alloc = arena.allocator();
-
-        var stack_snapshot: [16]*Memtable = undefined;
-        var snapshot_tables: []*Memtable = undefined;
-        var table_count: usize = 0;
-
-        {
-            self.mtables_mutex.lock();
-            defer self.mtables_mutex.unlock();
-
-            table_count = self.mtables.items.len;
-            if (table_count <= stack_snapshot.len) {
-                snapshot_tables = stack_snapshot[0..table_count];
-                @memcpy(snapshot_tables, self.mtables.items);
-            } else {
-                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch {
-                    return latest_kv;
-                };
-                @memcpy(snapshot_tables, self.mtables.items);
-            }
+        if (try self.io.read(key)) |kv| {
+            return kv;
         }
 
-        if (table_count > 0) {
-            var i = table_count;
-            while (i > 0) {
-                i -= 1;
-                const table = snapshot_tables[i];
-                if (try table.get(key)) |kv| {
-                    if (latest_kv == null or kv.timestamp > latest_timestamp) {
-                        latest_timestamp = kv.timestamp;
-                        latest_kv = kv;
-                    }
-                }
-            }
-        }
-
-        return latest_kv;
+        return null;
     }
 
     const MergeIteratorWrapper = struct {
@@ -201,47 +197,24 @@ pub const Database = struct {
 
     pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
         var merger = try alloc.create(MergeIterator(KV, keyvalue.compare));
+        errdefer alloc.destroy(merger);
+
         merger.* = try MergeIterator(KV, keyvalue.compare).init(alloc);
 
-        const hot_table = self.mtable.load(.seq_cst);
-        if (hot_table.size() > 0) {
-            const hot_iter = try hot_table.iterator(alloc);
+        const memory = self.memory.load(.seq_cst);
+        if (memory.size() > 0) {
+            var hot_iter = try memory.iterator(alloc);
+            errdefer hot_iter.deinit();
+
             try merger.add(hot_iter);
         }
 
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const temp_alloc = arena.allocator();
+        var cold_iter = try self.io.iterator(alloc);
+        errdefer cold_iter.deinit();
 
-        var snapshot_tables: []*Memtable = undefined;
-        var table_count: usize = 0;
-
-        {
-            self.mtables_mutex.lock();
-            defer self.mtables_mutex.unlock();
-
-            table_count = self.mtables.items.len;
-            if (table_count > 0) {
-                snapshot_tables = temp_alloc.alloc(*Memtable, table_count) catch |err| {
-                    std.log.err("Failed to allocate snapshot tables for iterator {s}", .{@errorName(err)});
-                    return error.OutOfMemory;
-                };
-                @memcpy(snapshot_tables, self.mtables.items);
-            } else {
-                snapshot_tables = &[_]*Memtable{};
-            }
-        }
-
-        const warm_tables = snapshot_tables[0..table_count];
-
-        for (warm_tables) |mtable| {
-            const warm_iter = try mtable.iterator(alloc);
-            try merger.add(warm_iter);
-        }
+        try merger.add(cold_iter);
 
         const wrapper = try alloc.create(MergeIteratorWrapper);
-        errdefer alloc.destroy(wrapper);
-
         wrapper.* = .{
             .alloc = alloc,
             .iter = merger.iterator(),
@@ -313,36 +286,15 @@ pub const Database = struct {
             return error.InvalidValueData;
         }
 
-        var retry_count: u8 = 0;
-        const max_retries = 10;
+        try self.wal.write(allocator, kv);
 
-        while (retry_count < max_retries) {
-            const mtable = self.mtable.load(.seq_cst);
-            mtable.put(kv) catch |err| switch (err) {
-                error.MemtableImmutable => {
-                    retry_count += 1;
-                    continue;
-                },
-                else => return err,
-            };
-            return;
-        }
-
-        return error.TooManyRetries;
+        const mtable = self.memory.load(.seq_cst);
+        try mtable.put(kv);
     }
 
     pub fn memtableCount(self: *Self) usize {
-        self.mtables_mutex.lock();
-        defer self.mtables_mutex.unlock();
-
-        var count: usize = 0;
-        for (self.mtables.items) |table| {
-            if (!table.flushed()) {
-                count += 1;
-            }
-        }
-
-        return count;
+        _ = self;
+        return 1;
     }
 
     pub fn freeze(self: *Self, alloc: Allocator, mtable: *Memtable) !void {
@@ -355,42 +307,38 @@ pub const Database = struct {
 
         const nxt_table = try Memtable.init(alloc, new_id);
 
-        try self.mtables.append(mtable);
-
-        self.mtable.store(nxt_table, .seq_cst);
+        self.memory.store(nxt_table, .seq_cst);
     }
 
-    pub fn flush(self: *Self, alloc: Allocator) void {
-        const hot_table = self.mtable.load(.acquire);
-        self.freeze(alloc, hot_table) catch |err| {
-            std.log.err("db freeze failed {s}", .{@errorName(err)});
-            return;
-        };
-        self.xflush(alloc) catch |err| {
-            std.log.err("db flush failed {s}", .{@errorName(err)});
-        };
+    pub fn flush(self: *Self, alloc: Allocator) !void {
+        const memory = self.memory.load(.acquire);
+        if (memory.size() == 0) return error.NothingToFlush;
+
+        if (!memory.flushed()) {
+            memory.flush();
+            try self.xflush(alloc, memory);
+        }
+
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = try std.fmt.bufPrint(
+            &new_id_buf,
+            "{d}",
+            .{std.time.nanoTimestamp()},
+        );
+
+        std.log.debug("new memtable created", .{});
+        const nxt_table = try Memtable.init(alloc, new_id);
+        self.memory.store(nxt_table, .seq_cst);
     }
 
-    pub fn xflush(self: *Self, alloc: Allocator) !void {
-        self.mtables_mutex.lock();
-        defer self.mtables_mutex.unlock();
-
-        if (self.mtables.items.len == 0) {
-            std.log.debug("nothing to flush", .{});
-            return error.NothingToFlush;
-        }
-
-        for (self.mtables.items) |table| {
-            if (!table.flushed()) {
-                self.sstables.flush(alloc, table) catch |err| {
-                    std.log.err(
-                        "sstables not able to flush mtable {s} {s}",
-                        .{ table.getId(), @errorName(err) },
-                    );
-                    return error.FlushFailed;
-                };
-            }
-        }
+    inline fn xflush(self: *Self, alloc: Allocator, memory: *Memtable) !void {
+        self.io.flush(alloc, memory) catch |err| {
+            std.log.err(
+                "sstables not able to flush mtable {s} {s}",
+                .{ memory.getId(), @errorName(err) },
+            );
+            return error.FlushFailed;
+        };
     }
 };
 
@@ -443,9 +391,7 @@ test "basic functionality with many items" {
 
     // when
     for (keys, values) |key, value| {
-        var expected = try KV.initOwned(alloc, key, value);
-        defer expected.deinit(alloc);
-
+        const expected = try KV.initOwned(alloc, key, value);
         try db.write(expected);
     }
 
@@ -505,35 +451,6 @@ test "write with empty key returns error" {
     try testing.expectError(error.InvalidKeyData, db.write(kv));
 }
 
-test "memtableCount returns correct count" {
-    var arena = ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const alloc = arena.allocator();
-    const testDir = testing.tmpDir(.{});
-
-    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
-    defer testDir.dir.deleteTree(dir_name) catch {};
-
-    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
-    defer db.deinit(alloc);
-
-    // initially should be 0
-    try testing.expectEqual(@as(usize, 0), db.memtableCount());
-
-    // write some data and freeze to create memtables
-    var kv = try KV.initOwned(alloc, "test_key", "test_value");
-    defer kv.deinit(alloc);
-
-    try db.write(kv);
-
-    const hot_table = db.mtable.load(.seq_cst);
-    try db.freeze(alloc, hot_table);
-
-    // should now have 1 unflushed memtable
-    try testing.expectEqual(@as(usize, 1), db.memtableCount());
-}
-
 test "flush with no memtables" {
     var arena = ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -547,8 +464,8 @@ test "flush with no memtables" {
     const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
     defer db.deinit(alloc);
 
-    // xflush should return error when no memtables to flush
-    try testing.expectError(error.NothingToFlush, db.xflush(alloc));
+    // flush should return error when no memtables to flush
+    try testing.expectError(error.NothingToFlush, db.flush(alloc));
 }
 
 test "read returns null for non-existent key" {
@@ -589,14 +506,67 @@ test "freeze already frozen memtable" {
     defer kv.deinit(alloc);
     try db.write(kv);
 
-    const hot_table = db.mtable.load(.seq_cst);
+    const memory = db.memory.load(.seq_cst);
 
     // freeze once
-    try db.freeze(alloc, hot_table);
+    try db.freeze(alloc, memory);
 
     // freeze again - should be no-op
-    try db.freeze(alloc, hot_table);
+    try db.freeze(alloc, memory);
 
     // should still work without error
-    try testing.expect(hot_table.frozen());
+    try testing.expect(memory.frozen());
+}
+
+test "shutdown persists hot memtable to disk" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    // write some data to hot memtable
+    var kv1 = try KV.initOwned(alloc, "shutdown_key1", "shutdown_value1");
+    defer kv1.deinit(alloc);
+    try db.write(kv1);
+
+    var kv2 = try KV.initOwned(alloc, "shutdown_key2", "shutdown_value2");
+    defer kv2.deinit(alloc);
+    try db.write(kv2);
+
+    const memory = db.memory.load(.seq_cst);
+    const initial_size = memory.size();
+    try testing.expect(initial_size > 0);
+
+    // shutdown should persist the hot memtable
+    try db.shutdown(alloc);
+
+    // verify hot table was frozen
+    try testing.expect(memory.frozen());
+}
+
+test "shutdown with empty hot memtable" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+    const testDir = testing.tmpDir(.{});
+
+    const dir_name = try testDir.dir.realpathAlloc(alloc, ".");
+    defer testDir.dir.deleteTree(dir_name) catch {};
+
+    const db = try lsm.databaseFromOpts(alloc, opt.withDataDirOpts(dir_name));
+    defer db.deinit(alloc);
+
+    const memory = db.memory.load(.seq_cst);
+    try testing.expectEqual(@as(usize, 0), memory.size());
+
+    // shutdown with empty hot table should not error
+    try db.shutdown(alloc);
 }

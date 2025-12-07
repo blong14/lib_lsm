@@ -180,7 +180,9 @@ test TableMap {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var tm = try TableMap(u16, u16, order).init(alloc, std.mem.page_size);
+    const page_size = std.heap.pageSize();
+
+    var tm = try TableMap(u16, u16, order).init(alloc, page_size);
     defer tm.deinit(alloc);
 
     const key = 4;

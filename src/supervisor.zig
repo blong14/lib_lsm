@@ -1,6 +1,8 @@
 const std = @import("std");
 
+const Pool = std.Thread.Pool;
 const Database = @import("database.zig").Database;
+const KV = @import("kv.zig").KV;
 
 /// Events that can trigger supervisor decisions
 pub const DatabaseEvent = union(enum) {
@@ -40,8 +42,9 @@ pub const DatabaseSupervisor = struct {
     event_mutex: std.Thread.Mutex,
     event_queue: std.fifo.LinearFifo(DatabaseEvent, .Dynamic),
 
-    thread: ?std.Thread = null,
     running: std.atomic.Value(bool),
+
+    pool: ?*Pool = null,
 
     const Self = @This();
 
@@ -70,16 +73,96 @@ pub const DatabaseSupervisor = struct {
         if (self.isRunning()) return;
 
         self.running.store(true, .release);
-        self.thread = try std.Thread.spawn(.{}, Self.run, .{self});
+
+        var thread_pool = try self.alloc.create(Pool);
+        try thread_pool.init(Pool.Options{
+            .allocator = self.alloc,
+            .n_jobs = 16, // TODO: make configurable
+        });
+        errdefer thread_pool.deinit();
+
+        try thread_pool.spawn(Self.run, .{self});
+
+        self.pool = thread_pool;
+    }
+
+    pub fn read(self: Self, key: []const u8) !?KV {
+        if (!self.isRunning()) return error.NotRunning;
+
+        const pool = self.pool orelse return error.MissingPool;
+
+        const db: *Database = @ptrCast(@alignCast(self.db));
+
+        const ThreadContext = struct {
+            db: *Database,
+            key: []const u8,
+            mtx: std.Thread.Mutex = .{},
+            value: ?KV = null,
+        };
+
+        const reader = struct {
+            fn read(ctx: *ThreadContext) void {
+                if (ctx.db.read(ctx.key) catch |err| {
+                    std.log.err("{s}", .{@errorName(err)});
+                    return;
+                }) |v| {
+                    ctx.mtx.lock();
+                    ctx.value = v;
+                    ctx.mtx.unlock();
+                }
+            }
+        }.read;
+
+        var wait_group = std.Thread.WaitGroup{};
+        wait_group.reset();
+
+        var ctx: ThreadContext = .{ .db = db, .key = key };
+
+        pool.spawnWg(&wait_group, reader, .{&ctx});
+        pool.waitAndWork(&wait_group);
+
+        return ctx.value;
+    }
+
+    pub fn write(self: Self, kv: KV) !void {
+        if (!self.isRunning()) return error.NotRunning;
+
+        const pool = self.pool orelse return error.MissingPool;
+
+        const db: *Database = @ptrCast(@alignCast(self.db));
+
+        const ThreadContext = struct {
+            db: *Database,
+            value: KV,
+        };
+
+        const writer = struct {
+            fn write(ctx: ThreadContext) void {
+                ctx.db.write(ctx.value) catch |err| {
+                    std.log.err("{s}", .{@errorName(err)});
+                };
+            }
+        }.write;
+
+        var wait_group = std.Thread.WaitGroup{};
+        wait_group.reset();
+
+        const ctx: ThreadContext = .{ .db = db, .value = kv };
+
+        pool.spawnWg(&wait_group, writer, .{ctx});
+        pool.waitAndWork(&wait_group);
+
+        return;
     }
 
     pub fn stop(self: *Self) void {
         if (!self.isRunning()) return;
 
         self.running.store(false, .release);
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+
+        if (self.pool) |pool| {
+            pool.deinit();
+            self.pool = null;
         }
     }
 
@@ -139,33 +222,11 @@ pub const DatabaseSupervisor = struct {
             switch (action) {
                 .freeze_memtable => |_| {
                     std.log.debug("freeze_memtable", .{});
-
-                    const mtable = db.mtable.load(.seq_cst);
-                    db.freeze(self.alloc, mtable) catch |err| {
-                        std.log.err(
-                            "supervisor not able to freeze memtable {s}",
-                            .{@errorName(err)},
-                        );
-                        return;
-                    };
-
-                    db.xflush(self.alloc) catch |err| switch (err) {
-                        error.NothingToFlush => return,
-                        else => {
-                            std.log.err(
-                                "supervisor not able to flush memtable {s}",
-                                .{@errorName(err)},
-                            );
-                            return;
-                        },
-                    };
-
-                    self.submitEvent(.{ .sstable_created = .{ .level = 0 } });
                 },
                 .flush_memtable => |_| {
                     std.log.debug("flush_memtable", .{});
 
-                    db.xflush(self.alloc) catch |err| switch (err) {
+                    db.flush(self.alloc) catch |err| switch (err) {
                         error.NothingToFlush => return,
                         else => {
                             std.log.err(
@@ -181,7 +242,7 @@ pub const DatabaseSupervisor = struct {
                 .compact_level => |data| {
                     std.log.debug("compact_level {d}", .{data.level});
 
-                    db.sstables.compact(data.level) catch |err| {
+                    db.io.compact(data.level) catch |err| {
                         std.log.err(
                             "supervisor not able to compact level {d} {s}",
                             .{ data.level, @errorName(err) },
@@ -196,7 +257,7 @@ pub const DatabaseSupervisor = struct {
                         },
                     };
 
-                    if (db.sstables.getLevelStats(data.level)) |stats| {
+                    if (db.io.getLevelStats(data.level)) |stats| {
                         event.compaction_completed.duration_ns = stats.last_compaction;
                     }
 
@@ -260,7 +321,7 @@ pub const DatabaseSupervisor = struct {
         // and make decisions based on the current statistics
 
         // Check level 0 file count
-        const level0_files = db.sstables.stats.getFilesCount(0);
+        const level0_files = db.io.stats.getFilesCount(0);
         if (level0_files > self.policy.max_level0_files) {
             std.log.debug(
                 "state evaluated: level 0 files ({d}) exceeds policy {d}",
@@ -270,9 +331,9 @@ pub const DatabaseSupervisor = struct {
         }
 
         // Check other levels based on size ratios
-        for (1..db.sstables.num_levels) |level| {
-            const level_stats = db.sstables.getLevelStats(level) orelse continue;
-            const next_level_stats = db.sstables.getLevelStats(level + 1) orelse continue;
+        for (1..db.io.num_levels) |level| {
+            const level_stats = db.io.getLevelStats(level) orelse continue;
+            const next_level_stats = db.io.getLevelStats(level + 1) orelse continue;
 
             // If this level is getting too full compared to the next level
             if (level_stats.files_count > 0 and next_level_stats.files_count > 0) {
@@ -293,9 +354,9 @@ pub const DatabaseSupervisor = struct {
     fn considerFreezingMemtable(self: *Self, data: u64) void {
         const db: *Database = @ptrCast(@alignCast(self.db));
 
-        var mtable = db.mtable.load(.seq_cst);
+        var mtable = db.memory.load(.seq_cst);
         if ((mtable.size() + data) >= db.capacity) {
-            self.queueAction(.{ .freeze_memtable = .{ .id = mtable.getId() } });
+            self.queueAction(.{ .flush_memtable = .{ .id = mtable.getId() } });
         }
     }
 
@@ -315,7 +376,7 @@ pub const DatabaseSupervisor = struct {
         const db: *Database = @ptrCast(@alignCast(self.db));
 
         // Check if this level needs compaction based on file count
-        const files_count = db.sstables.stats.getFilesCount(level);
+        const files_count = db.io.stats.getFilesCount(level);
         const max_files = self.policy.max_level0_files * std.math.pow(u32, 10, @intCast(level));
 
         if (files_count > max_files) {
@@ -336,8 +397,8 @@ pub const DatabaseSupervisor = struct {
         var oldest_level: usize = 0;
         var oldest_time: i64 = std.time.timestamp();
 
-        for (0..db.sstables.num_levels) |level| {
-            const last_compaction = db.sstables.stats.getLastCompactionTime(level);
+        for (0..db.io.num_levels) |level| {
+            const last_compaction = db.io.stats.getLastCompactionTime(level);
             if (last_compaction > 0 and last_compaction < oldest_time) {
                 oldest_time = last_compaction;
                 oldest_level = level;

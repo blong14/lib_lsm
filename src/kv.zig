@@ -301,7 +301,7 @@ test "KV encode" {
         kv.timestamp = 1;
 
         // when
-        var buf: [std.mem.page_size]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         const str = try kv.encode(&buf);
 
         // then

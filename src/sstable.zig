@@ -14,9 +14,14 @@ const Block = blk.Block;
 const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
 const Opts = options.Opts;
+const TableMap = @import("tablemap.zig").TableMap;
 
 const Endian = std.builtin.Endian.little;
-const PageSize = std.mem.page_size;
+const PageSize = std.heap.pageSize();
+
+fn order(a: []const u8, b: []const u8) std.math.Order {
+    return std.mem.order(u8, a, b);
+}
 
 /// SSTable - Sorted String Table implementation
 ///
@@ -32,6 +37,8 @@ pub const SSTable = struct {
     mutable: bool,
     stream: []align(PageSize) u8,
     ref_count: AtomicU32,
+
+    index: TableMap([]const u8, usize, order),
 
     const Self = @This();
 
@@ -56,12 +63,15 @@ pub const SSTable = struct {
         );
         errdefer alloc.free(sstid);
 
+        const index = try TableMap([]const u8, usize, order).init(alloc, 1_000_000);
+
         const st = try alloc.create(Self);
         st.* = .{
             .alloc = alloc,
             .capacity = opts.sst_capacity,
             .data_dir = opts.data_dir,
             .id = sstid,
+            .index = index,
             .mutable = true,
             .connected = false,
             .block = undefined,
@@ -140,6 +150,21 @@ pub const SSTable = struct {
         self.*.stream = stream;
     }
 
+    pub fn xread(self: Self, key: []const u8) !?KV {
+        const idx = self.index.get(key) catch |err| switch (err) {
+            error.NotFound => return try self.read(key),
+            else => return err,
+        };
+
+        return self.block.read(idx) catch |err| {
+            std.log.err(
+                "sstable not able to read from block @ index {d}: {s}",
+                .{ idx, @errorName(err) },
+            );
+            return err;
+        };
+    }
+
     pub fn read(self: Self, key: []const u8) !?KV {
         // TODO: Add bloom filter check here first
         // if (!self.bloom_filter.mightContain(key)) {
@@ -184,6 +209,8 @@ pub const SSTable = struct {
             );
             return err;
         };
+
+        try self.index.put(value.key, idx);
 
         return idx;
     }

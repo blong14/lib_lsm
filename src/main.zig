@@ -4,7 +4,6 @@ const clap = @import("clap");
 const csv = @cImport({
     @cInclude("csv.h");
 });
-const jemalloc = @import("jemalloc");
 const lsm = @import("lsm");
 
 const debug = std.debug;
@@ -16,7 +15,9 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const KV = lsm.KV;
 
-const allocator = jemalloc.allocator;
+var tsa: std.heap.ThreadSafeAllocator = .{
+    .child_allocator = std.heap.c_allocator,
+};
 const usage =
     \\-h, --help             Display this help and exit.
     \\-d, --data_dir <str>   The data directory to save files on disk.
@@ -30,7 +31,7 @@ const usage =
     \\
 ;
 
-pub const std_options = .{
+pub const std_options: std.Options = .{
     .log_level = .debug,
 };
 
@@ -43,6 +44,8 @@ pub fn main() !void {
         .str = clap.parsers.string,
         .usize = clap.parsers.int(usize, 10),
     };
+
+    const allocator = tsa.allocator();
 
     // Initialize our diagnostics, which can be used for reporting useful errors.
     // This is optional. You can also pass `.{}` to `clap.parse` if you don't
@@ -66,7 +69,8 @@ pub fn main() !void {
     const default_opts = lsm.defaultOpts();
 
     const data_dir = res.args.data_dir orelse default_opts.data_dir;
-    const sst_capacity = res.args.sst_capacity orelse default_opts.sst_capacity;
+    // const sst_capacity = res.args.sst_capacity orelse default_opts.sst_capacity;
+    const sst_capacity = default_opts.sst_capacity;
     const wal_capacity = default_opts.wal_capacity;
 
     const opts: lsm.Opts = .{
@@ -91,6 +95,7 @@ pub fn main() !void {
     } else if (res.args.perf != 0) {
         write(allocator, db, res.args.input.?);
         read(allocator, db, res.args.input.?);
+        // scan(allocator, db, "Atlanta", "New York");
     } else {
         // Fallback runnable used for simple scanning of the database files.
         scan(allocator, db, "Atlanta", "New York");
@@ -229,7 +234,7 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             };
 
             const ctx = arena_alloc.create(ReadThreadContext) catch unreachable;
-            ctx.* = ReadThreadContext.init(allocator, wait_group, thread_id, db, items);
+            ctx.* = ReadThreadContext.init(arena_alloc, wait_group, thread_id, db, items);
 
             thread_pool.spawn(readWorker, .{ctx}) catch |err| {
                 debug.print(
@@ -254,7 +259,7 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         };
 
         const ctx = arena_alloc.create(ReadThreadContext) catch unreachable;
-        ctx.* = ReadThreadContext.init(allocator, wait_group, thread_id, db, items);
+        ctx.* = ReadThreadContext.init(arena_alloc, wait_group, thread_id, db, items);
 
         thread_pool.spawn(readWorker, .{ctx}) catch |err| {
             debug.print(
@@ -270,7 +275,7 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
 
     // stutter to make sure threads are schehduled. must be a better way
     std.time.sleep(1000);
-    
+
     thread_pool.waitAndWork(wait_group);
 
     read_time = timer.read();
@@ -298,7 +303,7 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     const num_ops = 1_000_000;
     const num_cpus: u64 = std.Thread.getCpuCount() catch 4;
     const ops_per_thread = num_ops / num_cpus;
-    const write_cnt = 1000; // ops_per_thread;
+    const write_cnt = ops_per_thread;
 
     std.log.info("Starting write tests with {d} operations per thread...", .{ops_per_thread});
 
@@ -449,7 +454,6 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
 
             thread_id += 1;
             threads.append(ctx) catch unreachable;
-            break;
         }
     }
 
@@ -490,9 +494,6 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     }
 
     write_time = timer.read();
-
-    // Ensure all writes are flushed
-    db.flush(alloc);
 
     std.log.info("Write phase completed: {d} workers {d} successful, {d} errors", .{ thread_id, total_success, total_errors });
 
@@ -627,9 +628,6 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
 
         write_time = timer.read();
 
-        // Ensure all writes are flushed
-        db.flush(alloc);
-
         std.log.info("Write phase completed: {d} successful, {d} errors", .{ total_success, total_errors });
     }
 
@@ -753,9 +751,6 @@ fn xbenchmark(alloc: Allocator, db: *lsm.Database) void {
     }
 
     write_time = timer.read();
-
-    // Ensure all writes are flushed
-    db.flush(alloc);
 
     std.log.info("Write phase completed: {d} successful, {d} errors", .{ success_count, error_count });
 

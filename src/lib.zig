@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const jemalloc = @import("jemalloc");
-
 const iter = @import("iterator.zig");
 const opt = @import("opts.zig");
 const spv = @import("supervisor.zig");
@@ -10,13 +8,13 @@ const Allocator = std.mem.Allocator;
 
 const DatabaseSupervisor = spv.DatabaseSupervisor;
 const Iterator = iter.Iterator;
-const WAL = @import("wal.zig").WAL;
 
-const allocator = jemalloc.allocator;
+var tsa: std.heap.ThreadSafeAllocator = .{
+    .child_allocator = std.heap.c_allocator,
+};
+var allocator = tsa.allocator();
 
 var supervisor: *DatabaseSupervisor = undefined;
-
-var wal: *WAL = undefined;
 
 // Public Interface
 
@@ -40,37 +38,40 @@ pub fn init(alloc: Allocator, opts: Opts) !*Database {
 
     try db.open(alloc);
 
-    supervisor = try DatabaseSupervisor.init(
-        alloc,
-        db,
-        .{},
-    );
+    supervisor = try DatabaseSupervisor.init(alloc, db, .{});
     try supervisor.start();
-
-    wal = try alloc.create(WAL);
-    wal.* = try WAL.init(alloc, .{ .Dir = opts.data_dir });
 
     return db;
 }
 
 pub fn deinit(alloc: Allocator, db: *Database) void {
+    // TODO: Decide how we actually want to stop things.
     supervisor.stop();
     supervisor.deinit();
 
-    wal.deinit(alloc) catch unreachable;
-    alloc.destroy(wal);
-
+    db.shutdown(alloc) catch unreachable;
+    db.flush(alloc) catch return;
     db.deinit(alloc);
     alloc.destroy(db);
 }
 
 pub fn read(db: *Database, key: []const u8) !?KV {
-    return try db.read(key);
+    if (try db.read(key)) |value| {
+        supervisor.submitEvent(.{ .read_completed = .{ .bytes = value.len() } });
+        return value;
+    }
+
+    return null;
 }
 
 pub fn write(db: *Database, kv: KV) !void {
-    try wal.write(allocator, kv);
-    try db.write(kv);
+    db.write(kv) catch |err| switch (err) {
+        error.MemtableImmutable => {
+            try db.flush(allocator);
+            return write(db, kv);
+        },
+        else => return err,
+    };
     supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
 }
 

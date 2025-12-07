@@ -134,11 +134,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const jemalloc = b.dependency("jemalloc", .{
-        .target = target,
-        .optimize = optimize,
-        .link_vendor = false,
-    });
 
     // make zig-out/include/skiplist.h
     // make zig-out/lib/libconcurrent_skiplist.so
@@ -150,21 +145,24 @@ pub fn build(b: *std.Build) void {
     const lsm_headers = cp_lsm_headers(b);
     lsm_headers.step.dependOn(&rust.step);
 
-    // make zig-out/lib/liblib_lsm.a
-    const lib = b.addStaticLibrary(.{
-        .name = "lib_lsm",
+    const lib_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    // make zig-out/lib/liblib_lsm.a
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "lib_lsm",
+        .root_module = lib_mod,
+    });
     lib.step.dependOn(&rust.step);
     lib.step.dependOn(&lsm_headers.step);
-    lib.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
     lib.addIncludePath(fast_csv.path(""));
     lib.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"}, .flags = &.{} });
     lib.addIncludePath(b.path("zig-out/include"));
     lib.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
-    lib.linkSystemLibrary("jemalloc");
     lib.linkLibC();
 
     // This declares intent for the library to be installed into the standard
@@ -174,7 +172,6 @@ pub fn build(b: *std.Build) void {
 
     // Main module to be imported into separate run artifacts
     const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/lib.zig") });
-    lsm.addImport("jemalloc", jemalloc.module("jemalloc"));
     lsm.addIncludePath(b.path("zig-out/include"));
     lsm.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
 
@@ -188,9 +185,7 @@ pub fn build(b: *std.Build) void {
     main_tests.step.dependOn(&rust.step);
     main_tests.step.dependOn(&lsm_headers.step);
     main_tests.root_module.addImport("lsm", lsm);
-    main_tests.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
     main_tests.addIncludePath(b.path("zig-out/include"));
-    main_tests.linkSystemLibrary("jemalloc");
     main_tests.linkLibC();
 
     const run_main_tests = b.addRunArtifact(main_tests);
@@ -202,15 +197,16 @@ pub fn build(b: *std.Build) void {
     const cover_step = b.step("cover", "Generate test coverage report");
     cover_step.dependOn(&run_main_cover.step);
 
-    // make build-lsmctl
-    const exe = b.addExecutable(.{
-        .name = "lsmctl",
+    const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        // .sanitize_thread = true,
-        .error_tracing = true,
-        .unwind_tables = true,
+    });
+
+    // make build-lsmctl
+    const exe = b.addExecutable(.{
+        .name = "lsmctl",
+        .root_module = exe_mod,
     });
     exe.step.dependOn(&rust.step);
     exe.step.dependOn(&lsm_headers.step);
@@ -218,15 +214,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("clap", clap.module("clap"));
     exe.addIncludePath(fast_csv.path(""));
     exe.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"}, .flags = &.{} });
-    exe.root_module.addImport("jemalloc", jemalloc.module("jemalloc"));
-    exe.linkSystemLibrary("jemalloc");
     exe.linkLibC();
-    b.installArtifact(exe); 
+    b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
         run_cmd.addArgs(args);
-    } 
+    }
 
     const run_step = b.step("lsmctl", "Run the lsm cli");
     run_step.dependOn(&run_cmd.step);

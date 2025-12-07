@@ -11,7 +11,7 @@ const Mutex = std.Thread.Mutex;
 
 const Endian = std.builtin.Endian.little;
 const MB = 1024 * 1024;
-const PageSize = std.mem.page_size;
+const PageSize = std.heap.pageSize();
 
 const assert = std.debug.assert;
 const bufferedWriter = std.io.bufferedWriter;

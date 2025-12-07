@@ -188,7 +188,7 @@ pub const SSTableStore = struct {
 
             // Extract level from filename (remove .dat extension first)
             const basename_no_ext = f.basename[0 .. f.basename.len - 4]; // Remove ".dat"
-            var filename_parts = std.mem.split(u8, basename_no_ext, "_");
+            var filename_parts = std.mem.splitSequence(u8, basename_no_ext, "_");
             const level_name = filename_parts.first();
             const level = try Level.fromString(level_name);
 
@@ -494,10 +494,10 @@ pub const SSTableStore = struct {
             comptime deinitFunc: fn (ctx: @TypeOf(pointer), alloc: Allocator) void,
         ) CompactionStrategy {
             const Ptr = @TypeOf(pointer);
-            const ptr_info = @typeInfo(Ptr);
+            // const ptr_info = @typeInfo(Ptr);
 
-            if (ptr_info != .Pointer) @compileError("Expected pointer, got " ++ @typeName(Ptr));
-            if (ptr_info.Pointer.size != .One) @compileError("Expected single-item pointer, got " ++ @typeName(Ptr));
+            // if (ptr_info != .Pointer) @compileError("Expected pointer, got " ++ @typeName(Ptr));
+            // if (ptr_info.Pointer.size != .One) @compileError("Expected single-item pointer, got " ++ @typeName(Ptr));
 
             // Create type-erased functions that handle the pointer type correctly
             const GenericFunctions = struct {
@@ -760,7 +760,7 @@ pub const SSTableStore = struct {
         // each level
         for (0..self.num_levels) |level| {
             for (self.levels.items[level].items) |sstable| {
-                if (try sstable.read(key)) |kv| {
+                if (try sstable.xread(key)) |kv| {
                     return kv;
                 }
             }

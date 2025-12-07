@@ -2,7 +2,7 @@ const std = @import("std");
 
 const store = @import("store.zig");
 
-const PageSize = std.mem.page_size;
+const PageSize = std.heap.pageSize();
 
 const CompactionStrategyType = store.SSTableStore.CompactionStrategyType;
 

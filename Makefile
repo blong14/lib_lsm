@@ -72,7 +72,6 @@ clean:
 	@rm -rf $(BUILD_OUT) $(BUILD_CACHE)
 
 debug:
-	rm -rf .tmp/data/*.dat
 	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
 		--write \
 		--input data/measurements.txt \
@@ -84,6 +83,7 @@ fmt:
 
 perf:
 	rm -rf .tmp/data/*.dat
+	rm -rf .tmp/data/*.mtab
 	perf record --call-graph dwarf -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
 		--perf \
 		--input data/measurements.txt \
@@ -105,6 +105,7 @@ read:
 
 write:
 	rm -rf .tmp/data/*.dat
+	rm -rf .tmp/data/*.mtab
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--write \
 		--input data/measurements.txt \
@@ -113,6 +114,7 @@ write:
 
 bench:
 	rm -rf .tmp/data/*.dat
+	rm -rf .tmp/data/*.mtab
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--bench \
 		--input data/measurements.txt \

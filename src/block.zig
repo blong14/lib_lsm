@@ -12,7 +12,7 @@ const MMap = map.AppendOnlyMMap;
 const Opts = options.Opts;
 
 const Endian = std.builtin.Endian.little;
-const PageSize = std.mem.page_size;
+const PageSize = std.heap.pageSize();
 
 const assert = std.debug.assert;
 const print = std.debug.print;
