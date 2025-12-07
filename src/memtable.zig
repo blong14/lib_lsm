@@ -11,9 +11,21 @@ const Iterator = iter.Iterator;
 const KV = keyvalue.KV;
 const SkipList = skl.SkipList;
 
+const MEMTABLE_MAGIC: u32 = 0x4D544142; // "MTAB" in hex
+const MEMTABLE_VERSION: u32 = 1;
+
+const MemtableHeader = packed struct {
+    magic: u32,
+    version: u32,
+    id_len: usize,
+    byte_count: usize,
+    is_frozen: bool,
+    is_flushed: bool,
+};
+
 pub const Memtable = struct {
     id: []const u8,
-    index: SkipList(KV, keyvalue.decode),
+    index: *SkipList(KV, keyvalue.decode),
     byte_count: AtomicValue(usize),
     mutable: AtomicValue(bool),
     is_flushed: AtomicValue(bool),
@@ -26,12 +38,17 @@ pub const Memtable = struct {
 
         @memcpy(id_copy, id);
 
+        const index = try alloc.create(SkipList(KV, keyvalue.decode));
+        errdefer alloc.destroy(index);
+
+        index.* = try SkipList(KV, keyvalue.decode).init();
+
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
 
         self.* = .{
             .id = id_copy,
-            .index = try SkipList(KV, keyvalue.decode).init(),
+            .index = index,
             .byte_count = AtomicValue(usize).init(0),
             .mutable = AtomicValue(bool).init(true),
             .is_flushed = AtomicValue(bool).init(false),
@@ -42,6 +59,7 @@ pub const Memtable = struct {
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
         self.index.deinit();
+        alloc.destroy(self.index);
         alloc.free(self.id);
         self.* = undefined;
     }
@@ -88,6 +106,83 @@ pub const Memtable = struct {
 
     pub fn iterator(self: *Self, alloc: Allocator) !Iterator(KV) {
         return try self.index.iterator(alloc);
+    }
+
+    pub fn serializeToDisk(self: *Self, alloc: Allocator, file_path: []const u8) !void {
+        const file = try std.fs.cwd().createFile(file_path, .{});
+        defer file.close();
+
+        const header = MemtableHeader{
+            .magic = MEMTABLE_MAGIC,
+            .version = MEMTABLE_VERSION,
+            .id_len = self.id.len,
+            .byte_count = self.size(),
+            .is_frozen = self.frozen(),
+            .is_flushed = self.flushed(),
+        };
+
+        try file.writeAll(std.mem.asBytes(&header));
+        try file.writeAll(self.id);
+        try file.writeAll(std.mem.asBytes(&self.index.count));
+
+        var it = try self.iterator(alloc);
+        defer it.deinit();
+
+        while (it.next()) |nxt| {
+            try file.writeAll(std.mem.asBytes(&nxt.len()));
+            try file.writeAll(nxt.raw_bytes);
+        }
+    }
+
+    pub fn deserializeFromDisk(alloc: Allocator, file_path: []const u8) !*Self {
+        const file = try std.fs.cwd().openFile(file_path, .{});
+        defer file.close();
+
+        var header: MemtableHeader = undefined;
+        _ = try file.readAll(std.mem.asBytes(&header));
+
+        if (header.magic != MEMTABLE_MAGIC) {
+            return error.InvalidMemtableFile;
+        }
+        if (header.version != MEMTABLE_VERSION) {
+            return error.UnsupportedMemtableVersion;
+        }
+
+        const id = try alloc.alloc(u8, header.id_len);
+        errdefer alloc.free(id);
+
+        _ = try file.readAll(id);
+
+        const self = try Memtable.init(alloc, id);
+        errdefer alloc.destroy(self);
+
+        var entry_count: u64 = undefined;
+        _ = try file.readAll(std.mem.asBytes(&entry_count));
+
+        var i: u32 = 0;
+        while (i < entry_count) : (i += 1) {
+            var kv_len: u64 = undefined;
+            _ = try file.readAll(std.mem.asBytes(&kv_len));
+
+            const buf = try alloc.alloc(u8, kv_len);
+            defer alloc.free(buf);
+
+            _ = try file.readAll(buf);
+
+            var kv: KV = undefined;
+            try kv.decode(buf);
+
+            try self.put(kv);
+        }
+
+        if (header.is_frozen) {
+            self.freeze();
+        }
+        if (header.is_flushed) {
+            self.flush();
+        }
+
+        return self;
     }
 };
 
