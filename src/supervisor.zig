@@ -37,10 +37,10 @@ pub const DatabaseSupervisor = struct {
     policy: SupervisorPolicy,
 
     action_mutex: std.Thread.Mutex,
-    action_queue: std.fifo.LinearFifo(SupervisorAction, .Dynamic),
+    action_queue: std.ArrayList(SupervisorAction),
 
     event_mutex: std.Thread.Mutex,
-    event_queue: std.fifo.LinearFifo(DatabaseEvent, .Dynamic),
+    event_queue: std.ArrayList(DatabaseEvent),
 
     running: std.atomic.Value(bool),
 
@@ -55,17 +55,17 @@ pub const DatabaseSupervisor = struct {
             .db = db,
             .policy = policy,
             .event_mutex = std.Thread.Mutex{},
-            .event_queue = std.fifo.LinearFifo(DatabaseEvent, .Dynamic).init(alloc),
+            .event_queue = try std.ArrayList(DatabaseEvent).initCapacity(alloc, 256),
             .action_mutex = std.Thread.Mutex{},
-            .action_queue = std.fifo.LinearFifo(SupervisorAction, .Dynamic).init(alloc),
+            .action_queue = try std.ArrayList(SupervisorAction).initCapacity(alloc, 256),
             .running = std.atomic.Value(bool).init(false),
         };
         return supervisor;
     }
 
     pub fn deinit(self: *Self) void {
-        self.event_queue.deinit();
-        self.action_queue.deinit();
+        self.event_queue.deinit(self.alloc);
+        self.action_queue.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -192,7 +192,7 @@ pub const DatabaseSupervisor = struct {
 
             if (frame_time < target_frame_time_ns) {
                 const sleep_time_ns = target_frame_time_ns - frame_time;
-                std.time.sleep(@intCast(sleep_time_ns));
+                std.Thread.sleep(@intCast(sleep_time_ns));
             } else if (frame_time > target_frame_time_ns * 2) {
                 const frame_time_ms = @divFloor(frame_time, std.time.ns_per_ms);
                 std.log.warn("frame time ({d:.2}ms) exceeded target ({d:.2}ms) by more than 2x", .{
@@ -207,7 +207,7 @@ pub const DatabaseSupervisor = struct {
         self.action_mutex.lock();
         defer self.action_mutex.unlock();
 
-        self.action_queue.writeItem(action) catch |err| {
+        self.action_queue.append(self.alloc, action) catch |err| {
             std.log.err("failed to queue action: {s}", .{@errorName(err)});
         };
     }
@@ -218,7 +218,8 @@ pub const DatabaseSupervisor = struct {
 
         const db: *Database = @ptrCast(@alignCast(self.db));
 
-        if (self.action_queue.readItem()) |action| {
+        if (self.action_queue.items.len > 0) {
+            const action = self.action_queue.orderedRemove(0);
             switch (action) {
                 .freeze_memtable => |_| {
                     std.log.debug("freeze_memtable", .{});
@@ -272,7 +273,7 @@ pub const DatabaseSupervisor = struct {
         self.event_mutex.lock();
         defer self.event_mutex.unlock();
 
-        self.event_queue.writeItem(event) catch |err| {
+        self.event_queue.append(self.alloc, event) catch |err| {
             std.log.err("failed to submit event: {s}", .{@errorName(err)});
         };
     }
@@ -281,7 +282,8 @@ pub const DatabaseSupervisor = struct {
         self.event_mutex.lock();
         defer self.event_mutex.unlock();
 
-        if (self.event_queue.readItem()) |event| {
+        if (self.event_queue.items.len > 0) {
+            const event = self.event_queue.orderedRemove(0);
             switch (event) {
                 .write_completed => |data| {
                     self.considerFreezingMemtable(data.bytes);

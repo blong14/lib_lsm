@@ -326,7 +326,6 @@ pub const Database = struct {
             .{std.time.nanoTimestamp()},
         );
 
-        std.log.debug("new memtable created", .{});
         const nxt_table = try Memtable.init(alloc, new_id);
         self.memory.store(nxt_table, .seq_cst);
     }
@@ -412,14 +411,14 @@ test "basic functionality with many items" {
 
     try testing.expectEqual(keys.len, count);
 
-    var items = std.ArrayList(KV).init(alloc);
-    defer items.deinit();
+    var items = try std.ArrayList(KV).initCapacity(alloc, 10);
+    defer items.deinit(alloc);
 
     var scan_iter = try db.scan(alloc, "__key_b__", "__key_d__");
     defer scan_iter.deinit();
 
     while (scan_iter.next()) |nxt| {
-        try items.append(nxt);
+        try items.append(alloc, nxt);
     }
 
     try testing.expectEqual(3, items.items.len);

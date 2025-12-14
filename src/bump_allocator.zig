@@ -23,7 +23,7 @@ pub const ThreadSafeBumpAllocator = struct {
         alloc: Allocator,
         initial_chunk_size: usize,
     ) !ThreadSafeBumpAllocator {
-        var chunks = ArrayList([]align(16) u8).init(alloc);
+        var chunks = try ArrayList([]align(16) u8).initCapacity(alloc, MIN_CHUNK_SIZE);
 
         // Ensure initial chunk size is at least 4KB and a power of 2
         const adjusted_size = std.math.ceilPowerOfTwo(
@@ -34,7 +34,7 @@ pub const ThreadSafeBumpAllocator = struct {
         const first_chunk = try alloc.alignedAlloc(u8, 16, adjusted_size);
         errdefer alloc.free(first_chunk);
 
-        try chunks.append(first_chunk);
+        try chunks.append(alloc, first_chunk);
 
         return ThreadSafeBumpAllocator{
             .chunk_size = adjusted_size,
@@ -78,7 +78,7 @@ pub const ThreadSafeBumpAllocator = struct {
             self.chunk_size = new_size;
         }
 
-        try self.chunks.append(new_chunk);
+        try self.chunks.append(self.alloc, new_chunk);
         self.current_chunk = new_chunk;
 
         self.used.store(0, .monotonic);

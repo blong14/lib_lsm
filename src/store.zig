@@ -22,6 +22,7 @@ const parseInt = std.fmt.parseInt;
 const startsWith = std.mem.startsWith;
 
 pub const SSTableStore = struct {
+    alloc: Allocator,
     levels: ArrayList(ArrayList(*SSTable)),
     opts: Opts,
     num_levels: usize,
@@ -55,11 +56,11 @@ pub const SSTableStore = struct {
     pub fn init(alloc: Allocator, opts: Opts) !Self {
         const num_levels = opts.num_levels orelse 3;
 
-        var levels = ArrayList(ArrayList(*SSTable)).init(alloc);
+        var levels = try ArrayList(ArrayList(*SSTable)).initCapacity(alloc, 256);
 
         var i: usize = 0;
         while (i < num_levels) : (i += 1) {
-            try levels.append(ArrayList(*SSTable).init(alloc));
+            try levels.append(alloc, try ArrayList(*SSTable).initCapacity(alloc, 256));
         }
 
         var strategy: CompactionStrategy = undefined;
@@ -95,6 +96,7 @@ pub const SSTableStore = struct {
         }
 
         return .{
+            .alloc = alloc,
             .levels = levels,
             .opts = opts,
             .num_levels = num_levels,
@@ -109,10 +111,10 @@ pub const SSTableStore = struct {
 
         const malloc = arena.allocator();
 
-        var tables_to_release = ArrayList(*SSTable).init(malloc);
-        defer tables_to_release.deinit();
+        var tables_to_release = try ArrayList(*SSTable).initCapacity(malloc, 256);
+        defer tables_to_release.deinit(malloc);
 
-        try tables_to_release.appendSlice(self.get(level));
+        try tables_to_release.appendSlice(malloc, self.get(level));
         for (tables_to_release.items) |table| {
             const fln = try std.fmt.allocPrint(
                 malloc,
@@ -145,12 +147,12 @@ pub const SSTableStore = struct {
                     sstable.deinit();
                     alloc.destroy(sstable);
                 }
-                level.deinit();
+                level.deinit(alloc);
             }
         }
 
         self.compaction_strategy.deinit(alloc);
-        self.levels.deinit();
+        self.levels.deinit(alloc);
         self.stats.printStats();
         self.stats.deinit();
     }
@@ -570,7 +572,7 @@ pub const SSTableStore = struct {
             defer arena.deinit();
             const temp_alloc = arena.allocator();
 
-            var retained_tables = std.ArrayList(*SSTable).init(temp_alloc);
+            var retained_tables = try std.ArrayList(*SSTable).initCapacity(temp_alloc, 256);
             defer {
                 for (retained_tables.items) |table| {
                     _ = table.release();
@@ -581,7 +583,7 @@ pub const SSTableStore = struct {
             for (tables) |table| {
                 current_level_bytes += table.block.size();
                 table.retain();
-                try retained_tables.append(table);
+                try retained_tables.append(temp_alloc, table);
             }
 
             const metadata_overhead = 1024; // Space for headers, offsets, etc.
@@ -732,7 +734,7 @@ pub const SSTableStore = struct {
 
             // Increment reference count when adding to a level
             st.retain();
-            try self.levels.items[level].append(st);
+            try self.levels.items[level].append(self.alloc, st);
         }
 
         _ = self.stats.files_count[level].fetchAdd(1, .monotonic);
@@ -783,7 +785,7 @@ pub const SSTableStore = struct {
             for (self.used_tables.items) |table| {
                 _ = table.release();
             }
-            self.used_tables.deinit();
+            self.used_tables.deinit(self.alloc);
 
             self.alloc.destroy(self.merger);
             self.alloc.destroy(self);
@@ -800,15 +802,15 @@ pub const SSTableStore = struct {
         merger.* = try MergeIterator(KV, keyvalue.compare).init(alloc);
 
         // Create a list to track all tables we're using
-        var used_tables = ArrayList(*SSTable).init(alloc);
-        errdefer used_tables.deinit();
+        var used_tables = try ArrayList(*SSTable).initCapacity(alloc, 256);
+        errdefer used_tables.deinit(alloc);
 
         var level_idx: usize = 0;
         while (level_idx < self.num_levels) : (level_idx += 1) {
             for (self.get(level_idx)) |sstable| {
                 // Retain the table while the iterator is active
                 sstable.retain();
-                try used_tables.append(sstable);
+                try used_tables.append(alloc, sstable);
 
                 const siter = try sstable.iterator(alloc);
                 try merger.add(siter);

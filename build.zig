@@ -125,16 +125,6 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&rustfmt.step);
     fmt_step.dependOn(&zigfmt.step);
 
-    // Add lib specific deps (check zig cacheing)
-    const clap = b.dependency("clap", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const fast_csv = b.dependency("csv-fast-reader", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     // make zig-out/include/skiplist.h
     // make zig-out/lib/libconcurrent_skiplist.so
     const rust = rust_build(b);
@@ -145,48 +135,37 @@ pub fn build(b: *std.Build) void {
     const lsm_headers = cp_lsm_headers(b);
     lsm_headers.step.dependOn(&rust.step);
 
-    const lib_mod = b.createModule(.{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // make zig-out/lib/liblib_lsm.a
+    // make zig-out/lib/liblsm.a
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "lib_lsm",
-        .root_module = lib_mod,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
     lib.step.dependOn(&rust.step);
     lib.step.dependOn(&lsm_headers.step);
-    lib.addIncludePath(fast_csv.path(""));
-    lib.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"}, .flags = &.{} });
-    lib.addIncludePath(b.path("zig-out/include"));
-    lib.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
-    lib.linkLibC();
+    lib.root_module.addIncludePath(b.path("zig-out/include"));
+    lib.root_module.addObjectFile(
+        b.path("zig-out/lib/release/libconcurrent_skiplist.so"),
+    );
 
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`)
     b.installArtifact(lib);
 
-    // Main module to be imported into separate run artifacts
-    const lsm = b.addModule("lsm", .{ .root_source_file = b.path("src/lib.zig") });
-    lsm.addIncludePath(b.path("zig-out/include"));
-    lsm.addObjectFile(b.path("zig-out/lib/release/libconcurrent_skiplist.so"));
-
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const main_tests = b.addTest(.{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
+        .name = "main_tests",
+        .root_module = lib.root_module,
     });
     main_tests.step.dependOn(&rust.step);
     main_tests.step.dependOn(&lsm_headers.step);
-    main_tests.root_module.addImport("lsm", lsm);
-    main_tests.addIncludePath(b.path("zig-out/include"));
-    main_tests.linkLibC();
 
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run library tests");
@@ -197,24 +176,35 @@ pub fn build(b: *std.Build) void {
     const cover_step = b.step("cover", "Generate test coverage report");
     cover_step.dependOn(&run_main_cover.step);
 
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    // make build-lsmctl
+    const clap = b.dependency("clap", .{
         .target = target,
         .optimize = optimize,
     });
-
-    // make build-lsmctl
+    const fast_csv = b.dependency("csv-fast-reader", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const exe = b.addExecutable(.{
         .name = "lsmctl",
-        .root_module = exe_mod,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
     exe.step.dependOn(&rust.step);
     exe.step.dependOn(&lsm_headers.step);
-    exe.root_module.addImport("lsm", lsm);
     exe.root_module.addImport("clap", clap.module("clap"));
-    exe.addIncludePath(fast_csv.path(""));
-    exe.addCSourceFiles(.{ .root = fast_csv.path(""), .files = &.{"csv.c"}, .flags = &.{} });
-    exe.linkLibC();
+    exe.root_module.addImport("lsm", lib.root_module);
+    exe.root_module.addIncludePath(fast_csv.path(""));
+    exe.root_module.addCSourceFiles(.{
+        .root = fast_csv.path(""),
+        .files = &.{"csv.c"},
+        .flags = &.{},
+    });
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

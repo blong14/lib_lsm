@@ -5,7 +5,6 @@ const map = @import("mmap.zig");
 const options = @import("opts.zig");
 
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
 
 const KV = keyvalue.KV;
 const MMap = map.AppendOnlyMMap;
@@ -15,7 +14,6 @@ const Endian = std.builtin.Endian.little;
 const PageSize = std.heap.pageSize();
 
 const assert = std.debug.assert;
-const print = std.debug.print;
 const copyBackwards = std.mem.copyBackwards;
 const fixedBufferStream = std.io.fixedBufferStream;
 const writeInt = std.mem.writeInt;

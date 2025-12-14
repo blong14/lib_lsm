@@ -80,7 +80,7 @@ pub fn MergeIterator(
         pub fn init(allocator: std.mem.Allocator) !Self {
             return Self{
                 .allocator = allocator,
-                .iterators = std.ArrayList(Iterator(T)).init(allocator),
+                .iterators = try std.ArrayList(Iterator(T)).initCapacity(allocator, 4096),
                 .queue = PriorityQueue.init(allocator, {}),
                 .compareFn = compareFn,
             };
@@ -92,7 +92,7 @@ pub fn MergeIterator(
             for (self.iterators.items) |*iter| {
                 iter.deinit();
             }
-            self.iterators.deinit();
+            self.iterators.deinit(self.allocator);
 
             self.queue.deinit();
 
@@ -100,7 +100,7 @@ pub fn MergeIterator(
         }
 
         pub fn add(self: *Self, iter: Iterator(T)) !void {
-            try self.iterators.append(iter);
+            try self.iterators.append(self.allocator, iter);
 
             if (self.iterators.items[self.iterators.items.len - 1].next()) |value| {
                 try self.queue.add(Item{ .value = value });
@@ -288,8 +288,8 @@ test Iterator {
     expected[1] = 1;
     expected[2] = 3;
 
-    var actual = std.ArrayList(u32).init(alloc);
-    defer actual.deinit();
+    var actual = try std.ArrayList(u32).initCapacity(alloc, 10);
+    defer actual.deinit(alloc);
 
     var stream = U32Stream.init(expected);
 
@@ -297,7 +297,7 @@ test Iterator {
     defer iter.deinit();
 
     while (iter.next()) |nxt| {
-        try actual.append(nxt);
+        try actual.append(alloc, nxt);
     }
 
     try testing.expectEqual(expected.len, actual.items.len);
@@ -331,11 +331,11 @@ test "FilterIterator" {
     var iter = filter.iterator();
     defer iter.deinit();
 
-    var actual = std.ArrayList(u32).init(alloc);
-    defer actual.deinit();
+    var actual = try std.ArrayList(u32).initCapacity(alloc, 10);
+    defer actual.deinit(alloc);
 
     while (iter.next()) |n| {
-        try actual.append(n);
+        try actual.append(alloc, n);
     }
 
     try testing.expectEqual(@as(usize, 3), actual.items.len);
@@ -388,11 +388,11 @@ test "MergeIterator" {
     var mergedIter = merger.iterator();
     defer mergedIter.deinit();
 
-    var actual = std.ArrayList(u32).init(alloc);
-    defer actual.deinit();
+    var actual = try std.ArrayList(u32).initCapacity(alloc, 10);
+    defer actual.deinit(alloc);
 
     while (mergedIter.next()) |n| {
-        try actual.append(n);
+        try actual.append(alloc, n);
     }
 
     try testing.expectEqual(@as(usize, 9), actual.items.len);
@@ -434,11 +434,11 @@ test "ScanIterator" {
         var iter = scan.iterator();
         defer iter.deinit();
 
-        var actual = std.ArrayList(u32).init(alloc);
-        defer actual.deinit();
+        var actual = try std.ArrayList(u32).initCapacity(alloc, 10);
+        defer actual.deinit(alloc);
 
         while (iter.next()) |n| {
-            try actual.append(n);
+            try actual.append(alloc, n);
         }
 
         // Should include 3,4,5,6,7 (values >= 3 and <= 7)
@@ -460,11 +460,11 @@ test "ScanIterator" {
         var iter = scan.iterator();
         defer iter.deinit();
 
-        var actual = std.ArrayList(u32).init(alloc);
-        defer actual.deinit();
+        var actual = try std.ArrayList(u32).initCapacity(alloc, 10);
+        defer actual.deinit(alloc);
 
         while (iter.next()) |n| {
-            try actual.append(n);
+            try actual.append(alloc, n);
         }
 
         // Should include 0,1,2,3,4,5
@@ -487,11 +487,11 @@ test "ScanIterator" {
         var iter = scan.iterator();
         defer iter.deinit();
 
-        var actual = std.ArrayList(u32).init(alloc);
-        defer actual.deinit();
+        var actual = try std.ArrayList(u32).initCapacity(alloc, 10);
+        defer actual.deinit(alloc);
 
         while (iter.next()) |n| {
-            try actual.append(n);
+            try actual.append(alloc, n);
         }
 
         // Should include 7,8,9

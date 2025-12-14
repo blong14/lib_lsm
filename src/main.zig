@@ -56,7 +56,9 @@ pub fn main() !void {
         .allocator = allocator,
     }) catch |err| {
         // Report useful error and exit
-        diag.report(io.getStdErr().writer(), err) catch {};
+        var buf: [1024]u8 = undefined;
+        var w = std.fs.File.stderr().writer(&buf).interface;
+        diag.report(&w, err) catch {};
         return err;
     };
     defer res.deinit();
@@ -185,11 +187,11 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         }
     }.read;
 
-    var kvs = std.ArrayList([]const u8).init(arena_alloc);
-    defer kvs.deinit();
+    var kvs = std.ArrayList([]const u8).initCapacity(arena_alloc, 4096) catch unreachable;
+    defer kvs.deinit(arena_alloc);
 
-    var threads = std.ArrayList(*ReadThreadContext).init(arena_alloc);
-    defer threads.deinit();
+    var threads = std.ArrayList(*ReadThreadContext).initCapacity(arena_alloc, 10) catch unreachable;
+    defer threads.deinit(arena_alloc);
 
     var wait_group = arena_alloc.create(std.Thread.WaitGroup) catch unreachable;
     wait_group.reset();
@@ -221,11 +223,11 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             const k = mem.span(val);
             const key = std.fmt.allocPrint(arena_alloc, "{s}_{d}", .{ k, i }) catch unreachable;
 
-            kvs.append(key) catch return;
+            kvs.append(arena_alloc, key) catch return;
         }
 
         if (kvs.items.len >= ops_per_thread) {
-            const items = kvs.toOwnedSlice() catch |err| {
+            const items = kvs.toOwnedSlice(arena_alloc) catch |err| {
                 debug.print(
                     "not able to publish items {s}\n",
                     .{@errorName(err)},
@@ -245,12 +247,12 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             };
 
             thread_id += 1;
-            threads.append(ctx) catch unreachable;
+            threads.append(arena_alloc, ctx) catch unreachable;
         }
     }
 
     if (kvs.items.len > 0) {
-        const items = kvs.toOwnedSlice() catch |err| {
+        const items = kvs.toOwnedSlice(arena_alloc) catch |err| {
             debug.print(
                 "not able to publish items {s}\n",
                 .{@errorName(err)},
@@ -270,11 +272,11 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         };
 
         thread_id += 1;
-        threads.append(ctx) catch unreachable;
+        threads.append(arena_alloc, ctx) catch unreachable;
     }
 
     // stutter to make sure threads are schehduled. must be a better way
-    std.time.sleep(1000);
+    std.Thread.sleep(1000);
 
     thread_pool.waitAndWork(wait_group);
 
@@ -381,8 +383,8 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         }
     }.work;
 
-    var threads = std.ArrayList(*ThreadContext).init(arena_alloc);
-    defer threads.deinit();
+    var threads = std.ArrayList(*ThreadContext).initCapacity(arena_alloc, 10) catch unreachable;
+    defer threads.deinit(arena_alloc);
 
     var wait_group = arena_alloc.create(std.Thread.WaitGroup) catch unreachable;
     wait_group.reset();
@@ -398,8 +400,8 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     };
     defer thread_pool.deinit();
 
-    var kvs = std.ArrayList(KV).init(arena_alloc);
-    defer kvs.deinit();
+    var kvs = std.ArrayList(KV).initCapacity(arena_alloc, 4096) catch unreachable;
+    defer kvs.deinit(arena_alloc);
 
     const handle = csv.CsvOpen2(input.ptr, ';', '"', '\\');
     defer csv.CsvClose(handle);
@@ -429,10 +431,10 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
         const key = std.fmt.allocPrint(arena_alloc, "{s}_{d}", .{ k, i }) catch unreachable;
 
         const item = KV.initOwned(arena_alloc, key, value) catch unreachable;
-        kvs.append(item) catch return;
+        kvs.append(arena_alloc, item) catch return;
 
         if (kvs.items.len >= write_cnt) {
-            const items = kvs.toOwnedSlice() catch |err| {
+            const items = kvs.toOwnedSlice(arena_alloc) catch |err| {
                 debug.print(
                     "not able to publish items {s}\n",
                     .{@errorName(err)},
@@ -453,12 +455,12 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             };
 
             thread_id += 1;
-            threads.append(ctx) catch unreachable;
+            threads.append(arena_alloc, ctx) catch unreachable;
         }
     }
 
     if (kvs.items.len > 0) {
-        const items = kvs.toOwnedSlice() catch |err| {
+        const items = kvs.toOwnedSlice(arena_alloc) catch |err| {
             debug.print(
                 "not able to publish items {s}\n",
                 .{@errorName(err)},
@@ -478,10 +480,10 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
             return;
         };
 
-        threads.append(ctx) catch unreachable;
+        threads.append(arena_alloc, ctx) catch unreachable;
     }
 
-    std.time.sleep(1000);
+    std.Thread.sleep(1000);
     thread_pool.waitAndWork(wait_group);
 
     // Calculate total counts
@@ -792,12 +794,12 @@ fn scan(alloc: Allocator, db: *lsm.Database, start: []const u8, end: []const u8)
     var it = db.scan(alloc, start, end) catch |err| @panic(@errorName(err));
     defer it.deinit();
 
-    var w = std.io.bufferedWriter(std.io.getStdOut().writer());
+    var buf: [1024 * 1024]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf).interface;
 
     var count: usize = 0;
     while (it.next()) |kv| {
-        const out = std.fmt.allocPrint(alloc, "{d} - {s}\n", .{ count, kv }) catch unreachable;
-        _ = w.write(out) catch unreachable;
+        w.print("{d} - {s}\n", .{ count, kv.raw_bytes }) catch unreachable;
         count += 1;
     }
 
@@ -810,13 +812,12 @@ fn iterator(alloc: Allocator, db: *lsm.Database) void {
     var it = db.iterator(alloc) catch |err| @panic(@errorName(err));
     defer it.deinit();
 
-    var w = std.io.bufferedWriter(std.io.getStdOut().writer());
+    var w = std.fs.File.stdout().writer().interface;
 
     var count: usize = 0;
     while (it.next()) |kv| {
+        w.print("{d} - {s}\n", .{ count, kv.raw_bytes }) catch unreachable;
         count += 1;
-        const out = std.fmt.allocPrint(alloc, "{d} - {s}\n", .{ count, kv }) catch unreachable;
-        _ = w.write(out) catch unreachable;
     }
 
     w.flush() catch unreachable;

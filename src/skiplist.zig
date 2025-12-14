@@ -174,14 +174,14 @@ test "SkipList.Iterator" {
         try skl.put(entry.key, entry.raw_bytes);
     }
 
-    var actual = std.ArrayList(KV).init(alloc);
-    defer actual.deinit();
+    var actual = try std.ArrayList(KV).initCapacity(alloc, 10);
+    defer actual.deinit(alloc);
 
     var it = try skl.iterator(alloc);
     defer it.deinit();
 
     while (it.next()) |nxt| {
-        try actual.append(try nxt.clone(alloc));
+        try actual.append(alloc, try nxt.clone(alloc));
     }
 
     try testing.expectEqual(3, actual.items.len);

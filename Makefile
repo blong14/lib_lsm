@@ -84,7 +84,7 @@ fmt:
 perf:
 	rm -rf .tmp/data/*.dat
 	rm -rf .tmp/data/*.mtab
-	perf record --call-graph dwarf -F 200 -g $(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
+	perf record --call-graph dwarf -F 200 -g $(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--perf \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \

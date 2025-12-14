@@ -5,7 +5,6 @@ const Iterator = @import("iterator.zig").Iterator;
 const KV = @import("kv.zig").KV;
 
 const Allocator = std.mem.Allocator;
-const BufferedWriter = std.io.BufferedWriter;
 const FixedBuffer = std.io.FixedBufferStream;
 const Mutex = std.Thread.Mutex;
 
@@ -14,7 +13,6 @@ const MB = 1024 * 1024;
 const PageSize = std.heap.pageSize();
 
 const assert = std.debug.assert;
-const bufferedWriter = std.io.bufferedWriter;
 const fixedBufferStream = std.io.fixedBufferStream;
 const writeInt = std.mem.writeInt;
 const readInt = std.mem.readInt;
@@ -137,7 +135,7 @@ pub const WAL = struct {
             .mtx = Mutex{},
             .conf = conf,
             .active_segment = active_segment,
-            .segments = std.ArrayList(*Segment).init(alloc),
+            .segments = try std.ArrayList(*Segment).initCapacity(alloc, 256),
         };
     }
 
@@ -148,7 +146,7 @@ pub const WAL = struct {
             segment.deinit();
             alloc.destroy(segment);
         }
-        self.segments.deinit();
+        self.segments.deinit(alloc);
         self.* = undefined;
     }
 
@@ -158,7 +156,7 @@ pub const WAL = struct {
 
         self.active_segment.write(kv) catch |err| switch (err) {
             error.NoSpaceLeft => {
-                try self.segments.append(self.active_segment);
+                try self.segments.append(alloc, self.active_segment);
 
                 const current_id = self.active_segment.id;
 

@@ -3,7 +3,7 @@ package main
 // https://github.com/eatonphil/waterbugdb
 
 // #cgo CFLAGS: -I../zig-out/include
-// #cgo LDFLAGS: -L../zig-out/lib -llib_lsm
+// #cgo LDFLAGS: -L../zig-out/lib/release -lconcurrent_skiplist -L../zig-out/lib -llib_lsm
 // #include <stdlib.h>
 // #include <lib_lsm.h>
 import "C"
