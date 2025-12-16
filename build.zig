@@ -149,6 +149,7 @@ pub fn build(b: *std.Build) void {
     lib.step.dependOn(&rust.step);
     lib.step.dependOn(&lsm_headers.step);
     lib.root_module.addIncludePath(b.path("zig-out/include"));
+    lib.root_module.addLibraryPath(b.path("zig-out/lib/release"));
     lib.root_module.addObjectFile(
         b.path("zig-out/lib/release/libconcurrent_skiplist.so"),
     );
