@@ -3,7 +3,7 @@ FROM debian:bookworm AS builder
 ARG GO_VERSION=1.24.2
 ARG RUST_VERSION=1.86.0
 ARG CBINDGEN_VERSION=0.28.0
-ARG ZIG_VERSION=0.13.0
+ARG ZIG_VERSION=0.15.2
 ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y \
