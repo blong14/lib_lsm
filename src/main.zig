@@ -794,16 +794,11 @@ fn scan(alloc: Allocator, db: *lsm.Database, start: []const u8, end: []const u8)
     var it = db.scan(alloc, start, end) catch |err| @panic(@errorName(err));
     defer it.deinit();
 
-    var buf: [1024 * 1024]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf).interface;
-
     var count: usize = 0;
     while (it.next()) |kv| {
-        w.print("{d} - {s}\n", .{ count, kv.raw_bytes }) catch unreachable;
+        std.log.info("{d} - {s}", .{ count, kv.key });
         count += 1;
     }
-
-    w.flush() catch unreachable;
 
     std.log.info("\ntotal rows {d}", .{count});
 }
@@ -816,7 +811,7 @@ fn iterator(alloc: Allocator, db: *lsm.Database) void {
 
     var count: usize = 0;
     while (it.next()) |kv| {
-        w.print("{d} - {s}\n", .{ count, kv.raw_bytes }) catch unreachable;
+        w.print("{d} - {s}\n", .{ count, kv.key }) catch unreachable;
         count += 1;
     }
 

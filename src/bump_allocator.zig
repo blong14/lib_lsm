@@ -31,7 +31,7 @@ pub const ThreadSafeBumpAllocator = struct {
             @max(initial_chunk_size, MIN_CHUNK_SIZE),
         ) catch initial_chunk_size;
 
-        const first_chunk = try alloc.alignedAlloc(u8, 16, adjusted_size);
+        const first_chunk = try alloc.alignedAlloc(u8, .@"16", adjusted_size);
         errdefer alloc.free(first_chunk);
 
         try chunks.append(alloc, first_chunk);
@@ -56,7 +56,7 @@ pub const ThreadSafeBumpAllocator = struct {
         for (self.chunks.items) |chunk| {
             self.alloc.free(chunk);
         }
-        self.chunks.deinit();
+        self.chunks.deinit(self.alloc);
     }
 
     pub fn allocator(self: *ThreadSafeBumpAllocator) Allocator {
@@ -65,6 +65,7 @@ pub const ThreadSafeBumpAllocator = struct {
             .vtable = &.{
                 .alloc = allocFn,
                 .resize = resizeFn,
+                .remap = remapFn,
                 .free = freeFn,
             },
         };
@@ -72,7 +73,7 @@ pub const ThreadSafeBumpAllocator = struct {
 
     fn add_chunk(self: *ThreadSafeBumpAllocator) !void {
         const new_size = @min(self.chunk_size * 2, MAX_CHUNK_SIZE);
-        const new_chunk = try self.alloc.alignedAlloc(u8, 16, new_size);
+        const new_chunk = try self.alloc.alignedAlloc(u8, .@"16", new_size);
 
         if (new_size > self.chunk_size) {
             self.chunk_size = new_size;
@@ -85,9 +86,9 @@ pub const ThreadSafeBumpAllocator = struct {
         _ = self.total_allocations.fetchAdd(1, .monotonic);
     }
 
-    fn allocFn(ctx: *anyopaque, len: usize, log2_align: u8, ret_addr: usize) ?[*]u8 {
+    fn allocFn(ctx: *anyopaque, len: usize, log2_align: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *ThreadSafeBumpAllocator = @ptrCast(@alignCast(ctx));
-        const algn = @as(usize, 1) << @intCast(log2_align);
+        const algn = log2_align.toByteUnits();
 
         if (len <= 64 and algn <= 16) {
             return self.fastAllocate(len, algn);
@@ -137,8 +138,8 @@ pub const ThreadSafeBumpAllocator = struct {
             if (len > current_chunk.len) {
                 // Requested allocation is larger than our chunk size
                 // Allocate a dedicated chunk for this request
-                const large_chunk = self.alloc.alignedAlloc(u8, 16, len) catch return null;
-                self.chunks.append(large_chunk) catch {
+                const large_chunk = self.alloc.alignedAlloc(u8, .@"16", len) catch return null;
+                self.chunks.append(self.alloc, large_chunk) catch {
                     self.alloc.free(large_chunk);
                     return null;
                 };
@@ -156,7 +157,14 @@ pub const ThreadSafeBumpAllocator = struct {
         return current_chunk.ptr + aligned_start;
     }
 
-    fn resizeFn(ctx: *anyopaque, buf: []u8, log2_align: u8, new_len: usize, ret_addr: usize) bool {
+    fn remapFn(ctx: *anyopaque, buf: []u8, log2_align: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = buf;
+        const self: *ThreadSafeBumpAllocator = @ptrCast(@alignCast(ctx));
+
+        return self.slowAllocate(new_len, log2_align.toByteUnits(), ret_addr);
+    }
+
+    fn resizeFn(ctx: *anyopaque, buf: []u8, log2_align: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         _ = log2_align;
         _ = ret_addr;
 
@@ -179,7 +187,7 @@ pub const ThreadSafeBumpAllocator = struct {
         return false;
     }
 
-    fn freeFn(ctx: *anyopaque, buf: []u8, log2_align: u8, ret_addr: usize) void {
+    fn freeFn(ctx: *anyopaque, buf: []u8, log2_align: std.mem.Alignment, ret_addr: usize) void {
         _ = ret_addr;
         _ = log2_align;
 
@@ -336,7 +344,7 @@ test "Benchmark" {
     }
 }
 
-var ballast: usize = std.mem.page_size;
+var ballast = std.heap.pageSize();
 
 fn xalloc(alloc: Allocator, buffer: *[]u8, len_: usize) ![]u8 {
     if (buffer.*.len == 0) {
