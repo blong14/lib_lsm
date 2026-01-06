@@ -1,15 +1,12 @@
 const std = @import("std");
 
+const iter = @import("iterator.zig");
 const c = @cImport({
     @cInclude("skiplist.h");
 });
-const iter = @import("iterator.zig");
-const keyvalue = @import("kv.zig");
 
 const Allocator = std.mem.Allocator;
-
 const Iterator = iter.Iterator;
-const KV = keyvalue.KV;
 
 pub fn SkipList(
     comptime V: type,
@@ -119,71 +116,4 @@ pub fn SkipList(
             return Iterator(V).init(it, SkiplistIterator.next, SkiplistIterator.deinit);
         }
     };
-}
-
-test SkipList {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var skl = try SkipList(KV, keyvalue.decode).init();
-    defer skl.deinit();
-
-    const key: []const u8 = "__key__";
-
-    {
-        var expected = try KV.initOwned(alloc, key, "__value__");
-        defer expected.deinit(alloc);
-
-        try skl.put(key, expected.raw_bytes);
-
-        const actual = try skl.get(key);
-
-        try testing.expectEqualStrings(expected.value, actual.?.value);
-    }
-
-    {
-        var expected = try KV.initOwned(alloc, key, "__new_value__");
-        defer expected.deinit(alloc);
-
-        try skl.put(key, expected.raw_bytes);
-
-        const actual = try skl.get(key);
-
-        try testing.expectEqualStrings(expected.value, actual.?.value);
-    }
-}
-
-test "SkipList.Iterator" {
-    const testing = std.testing;
-    const ta = testing.allocator;
-
-    var arena = std.heap.ArenaAllocator.init(ta);
-    defer arena.deinit();
-
-    const alloc = arena.allocator();
-
-    var skl = try SkipList(KV, keyvalue.decode).init();
-    defer skl.deinit();
-
-    const entries = [_]KV{
-        try KV.initOwned(alloc, "b", "b"),
-        try KV.initOwned(alloc, "a", "a"),
-        try KV.initOwned(alloc, "c", "c"),
-    };
-    for (entries) |entry| {
-        try skl.put(entry.key, entry.raw_bytes);
-    }
-
-    var actual = try std.ArrayList(KV).initCapacity(alloc, 10);
-    defer actual.deinit(alloc);
-
-    var it = try skl.iterator(alloc);
-    defer it.deinit();
-
-    while (it.next()) |nxt| {
-        try actual.append(alloc, try nxt.clone(alloc));
-    }
-
-    try testing.expectEqual(3, actual.items.len);
-    try testing.expectEqualStrings("a", actual.items[0].key);
 }

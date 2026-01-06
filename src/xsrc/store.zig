@@ -570,6 +570,7 @@ pub const SSTableStore = struct {
 
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
+
             const temp_alloc = arena.allocator();
 
             var retained_tables = try std.ArrayList(*SSTable).initCapacity(temp_alloc, 256);
@@ -585,10 +586,6 @@ pub const SSTableStore = struct {
                 table.retain();
                 try retained_tables.append(temp_alloc, table);
             }
-
-            const metadata_overhead = 1024; // Space for headers, offsets, etc.
-            const safety_buffer = current_level_bytes / 4; // 25% buffer for safety
-            const estimated_size = current_level_bytes + metadata_overhead + safety_buffer;
 
             const start_time = std.time.nanoTimestamp();
 
@@ -606,7 +603,7 @@ pub const SSTableStore = struct {
                 .{ new_table.data_dir, new_table.id },
             );
 
-            const out_file = try file_utils.openAndTruncate(filename, estimated_size);
+            const out_file = try file_utils.openAndTruncate(filename, tm.opts.sst_capacity);
             try new_table.open(out_file);
 
             var keys_compacted: usize = 0;
@@ -633,8 +630,6 @@ pub const SSTableStore = struct {
             }
 
             if (keys_compacted > 0) {
-                try new_table.block.flush();
-
                 new_table.file.sync() catch |err| {
                     std.log.err(
                         "not able to file sync {s} for file {s}",
@@ -740,7 +735,7 @@ pub const SSTableStore = struct {
         _ = self.stats.files_count[level].fetchAdd(1, .monotonic);
 
         self.stats.recordBytesWritten(level, st.block.size());
-        self.stats.recordKeysWritten(level, st.block.count);
+        self.stats.recordKeysWritten(level, st.block.len());
     }
 
     pub fn get(self: *Self, level: usize) []const *SSTable {
@@ -762,7 +757,7 @@ pub const SSTableStore = struct {
         // each level
         for (0..self.num_levels) |level| {
             for (self.levels.items[level].items) |sstable| {
-                if (try sstable.xread(key)) |kv| {
+                if (try sstable.read(key)) |kv| {
                     return kv;
                 }
             }
@@ -846,8 +841,7 @@ pub const SSTableStore = struct {
         );
         defer alloc.free(filename);
 
-        const sz = mtable.size() * 10;
-        const out_file = try file_utils.openWithCapacity(filename, sz);
+        const out_file = try file_utils.openWithCapacity(filename, self.opts.sst_capacity);
 
         try sstable.open(out_file);
 
@@ -871,8 +865,6 @@ pub const SSTableStore = struct {
         }
 
         if (keys_written > 0) {
-            try sstable.block.flush();
-
             sstable.file.sync() catch |err| {
                 std.log.err(
                     "file synced failed {s} {s}",
@@ -1033,8 +1025,6 @@ test "SSTableStore open" {
         // Persist tables to disk
         for (0..2) |level| {
             for (store.get(level)) |table| {
-                try table.block.flush();
-
                 try table.file.sync();
 
                 table.mutable = false;

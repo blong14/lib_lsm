@@ -9,7 +9,10 @@ const Allocator = std.mem.Allocator;
 const DatabaseSupervisor = spv.DatabaseSupervisor;
 const Iterator = iter.Iterator;
 
-var allocator = std.heap.smp_allocator;
+var tsa: std.heap.ThreadSafeAllocator = .{
+    .child_allocator = std.heap.c_allocator,
+};
+var allocator = tsa.allocator();
 
 var supervisor: *DatabaseSupervisor = undefined;
 
@@ -17,7 +20,7 @@ var supervisor: *DatabaseSupervisor = undefined;
 
 pub const Opts = opt.Opts;
 pub const Database = @import("Database.zig");
-pub const KV = @import("KV.zig");
+pub const KV = @import("kv.zig").KV;
 
 pub const defaultOpts = opt.defaultOpts;
 pub const withDataDirOpts = opt.withDataDirOpts;
@@ -36,29 +39,27 @@ pub fn init(alloc: Allocator, opts: Opts) !*Database {
 
     db.* = try databaseFromOpts(alloc, opts);
 
-    try db.open(alloc);
+    // try db.open(alloc);
 
-    supervisor = try DatabaseSupervisor.init(alloc, db, .{});
-    try supervisor.start();
+    // supervisor = try DatabaseSupervisor.init(alloc, db, .{});
+    // try supervisor.start();
 
     return db;
 }
 
 pub fn deinit(alloc: Allocator, db: *Database) void {
-    supervisor.stop();
-    supervisor.deinit();
+    // supervisor.stop();
+    // supervisor.deinit();
 
-    db.close(alloc) catch unreachable;
+    // db.shutdown(alloc) catch unreachable;
+    // db.flush(alloc) catch return;
     db.deinit(alloc);
     alloc.destroy(db);
 }
 
 pub fn read(db: *Database, key: []const u8) !?KV {
-    if (db.read(allocator, key) catch |err| switch (err) {
-        error.InvalidLsmState => return read(db, key),
-        else => return err,
-    }) |value| {
-        supervisor.submitEvent(.{ .read_completed = .{ .bytes = value.len() } });
+    if (try db.read(key)) |value| {
+        // supervisor.submitEvent(.{ .read_completed = .{ .bytes = value.len() } });
         return value;
     }
 
@@ -66,11 +67,14 @@ pub fn read(db: *Database, key: []const u8) !?KV {
 }
 
 pub fn write(db: *Database, kv: KV) !void {
-    db.write(allocator, kv) catch |err| switch (err) {
-        error.InvalidLsmState => return write(db, kv),
+    db.write(kv) catch |err| switch (err) {
+        error.MemtableImmutable => {
+            try db.flush(allocator);
+            return write(db, kv);
+        },
         else => return err,
     };
-    supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+    // supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
 }
 
 // Public C Interface
@@ -111,7 +115,7 @@ export fn lsm_write(addr: *anyopaque, k: [*c]const u8, v: [*c]const u8) bool {
     const key = std.mem.span(k);
     const value = std.mem.span(v);
 
-    var kv = KV.init(allocator, key, value) catch return false;
+    var kv = KV.initOwned(allocator, key, value) catch return false;
     defer kv.deinit(allocator);
 
     const db: *Database = @ptrCast(@alignCast(addr));
@@ -181,8 +185,8 @@ test "C interface lsm_init_with_config" {
 
     const actual: *Database = @ptrCast(@alignCast(db));
 
-    try std.testing.expect(actual.Opts.sst_capacity > 0);
-    try std.testing.expectEqualStrings(dir_name, actual.Opts.data_dir);
+    try std.testing.expect(actual.capacity > 0);
+    try std.testing.expectEqualStrings(dir_name, actual.opts.data_dir);
     try std.testing.expect(lsm_deinit(db.?));
 }
 
@@ -196,10 +200,13 @@ test "C interface lsm_write with invalid data returns false" {
     defer testDir.dir.deleteTree(dir_name) catch {};
 
     const opts = withDataDirOpts(dir_name);
-    var db = try Database.init(alloc, opts);
-    defer db.deinit(alloc);
+    const db = try Database.init(alloc, opts);
+    defer {
+        db.deinit(alloc);
+        alloc.destroy(db);
+    }
 
-    const result = lsm_write(&db, null, "value");
+    const result = lsm_write(db, null, "value");
     try std.testing.expect(!result);
 }
 
@@ -213,10 +220,13 @@ test "C interface lsm_read with non-existent key returns null" {
     defer testDir.dir.deleteTree(dir_name) catch {};
 
     const opts = withDataDirOpts(dir_name);
-    var db = try Database.init(alloc, opts);
-    defer db.deinit(alloc);
+    const db = try Database.init(alloc, opts);
+    defer {
+        db.deinit(alloc);
+        alloc.destroy(db);
+    }
 
-    const result = lsm_read(&db, "non_existent_key");
+    const result = lsm_read(db, "non_existent_key");
     try std.testing.expect(result == null);
 }
 
@@ -230,19 +240,22 @@ test "C interface lsm_scan" {
     defer testDir.dir.deleteTree(dir_name) catch {};
 
     const opts = withDataDirOpts(dir_name);
-    var db = try Database.init(alloc, opts);
-    defer db.deinit(alloc);
-
-    const keys = [_]KV{
-        try KV.init(alloc, "__3__", "__key_3__"),
-        try KV.init(alloc, "__2__", "__key_2__"),
-        try KV.init(alloc, "__1__", "__key_1__"),
-    };
-    for (keys) |expected| {
-        try db.write(alloc, expected);
+    const db = try Database.init(alloc, opts);
+    defer {
+        db.deinit(alloc);
+        alloc.destroy(db);
     }
 
-    const scanner = lsm_scan(&db, "__1__", "__3__");
+    const keys = [_]KV{
+        try KV.initOwned(alloc, "__3__", "__key_3__"),
+        try KV.initOwned(alloc, "__2__", "__key_2__"),
+        try KV.initOwned(alloc, "__1__", "__key_1__"),
+    };
+    for (keys) |expected| {
+        try db.write(expected);
+    }
+
+    const scanner = lsm_scan(db, "__1__", "__3__");
 
     try std.testing.expectEqualStrings(
         "__key_1__",

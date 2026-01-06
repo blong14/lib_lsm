@@ -15,6 +15,9 @@ const math = std.math;
 const mem = std.mem;
 const testing = std.testing;
 
+const xio = @import("io.zig");
+const Block = @import("Block.zig");
+
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const AtomicValue = atomic.Value;
@@ -42,11 +45,43 @@ pub const Database = struct {
     opts: Opts,
 
     // in-memory
+    state: State,
     memory: AtomicValue(*Memtable),
 
     // on disk
     wal: *WAL,
     io: *SSTableStore,
+
+    state_lease: std.Thread.RwLock = .{},
+
+    const State = struct {
+        lock: std.Thread.RwLock = .{},
+        memtable: *Memtable = undefined,
+        mem_cache: *std.ArrayList(*const Memtable) = undefined,
+        wal: *WAL = undefined,
+
+        fn freeze(state: State) void {
+            return state.lock.lock();
+        }
+
+        fn acquire(state: State) bool {
+            state.lock.tryLockShared();
+        }
+
+        fn release(state: State) void {
+            state.lock.unlockShared();
+        }
+    };
+
+    const Transaction = struct {
+        fn transaction(state: State) ?State {
+            if (state.acquire()) {
+                return state;
+            } else {
+                return null;
+            }
+        }
+    }.transaction;
 
     const Self = @This();
 
@@ -84,6 +119,7 @@ pub const Database = struct {
             .wal = wal,
             .memory = AtomicValue(*Memtable).init(memory),
             .io = io,
+            .state = .{},
         };
 
         return db;
@@ -144,15 +180,50 @@ pub const Database = struct {
     pub fn shutdown(self: *Self, alloc: Allocator) !void {
         const memory = self.memory.load(.seq_cst);
         if (!memory.flushed() and memory.size() > 0) {
+            var count: u64 = 0;
+
             var file_path_buf: [256]u8 = undefined;
             const file_path = try std.fmt.bufPrint(
                 &file_path_buf,
-                "{s}/memtable_{s}.mtab",
-                .{ self.opts.data_dir, memory.getId() },
+                "{s}/memtable_{d}_{s}.mtab",
+                .{ self.opts.data_dir, count, memory.getId() },
             );
 
+            var stream = try xio.stream(file_path, self.opts.sst_capacity);
+            defer xio.close(stream);
+
+            var block: Block = .init(stream, .{ .max_offset_bytes = @divTrunc(self.opts.sst_capacity, 4) });
+
+            var it = try memory.iterator(alloc);
+            defer it.deinit();
+
+            while (it.next()) |nxt| {
+                _ = block.write(nxt) catch |err| switch (err) {
+                    error.NoSpaceLeft, error.NoOffsetSpaceLeft => {
+                        xio.close(stream);
+
+                        count += 1;
+
+                        var nxt_file_path_buf: [256]u8 = undefined;
+                        const nxt_file_path = try std.fmt.bufPrint(
+                            &nxt_file_path_buf,
+                            "{s}/memtable_{d}_{s}.mtab",
+                            .{ self.opts.data_dir, count, memory.getId() },
+                        );
+
+                        stream = try xio.stream(nxt_file_path, self.opts.sst_capacity);
+
+                        block = .init(stream.?, .{ .max_offset_bytes = @divTrunc(self.opts.sst_capacity, 4) });
+
+                        _ = try block.write(nxt);
+
+                        continue;
+                    },
+                    else => return err,
+                };
+            }
+
             memory.flush();
-            try memory.serializeToDisk(alloc, file_path);
 
             try self.xflush(alloc, memory);
 
@@ -165,9 +236,22 @@ pub const Database = struct {
     pub fn read(self: *Self, key: []const u8) !?KV {
         if (key.len == 0) return null;
 
-        const memory = self.memory.load(.acquire);
-        if (try memory.get(key)) |kv| {
-            return kv;
+        const state: State = blk: {
+            self.state_lease.lockShared();
+            defer self.state_lease.unlockShared();
+            break :blk self.state;
+        };
+
+        if (Transaction(state)) |txn| {
+            defer txn.release();
+
+            if (try txn.memtable.get(key)) |kv| {
+                return kv;
+            }
+
+            if (try txn.mem_cache.get(key)) |kv| {
+                return kv;
+            }
         }
 
         if (try self.io.read(key)) |kv| {
@@ -278,6 +362,44 @@ pub const Database = struct {
         return Iterator(KV).init(wrapper, ScanWrapper.next, ScanWrapper.deinit);
     }
 
+    pub fn cow(self: *Self, alloc: Allocator) !void {
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = try std.fmt.bufPrint(&new_id_buf, "{d}", .{std.time.nanoTimestamp()});
+
+        const memory = try Memtable.init(alloc, new_id);
+        errdefer {
+            memory.deinit(alloc);
+            alloc.destroy(memory);
+        }
+
+        var prev: State = blk: {
+            self.state_lease.lockShared();
+            defer self.state_lease.unlockShared();
+            break :blk self.state;
+        };
+        if (prev.acquire()) {
+            defer prev.release();
+
+            const mem_cache = try prev.mem_cache.clone(alloc);
+            try mem_cache.append(alloc, prev.memtable);
+
+            self.state = blk: {
+                self.state_lease.lock();
+                defer self.state_lease.unlock();
+
+                const nxt: State = .{
+                    .memtable = memory,
+                    .wal = prev.wal,
+                    .mem_cache = mem_cache,
+                };
+
+                try self.states.append(prev);
+
+                break :blk nxt;
+            };
+        }
+    }
+
     pub fn write(self: *Self, kv: KV) anyerror!void {
         if (kv.key.len == 0) {
             return error.InvalidKeyData;
@@ -286,10 +408,18 @@ pub const Database = struct {
             return error.InvalidValueData;
         }
 
-        try self.wal.write(allocator, kv);
+        const state: State = blk: {
+            self.state_lease.lockShared();
+            defer self.state_lease.unlockShared();
+            break :blk self.state;
+        };
 
-        const mtable = self.memory.load(.seq_cst);
-        try mtable.put(kv);
+        if (Transaction(state)) |txn| {
+            defer txn.release();
+
+            try txn.wal.write(allocator, kv);
+            try txn.memtable.put(kv);
+        }
     }
 
     pub fn memtableCount(self: *Self) usize {

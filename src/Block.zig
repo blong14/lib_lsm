@@ -1,9 +1,10 @@
 const std = @import("std");
 
-const Allocator = std.mem.Allocator;
+const iter = @import("iterator.zig");
 
-const kv = @import("kv.zig");
-const KV = kv.KV;
+const Allocator = std.mem.Allocator;
+const Iterator = iter.Iterator;
+const KV = @import("KV.zig");
 
 const writeInt = std.mem.writeInt;
 const readInt = std.mem.readInt;
@@ -16,8 +17,10 @@ const Endian = std.builtin.Endian.little;
 total: []u8,
 offsets: []u8,
 data: []u8,
+
 /// Current position for writing
-pos: usize = 0,
+pos: usize,
+
 /// Total count of kv pairs
 count: u64 = 0,
 
@@ -28,13 +31,14 @@ pub fn init(
         max_offset_bytes: ?u64 = null,
         max_data_bytes: ?u64 = null,
     },
-) !Block {
+) Block {
     const max_offset_bytes = opts.max_offset_bytes orelse 4096;
     const max_data_bytes = opts.max_data_bytes orelse buffer.len;
     return .{
         .total = buffer[0..@sizeOf(u64)],
         .offsets = buffer[@sizeOf(u64)..max_offset_bytes],
         .data = buffer[max_offset_bytes..max_data_bytes],
+        .pos = max_offset_bytes,
     };
 }
 
@@ -54,7 +58,10 @@ pub fn read(self: *const Block, index: usize) !KV {
         return error.InvalidOffset;
     }
 
-    return kv.decode(self.data[kv_offset..]) catch error.CorruptedData;
+    var kv: KV = undefined;
+    try kv.decode(self.data[kv_offset..]);
+
+    return kv;
 }
 
 /// Read the first KV pair
@@ -75,7 +82,7 @@ pub fn last(self: *const Block) !?KV {
 pub fn write(self: *Block, item: KV) !usize {
     const offset_size = @sizeOf(u64);
     if ((self.count + 1) * offset_size > self.offsets.len) {
-        return error.NoSpaceLeft;
+        return error.NoOffsetSpaceLeft;
     }
 
     const kv_size = item.len();
@@ -83,16 +90,15 @@ pub fn write(self: *Block, item: KV) !usize {
         return error.NoSpaceLeft;
     }
 
-    _ = try item.encode(self.data[self.pos..][0..kv_size]);
+    @memcpy(self.data[self.pos..][0..kv_size], item.raw_bytes);
 
     const offset_pos = self.count * offset_size;
     writeInt(u64, self.offsets[offset_pos..][0..offset_size], self.pos, Endian);
 
-    const index = self.pos;
-
     // Advance our position for the next write
     self.pos += kv_size;
 
+    const index = self.count;
     self.count += 1;
     writeInt(u64, self.total[0..@sizeOf(u64)], self.count, Endian);
 
@@ -109,18 +115,51 @@ pub fn size(self: Block) usize {
     return self.pos + (self.count * @sizeOf(u64));
 }
 
+const BlockIterator = struct {
+    alloc: Allocator,
+    block: *const Block = undefined,
+    nxt: usize = 0,
+
+    pub fn deinit(ctx: *anyopaque) void {
+        const self: *BlockIterator = @ptrCast(@alignCast(ctx));
+        self.alloc.destroy(self);
+    }
+
+    pub fn next(ctx: *anyopaque) ?KV {
+        const self: *BlockIterator = @ptrCast(@alignCast(ctx));
+
+        var nxt: ?KV = null;
+        if (self.nxt < self.block.len()) {
+            nxt = self.block.read(self.nxt) catch |err| {
+                std.log.err("sstable iter error {s}", .{@errorName(err)});
+                return null;
+            };
+
+            self.*.nxt += 1;
+        }
+
+        return nxt;
+    }
+};
+
+pub fn iterator(self: *Block, alloc: Allocator) !Iterator(KV) {
+    const it = try alloc.create(BlockIterator);
+    it.* = .{ .alloc = alloc, .block = self };
+    return Iterator(KV).init(it, BlockIterator.next, BlockIterator.deinit);
+}
+
 test "Block basic operations" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const PageSize = std.heap.pageSize();
 
     var buffer: [PageSize]u8 align(PageSize) = undefined;
-    var test_block = try Block.init(&buffer, .{});
+    var test_block: Block = .init(&buffer, .{ .max_offset_bytes = 1000 });
 
-    var kv1 = try KV.initOwned(allocator, "key1", "value1");
+    var kv1 = try KV.init(allocator, "key1", "value1");
     defer kv1.deinit(allocator);
 
-    var kv2 = try KV.initOwned(allocator, "key2", "value2");
+    var kv2 = try KV.init(allocator, "key2", "value2");
     defer kv2.deinit(allocator);
 
     // Test writing

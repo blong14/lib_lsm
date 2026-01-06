@@ -13,3 +13,4 @@ massif.o
 *.txt
 perf.*
 .tmp/*
+.env
