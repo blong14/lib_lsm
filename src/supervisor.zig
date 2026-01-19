@@ -245,6 +245,8 @@ pub const DatabaseSupervisor = struct {
             const event = self.event_queue.orderedRemove(0);
             switch (event) {
                 .write_completed => |data| {
+                    // std.log.debug("write_completed", .{});
+
                     self.considerFlushingMemtable(data.bytes);
                 },
                 .sstable_created => |data| {
@@ -258,7 +260,7 @@ pub const DatabaseSupervisor = struct {
                     _ = data;
                 },
                 .read_completed => |data| {
-                    std.log.debug("read_completed", .{});
+                    // std.log.debug("read_completed", .{});
 
                     _ = data;
                 },

@@ -24,14 +24,13 @@ pub fn init(alloc: Allocator, key: []const u8, value: []const u8) !KV {
     };
 
     const raw = try kv.encodeAlloc(alloc);
-    errdefer alloc.free(raw);
 
     const key_start = @sizeOf(u64);
     const value_start = @sizeOf(u64) + key.len + @sizeOf(i128) + @sizeOf(u64);
 
     return .{
-        .key = raw[key_start .. key_start + key.len],
-        .value = raw[value_start .. value_start + value.len],
+        .key = raw[key_start..][0..key.len],
+        .value = raw[value_start..][0..value.len],
         .raw_bytes = raw,
         .timestamp = kv.timestamp,
     };
@@ -51,8 +50,8 @@ pub fn clone(self: KV, alloc: Allocator) !KV {
     const value_start = @sizeOf(u64) + self.key.len + @sizeOf(i128) + @sizeOf(u64);
 
     return .{
-        .key = raw[key_start .. key_start + self.key.len],
-        .value = raw[value_start .. value_start + self.value.len],
+        .key = raw[key_start..][0..self.key.len],
+        .value = raw[value_start..][0..self.value.len],
         .raw_bytes = raw,
         .timestamp = self.timestamp,
     };

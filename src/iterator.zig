@@ -80,7 +80,7 @@ pub fn MergeIterator(
         pub fn init(allocator: std.mem.Allocator) !Self {
             return Self{
                 .allocator = allocator,
-                .iterators = try std.ArrayList(Iterator(T)).initCapacity(allocator, 4096),
+                .iterators = try std.ArrayList(Iterator(T)).initCapacity(allocator, 8),
                 .queue = PriorityQueue.init(allocator, {}),
                 .compareFn = compareFn,
             };

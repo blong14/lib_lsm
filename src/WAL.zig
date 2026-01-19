@@ -134,7 +134,7 @@ pub fn init(alloc: Allocator, conf: WalConfig) !WAL {
 
     active_segment.* = try Segment.init(alloc, 1, conf);
 
-    const segments = try std.ArrayList(*Segment).initCapacity(alloc, 256);
+    const segments = try std.ArrayList(*Segment).initCapacity(alloc, 4);
 
     return .{
         .conf = conf,

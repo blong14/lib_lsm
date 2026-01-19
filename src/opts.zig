@@ -22,6 +22,7 @@ pub fn defaultOpts() Opts {
         // TODO: temp
         .sst_capacity = 256 * MB,
         // .sst_capacity = 16 * MB,
+        // .sst_capacity = 4 * KB,
         .wal_capacity = PageSize * PageSize,
         .num_levels = 3,
         // .compaction_strategy = .simple,
