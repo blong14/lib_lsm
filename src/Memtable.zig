@@ -96,12 +96,11 @@ pub fn iterator(self: *Memtable, alloc: Allocator) !Iterator(KV) {
 pub fn serialize(self: *Memtable, alloc: Allocator, file_path: []const u8) !void {
     if (self.size() == 0) return;
 
-    const file = try std.fs.cwd().createFile(file_path, .{});
-    defer file.close();
-
-    var buffer: [1024]u8 = undefined;
-    var writer = file.writer(&buffer).interface;
-    defer writer.flush() catch {};
+    const file = try std.fs.cwd().createFile(file_path, .{ .read = true });
+    defer {
+        file.sync() catch undefined;
+        file.close();
+    }
 
     const header = Header{
         .magic = MEMTABLE_MAGIC,
@@ -109,30 +108,38 @@ pub fn serialize(self: *Memtable, alloc: Allocator, file_path: []const u8) !void
         .id_len = @sizeOf(u64),
         .byte_count = self.size(),
     };
+    _ = try file.write(std.mem.asBytes(&header));
 
-    try writer.writeAll(std.mem.asBytes(&header));
-    try writer.writeSliceEndian(u8, std.mem.asBytes(&self.id), Endian);
-    try writer.writeSliceEndian(u8, std.mem.asBytes(&self.index.count), Endian);
+    var id_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &id_buf, self.id, Endian);
+    _ = try file.write(&id_buf);
+
+    var count_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_buf, self.index.count, Endian);
+    _ = try file.write(&count_buf);
 
     var it = try self.iterator(alloc);
     defer it.deinit();
 
     while (it.next()) |nxt| {
-        try writer.writeSliceEndian(u8, std.mem.asBytes(&nxt.len()), Endian);
-        try writer.writeAll(nxt.raw_bytes);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, nxt.len(), Endian);
+        _ = try file.write(&buf);
+
+        _ = try file.write(nxt.raw_bytes);
     }
 }
 
 pub fn deserialize(self: *Memtable, alloc: Allocator, file_path: []const u8) !void {
-    _ = alloc;
-    const file = try std.fs.cwd().openFile(file_path, .{});
+    const file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
     defer file.close();
 
-    var buffer: [1024]u8 = undefined;
-    var reader = file.reader(&buffer).interface;
+    const stat = try file.stat();
+
+    std.log.debug("opening {s} stat {d}", .{ file_path, stat.size });
 
     var header: Header = undefined;
-    try reader.readSliceAll(std.mem.asBytes(&header));
+    _ = try file.read(std.mem.asBytes(&header));
 
     if (header.magic != MEMTABLE_MAGIC) {
         return error.InvalidMemtableFile;
@@ -142,25 +149,42 @@ pub fn deserialize(self: *Memtable, alloc: Allocator, file_path: []const u8) !vo
         return error.UnsupportedMemtableVersion;
     }
 
-    try reader.readSliceEndian(u8, std.mem.asBytes(&self.id), Endian);
+    var id_buf: [8]u8 = undefined;
+    _ = try file.read(&id_buf);
+
+    self.id = std.mem.readInt(u64, &id_buf, Endian);
 
     self.*.index = try SkipList(KV, decode).init();
 
     self.mutable.store(true, .seq_cst);
 
-    var entry_count: u64 = undefined;
-    try reader.readSliceEndian(u8, std.mem.asBytes(&entry_count), Endian);
+    var entry_buf: [8]u8 = undefined;
+    _ = try file.read(&entry_buf);
+
+    const entry_count = std.mem.readInt(u64, &entry_buf, Endian);
+
+    var kv_len_buf: [8]u8 = undefined;
 
     var i: u32 = 0;
     while (i < entry_count) : (i += 1) {
-        var kv_len: u64 = undefined;
-        try reader.readSliceEndian(u8, std.mem.asBytes(&kv_len), Endian);
+        _ = try file.read(&kv_len_buf);
 
-        var buf: [4096]u8 = undefined;
-        try reader.readSliceAll(&buf);
+        const kv_len = std.mem.readInt(u64, &kv_len_buf, Endian);
+
+        const buf = try alloc.alloc(u8, kv_len);
+        _ = try file.read(buf);
 
         var kv: KV = undefined;
-        try kv.decode(buf[0..kv_len]);
+        kv.decode(buf) catch |err| switch (err) {
+            error.InvalidKeyLength => {
+                std.log.debug(
+                    "invalid key length ({d}), skipping...",
+                    .{kv_len},
+                );
+                continue;
+            },
+            else => return err,
+        };
 
         try self.put(kv);
     }
