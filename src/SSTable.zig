@@ -156,7 +156,7 @@ pub fn openFile(alloc: Allocator, file: File, opts: Opts) !*SSTable {
     sst.*.stream = stream;
     sst.*.block = .init(
         stream[pos..],
-        .{ .max_offset_bytes = data_start },
+        .{ .max_offset_bytes = data_start, .frozen = true },
     );
 
     return sst;

@@ -9,9 +9,17 @@ const KV = @import("KV.zig");
 const writeInt = std.mem.writeInt;
 const readInt = std.mem.readInt;
 
+/// Block represents a fixed-size data structure for storing key-value pairs.
+/// It manages offsets and data in separate buffers for efficient access and storage.
+/// Blocks can be mutable (for writing) or immutable (read-only).
 pub const Block = @This();
 
 const Endian = std.builtin.Endian.little;
+
+const State = enum {
+    Mutable,
+    Immutable,
+};
 
 /// Buffers containing the block data
 total: []u8,
@@ -24,21 +32,27 @@ pos: usize,
 /// Total count of kv pairs
 count: u64 = 0,
 
+/// Tracks whether the underlying buffer can be mutated or not
+state: State,
+
 /// Initialize a new block with the given buffer
 pub fn init(
     buffer: []u8,
     opts: struct {
+        frozen: bool = false,
         max_offset_bytes: ?u64 = null,
         max_data_bytes: ?u64 = null,
     },
 ) Block {
-    const max_offset_bytes = opts.max_offset_bytes orelse 4096;
+    const state: State = if (opts.frozen) .Immutable else .Mutable;
+    const max_offset_bytes = opts.max_offset_bytes orelse buffer.len / 4;
     const max_data_bytes = opts.max_data_bytes orelse buffer.len;
     return .{
         .total = buffer[0..@sizeOf(u64)],
         .offsets = buffer[@sizeOf(u64)..max_offset_bytes],
         .data = buffer[max_offset_bytes..max_data_bytes],
         .pos = max_offset_bytes,
+        .state = state,
     };
 }
 
@@ -80,6 +94,8 @@ pub fn last(self: *const Block) !?KV {
 
 /// Write a KV pair to the block
 pub fn write(self: *Block, item: KV) !usize {
+    if (self.state == State.Immutable) return error.WriteError;
+
     const offset_size = @sizeOf(u64);
     if ((self.count + 1) * offset_size > self.offsets.len) {
         return error.NoOffsetSpaceLeft;
@@ -142,6 +158,7 @@ const BlockIterator = struct {
     }
 };
 
+// Scan all KV pairs in the block
 pub fn iterator(self: *Block, alloc: Allocator) !Iterator(KV) {
     const it = try alloc.create(BlockIterator);
     it.* = .{ .alloc = alloc, .block = self };
@@ -156,10 +173,10 @@ test "Block basic operations" {
     var buffer: [PageSize]u8 align(PageSize) = undefined;
     var test_block: Block = .init(&buffer, .{ .max_offset_bytes = 1000 });
 
-    var kv1 = try KV.init(allocator, "key1", "value1");
+    var kv1: KV = try .init(allocator, "key1", "value1");
     defer kv1.deinit(allocator);
 
-    var kv2 = try KV.init(allocator, "key2", "value2");
+    var kv2: KV = try .init(allocator, "key2", "value2");
     defer kv2.deinit(allocator);
 
     // Test writing
