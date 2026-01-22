@@ -26,12 +26,54 @@ const usage =
     \\-s, --scan             Run the read and scan tests.
     \\-b, --bench            Run the benchmark tests.
     \\-p, --perf             Run the debug perf tests.
+    \\--debug                Run the debug build tests. 
     \\--sst_capacity <usize> Max capacity for an SST block.
     \\
 ;
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
+};
+
+const KVCSV = struct {
+    alloc: Allocator,
+    handle: csv.CsvHandle,
+    idx: usize = 0,
+
+    pub fn init(alloc: Allocator, handle: csv.CsvHandle) KVCSV {
+        return .{
+            .alloc = alloc,
+            .handle = handle,
+        };
+    }
+
+    pub fn deinit(self: *KVCSV) void {
+        self.* = undefined;
+    }
+
+    pub fn next(self: *KVCSV) ?KV {
+        const row = csv.CsvReadNextRow(self.handle) orelse return null;
+
+        const k_raw = csv.CsvReadNextCol(row, self.handle) orelse return null;
+        const k = mem.span(k_raw);
+
+        const value_raw = csv.CsvReadNextCol(row, self.handle) orelse return null;
+        const value = mem.span(value_raw);
+
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}_{d}", .{ k, self.idx }) catch |err| {
+            std.log.err("Failed to format key: {}", .{err});
+            return null;
+        };
+
+        const item = KV.init(self.alloc, key, value) catch |err| {
+            std.log.err("Failed to create KV item: {}", .{err});
+            return null;
+        };
+
+        self.idx += 1;
+        return item;
+    }
 };
 
 pub fn main() !void {
@@ -84,19 +126,24 @@ pub fn main() !void {
     const db = try lsm.init(allocator, opts);
     defer lsm.deinit(allocator, db);
 
-    write(allocator, db, res.args.input.?);
-    read(allocator, db, res.args.input.?);
-    // benchmark(allocator, db);
+    if (res.args.read != 0) {
+        read(allocator, db, res.args.input.?);
+    } else if (res.args.write != 0) {
+        write(allocator, db, res.args.input.?);
+    } else if (res.args.bench != 0) {
+        benchmark(allocator, db);
+    } else if (res.args.perf != 0 or res.args.debug != 0) {
+        write(allocator, db, res.args.input.?);
+        read(allocator, db, res.args.input.?);
+    } else {
+        // Fallback runnable used for simple scanning of the database files.
+        read(allocator, db, res.args.input.?);
+    }
 }
 
 fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
-    const num_ops = 1_000_000;
-    const num_cpus: u64 = std.Thread.getCpuCount() catch 4;
-    const ops_per_thread = num_ops / num_cpus;
+    var success_count: u64 = 0;
 
-    std.log.info("Starting read tests with {d} operations per thread...", .{ops_per_thread});
-
-    // Timing variables
     var timer = std.time.Timer.start() catch unreachable;
     var read_time: u64 = 0;
 
@@ -105,180 +152,26 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
 
     // Used to manage benchmark memory
     const arena_alloc = arena.allocator();
-    const ReadThreadContext = struct {
-        wg: *std.Thread.WaitGroup,
-        thread_id: usize,
-        db: *lsm.Database,
-        alloc: Allocator,
-        items: [][]const u8,
-        success_count: std.atomic.Value(u64),
-        error_count: std.atomic.Value(u64),
-
-        fn init(
-            malloc: Allocator,
-            wg: *std.Thread.WaitGroup,
-            thread_id: usize,
-            database: *lsm.Database,
-            items: [][]const u8,
-        ) @This() {
-            return .{
-                .alloc = malloc,
-                .wg = wg,
-                .thread_id = thread_id,
-                .db = database,
-                .items = items,
-                .success_count = std.atomic.Value(u64).init(0),
-                .error_count = std.atomic.Value(u64).init(0),
-            };
-        }
-    };
-
-    const readWorker = struct {
-        fn read(ctx: *ReadThreadContext) void {
-            ctx.wg.start();
-            defer ctx.wg.finish();
-
-            var success_count: u64 = 0;
-            var error_count: u64 = 0;
-
-            for (ctx.items, 0..) |key, i| {
-                const kv = lsm.read(ctx.db, key) catch |err| {
-                    std.log.err("database read error for key '{s}' (len={d}): {s}", .{
-                        key,
-                        key.len,
-                        @errorName(err),
-                    });
-                    error_count += 1;
-                    continue;
-                };
-
-                if (kv) |_| {
-                    success_count += 1;
-                }
-
-                // Periodically log progress
-                const chunk_size = ctx.items.len / 5;
-                if (chunk_size > 0 and i % chunk_size == 0 and i > 0) {
-                    const progress = i * 100 / ctx.items.len;
-                    std.log.debug("Thread {d} read progress: {d}%", .{
-                        ctx.thread_id,
-                        progress,
-                    });
-                }
-            }
-
-            ctx.success_count.store(success_count, .release);
-            ctx.error_count.store(error_count, .release);
-        }
-    }.read;
-
-    var kvs = std.ArrayList([]const u8).initCapacity(arena_alloc, 4096) catch unreachable;
-    defer kvs.deinit(arena_alloc);
-
-    var threads = std.ArrayList(*ReadThreadContext).initCapacity(arena_alloc, 10) catch unreachable;
-    defer threads.deinit(arena_alloc);
-
-    var wait_group = arena_alloc.create(std.Thread.WaitGroup) catch unreachable;
-    wait_group.reset();
-
-    const Pool = std.Thread.Pool;
-
-    var thread_pool: Pool = undefined;
-    thread_pool.init(Pool.Options{ .allocator = arena_alloc }) catch |err| {
-        debug.print(
-            "threadpool init error {s}\n",
-            .{@errorName(err)},
-        );
-    };
-    defer thread_pool.deinit();
 
     const handle = csv.CsvOpen2(input.ptr, ';', '"', '\\');
     defer csv.CsvClose(handle);
 
-    var thread_id: usize = 0;
+    var it: KVCSV = .init(arena_alloc, handle);
+    defer it.deinit();
 
-    // Start timer and launch threads
-    timer.reset();
-
-    var i: usize = 0;
-    while (csv.CsvReadNextRow(handle)) |row| {
-        if (csv.CsvReadNextCol(row, handle)) |val| {
-            defer i += 1;
-
-            const k = mem.span(val);
-            const key = std.fmt.allocPrint(arena_alloc, "{s}_{d}", .{ k, i }) catch unreachable;
-
-            kvs.append(arena_alloc, key) catch return;
-        }
-
-        if (kvs.items.len >= ops_per_thread) {
-            const items = kvs.toOwnedSlice(arena_alloc) catch |err| {
-                debug.print(
-                    "not able to publish items {s}\n",
-                    .{@errorName(err)},
-                );
-                return;
-            };
-
-            const ctx = arena_alloc.create(ReadThreadContext) catch unreachable;
-            ctx.* = ReadThreadContext.init(arena_alloc, wait_group, thread_id, db, items);
-
-            thread_pool.spawn(readWorker, .{ctx}) catch |err| {
-                debug.print(
-                    "threadpool spawn error {s}\n",
-                    .{@errorName(err)},
-                );
-                return;
-            };
-
-            thread_id += 1;
-            threads.append(arena_alloc, ctx) catch unreachable;
-        }
-    }
-
-    if (kvs.items.len > 0) {
-        const items = kvs.toOwnedSlice(arena_alloc) catch |err| {
-            debug.print(
-                "not able to publish items {s}\n",
-                .{@errorName(err)},
-            );
-            return;
+    while (it.next()) |nxt| {
+        const kv = lsm.read(db, nxt.key) catch |err| {
+            @panic(@errorName(err));
         };
 
-        const ctx = arena_alloc.create(ReadThreadContext) catch unreachable;
-        ctx.* = ReadThreadContext.init(arena_alloc, wait_group, thread_id, db, items);
-
-        thread_pool.spawn(readWorker, .{ctx}) catch |err| {
-            debug.print(
-                "threadpool spawn error {s}\n",
-                .{@errorName(err)},
-            );
-            return;
-        };
-
-        thread_id += 1;
-        threads.append(arena_alloc, ctx) catch unreachable;
+        if (kv) |_| success_count += 1;
     }
-
-    // stutter to make sure threads are schehduled. must be a better way
-    std.Thread.sleep(1000);
-
-    thread_pool.waitAndWork(wait_group);
 
     read_time = timer.read();
 
-    // Calculate total counts
-    var total_success: u64 = 0;
-    var total_errors: u64 = 0;
+    std.log.info("Read phase completed: {d} successful", .{success_count});
 
-    for (threads.items) |ctx| {
-        total_success += ctx.success_count.load(.acquire);
-        total_errors += ctx.error_count.load(.acquire);
-    }
-
-    std.log.info("Read phase completed: {d} workers {d} successful, {d} errors", .{ thread_id, total_success, total_errors });
-
-    const read_ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(read_time)) / std.time.ns_per_s);
+    const read_ops_per_sec = @as(f64, @floatFromInt(success_count)) / (@as(f64, @floatFromInt(read_time)) / std.time.ns_per_s);
 
     std.log.info("Benchmark Results:", .{});
     std.log.info("  Read:  {d:.2} ops/sec ({d:.2} ms total)", .{
@@ -287,14 +180,8 @@ fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
 }
 
 fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
-    const num_ops = 1_000_000;
-    const num_cpus: u64 = std.Thread.getCpuCount() catch 4;
-    const ops_per_thread = num_ops / num_cpus;
-    const write_cnt = ops_per_thread;
+    var success_count: usize = 0;
 
-    std.log.info("Starting write tests with {d} operations per thread...", .{ops_per_thread});
-
-    // Timing variables
     var timer = std.time.Timer.start() catch unreachable;
     var write_time: u64 = 0;
 
@@ -304,187 +191,25 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
     // Used to manage benchmark memory
     const arena_alloc = arena.allocator();
 
-    const ThreadContext = struct {
-        wg: *std.Thread.WaitGroup,
-        thread_id: usize,
-        db: *lsm.Database,
-        alloc: Allocator,
-        items: []const KV,
-        success_count: std.atomic.Value(u64),
-        error_count: std.atomic.Value(u64),
-
-        fn init(
-            malloc: Allocator,
-            wg: *std.Thread.WaitGroup,
-            thread_id: usize,
-            database: *lsm.Database,
-            items: []const KV,
-        ) @This() {
-            return .{
-                .alloc = malloc,
-                .wg = wg,
-                .thread_id = thread_id,
-                .db = database,
-                .items = items,
-                .success_count = std.atomic.Value(u64).init(0),
-                .error_count = std.atomic.Value(u64).init(0),
-            };
-        }
-    };
-
-    const writeWorker = struct {
-        fn work(ctx: *ThreadContext) void {
-            ctx.wg.start();
-            defer ctx.wg.finish();
-
-            var success_count: u64 = 0;
-            var error_count: u64 = 0;
-
-            for (ctx.items, 0..) |kv, i| {
-                lsm.write(ctx.db, kv) catch |err| {
-                    std.log.debug("database write error for key {s} {s}\n", .{
-                        kv.key,
-                        @errorName(err),
-                    });
-                    error_count += 1;
-                    @panic(@errorName(err));
-                };
-
-                success_count += 1;
-
-                // Periodically log progress
-                const chunk_size = ctx.items.len / 5;
-                if (chunk_size > 0 and i % chunk_size == 0 and i > 0) {
-                    const progress = i * 100 / ctx.items.len;
-                    std.log.debug("Thread {d} write progress: {d}%", .{
-                        ctx.thread_id,
-                        progress,
-                    });
-                }
-            }
-
-            ctx.success_count.store(success_count, .release);
-            ctx.error_count.store(error_count, .release);
-        }
-    }.work;
-
-    var threads = std.ArrayList(*ThreadContext).initCapacity(arena_alloc, 10) catch unreachable;
-    defer threads.deinit(arena_alloc);
-
-    var wait_group = arena_alloc.create(std.Thread.WaitGroup) catch unreachable;
-    wait_group.reset();
-
-    const Pool = std.Thread.Pool;
-
-    var thread_pool: Pool = undefined;
-    thread_pool.init(Pool.Options{ .allocator = arena_alloc }) catch |err| {
-        debug.print(
-            "threadpool init error {s}\n",
-            .{@errorName(err)},
-        );
-    };
-    defer thread_pool.deinit();
-
-    var kvs = std.ArrayList(KV).initCapacity(arena_alloc, 4096) catch unreachable;
-    defer kvs.deinit(arena_alloc);
-
     const handle = csv.CsvOpen2(input.ptr, ';', '"', '\\');
     defer csv.CsvClose(handle);
 
-    var thread_id: usize = 0;
+    var it: KVCSV = .init(arena_alloc, handle);
+    defer it.deinit();
 
-    // Start timer and launch threads
-    timer.reset();
-
-    var i: usize = 0;
-    while (csv.CsvReadNextRow(handle)) |row| {
-        defer i += 1;
-        var k: []const u8 = undefined;
-        if (csv.CsvReadNextCol(row, handle)) |val| {
-            k = mem.span(val);
-        } else {
-            break;
-        }
-
-        var value: []const u8 = undefined;
-        if (csv.CsvReadNextCol(row, handle)) |val| {
-            value = mem.span(val);
-        } else {
-            break;
-        }
-
-        const key = std.fmt.allocPrint(arena_alloc, "{s}_{d}", .{ k, i }) catch unreachable;
-
-        const item = KV.init(arena_alloc, key, value) catch unreachable;
-        kvs.append(arena_alloc, item) catch return;
-
-        if (kvs.items.len >= write_cnt) {
-            const items = kvs.toOwnedSlice(arena_alloc) catch |err| {
-                debug.print(
-                    "not able to publish items {s}\n",
-                    .{@errorName(err)},
-                );
-                return;
-            };
-
-            const ctx = arena_alloc.create(ThreadContext) catch unreachable;
-            // pass in original allocator here not the arena
-            ctx.* = ThreadContext.init(alloc, wait_group, thread_id, db, items);
-
-            thread_pool.spawn(writeWorker, .{ctx}) catch |err| {
-                debug.print(
-                    "threadpool spawn error {s}\n",
-                    .{@errorName(err)},
-                );
-                return;
-            };
-
-            thread_id += 1;
-            threads.append(arena_alloc, ctx) catch unreachable;
-        }
-    }
-
-    if (kvs.items.len > 0) {
-        const items = kvs.toOwnedSlice(arena_alloc) catch |err| {
-            debug.print(
-                "not able to publish items {s}\n",
-                .{@errorName(err)},
-            );
-            return;
+    while (it.next()) |nxt| {
+        lsm.write(db, nxt) catch |err| {
+            @panic(@errorName(err));
         };
 
-        const ctx = arena_alloc.create(ThreadContext) catch unreachable;
-        // pass in original allocator here not the arena
-        ctx.* = ThreadContext.init(alloc, wait_group, thread_id, db, items);
-
-        thread_pool.spawn(writeWorker, .{ctx}) catch |err| {
-            debug.print(
-                "threadpool spawn error {s}\n",
-                .{@errorName(err)},
-            );
-            return;
-        };
-
-        threads.append(arena_alloc, ctx) catch unreachable;
-    }
-
-    std.Thread.sleep(1000);
-    thread_pool.waitAndWork(wait_group);
-
-    // Calculate total counts
-    var total_success: u64 = 0;
-    var total_errors: u64 = 0;
-
-    for (threads.items) |ctx| {
-        total_success += ctx.success_count.load(.acquire);
-        total_errors += ctx.error_count.load(.acquire);
+        success_count += 1;
     }
 
     write_time = timer.read();
 
-    std.log.info("Write phase completed: {d} workers {d} successful, {d} errors", .{ thread_id, total_success, total_errors });
+    std.log.info("Write phase completed: {d} successful", .{success_count});
 
-    const write_ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(write_time)) / std.time.ns_per_s);
+    const write_ops_per_sec = @as(f64, @floatFromInt(success_count)) / (@as(f64, @floatFromInt(write_time)) / std.time.ns_per_s);
 
     std.log.info("Benchmark Results:", .{});
     std.log.info("  Write: {d:.2} ops/sec ({d:.2} ms total)", .{
@@ -493,9 +218,14 @@ fn write(alloc: Allocator, db: *lsm.Database, input: []const u8) void {
 }
 
 fn benchmark(alloc: Allocator, db: *lsm.Database) void {
-    const num_ops = 10_000_000;
+    const num_ops = 1_000_000;
 
     std.log.info("Starting benchmark with {d} operations...", .{num_ops});
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const key_alloc = arena.allocator();
 
     var write_time: u64 = 0;
 
@@ -508,7 +238,7 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
         const key = std.fmt.bufPrint(buffer[0..32], "key_{d}", .{i}) catch unreachable;
         const value = std.fmt.bufPrint(buffer[32..], "value_{d}", .{i}) catch unreachable;
 
-        const kv = KV.init(alloc, key, value) catch unreachable;
+        const kv = KV.init(key_alloc, key, value) catch unreachable;
 
         lsm.write(db, kv) catch |err| {
             std.log.debug("database write error for key {s} {s}\n", .{
@@ -520,6 +250,7 @@ fn benchmark(alloc: Allocator, db: *lsm.Database) void {
         };
 
         success_count += 1;
+        _ = arena.reset(.retain_capacity);
     }
 
     write_time = timer.read();
