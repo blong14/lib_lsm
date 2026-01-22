@@ -39,7 +39,9 @@ help:
 	@echo "make fmt            - Format code"
 	@echo "make test           - Run tests"
 	@echo "make run            - Run lsmctl with default options"
-	@echo "make perf           - Run with profiling enabled"
+	@echo "make perf           - Run optimized profiling for Hotspot"
+	@echo "make perf-detailed  - Run comprehensive profiling with more events"
+	@echo "make perf-memory    - Run memory-focused profiling"
 	@echo "make debug          - Run in debug mode"
 	@echo "make help           - Display this help message"
 
@@ -82,14 +84,63 @@ fmt:
 	@$(ZIG) build $(ZIG_COMMON_FLAGS) fmt
 
 perf:
-	rm -rf .tmp/data/*.dat
-	rm -rf .tmp/data/*.mtab
-	perf record --call-graph dwarf -F 200 -g $(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
-		--perf \
-		--input data/measurements.txt \
-		--data_dir $(DATA_DIR) \
-		--sst_capacity $(SST_CAPACITY)
-	# perf script --input=perf.data -F +pid > perf.processed.data
+	rm -rf .tmp/data/*
+	# Optimized perf recording for Hotspot visualization
+	perf record \
+		--call-graph dwarf,65528 \
+		--freq 997 \
+		--event cycles:u,instructions:u,cache-misses:u,branch-misses:u \
+		--sample-cpu \
+		--timestamp \
+		--running-time \
+		--switch-events \
+		--mmap-pages 512 \
+		--output perf-lsm.data \
+		$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+			--bench \
+			--input data/measurements.txt \
+			--data_dir $(DATA_DIR) \
+			--sst_capacity $(SST_CAPACITY)
+	@echo "Perf data saved to perf-lsm.data - open with: hotspot perf-lsm.data"
+
+# Alternative comprehensive profiling with more events
+perf-detailed:
+	rm -rf .tmp/data/*
+	perf record \
+		--call-graph dwarf,65528 \
+		--freq 1997 \
+		--event cycles:u,instructions:u,cache-references:u,cache-misses:u,branch-instructions:u,branch-misses:u,page-faults:u,context-switches:u \
+		--sample-cpu \
+		--timestamp \
+		--running-time \
+		--switch-events \
+		--mmap-pages 1024 \
+		--buildid-all \
+		--output perf-lsm-detailed.data \
+		$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+			--perf \
+			--input data/measurements.txt \
+			--data_dir $(DATA_DIR) \
+			--sst_capacity $(SST_CAPACITY)
+	@echo "Detailed perf data saved to perf-lsm-detailed.data"
+
+# Memory-focused profiling for allocation analysis
+perf-memory:
+	rm -rf .tmp/data/*
+	perf record \
+		--call-graph dwarf,65528 \
+		--freq 997 \
+		--event cycles:u,cache-misses:u,dTLB-load-misses:u,dTLB-store-misses:u \
+		--sample-cpu \
+		--timestamp \
+		--mmap-pages 512 \
+		--output perf-lsm-memory.data \
+		$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
+			--perf \
+			--input data/measurements.txt \
+			--data_dir $(DATA_DIR) \
+			--sst_capacity $(SST_CAPACITY)
+	@echo "Memory-focused perf data saved to perf-lsm-memory.data"
 
 scan:
 	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
@@ -127,19 +178,21 @@ coverage:
 	$(ZIG) build cover $(ZIG_COMMON_FLAGS)
 
 poop: build 
+	rm -rf .tmp/data/data1/* .tmp/data/data2/*
 	./bin/poop \
-		'./$(EXEC) --data_dir .tmp/data/data1 --mode singlethreaded --input data/measurements.txt --sst_capacity 1_000_000' \
-		'./$(EXEC) --data_dir .tmp/data/data2 --mode multithreaded --input data/measurements.txt --sst_capacity 1_000_000'
+		'./$(EXEC) --data_dir .tmp/data/data1 --bench --input data/measurements.txt --sst_capacity 1_000_000' \
+		'./$(EXEC) --data_dir .tmp/data/data2 --write --input data/measurements.txt --sst_capacity 1_000_000'
 
 massif.o: $(EXEC)
+	rm -rf .tmp/data/*.dat .tmp/data/*.mtab
 	# ms_print
 	valgrind --tool=massif --time-unit=B --massif-out-file=$@ \
-		./$(EXEC) --read --data_dir $(DATA_DIR) --input data/measurements.txt
+		./$(EXEC) --bench --data_dir $(DATA_DIR) --input data/measurements.txt
 
 callgrind.o: $(EXEC)
 	# kcachegrind
 	valgrind --tool=callgrind --callgrind-out-file=$@ \
-		./$(EXEC) --read --data_dir $(DATA_DIR) --input data/measurements.txt
+		./$(EXEC) --bench --data_dir $(DATA_DIR) --input data/measurements.txt
 # Debug notes:
 # gdb --tui zig-out/bin/lsm
 # b src/tablemap.zig:76

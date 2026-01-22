@@ -23,11 +23,15 @@ const LsmState = struct {
         state.* = undefined;
     }
 
-    fn freeze(state: *LsmState) void {
-        return state.lock.lock();
+    pub fn freeze(state: *LsmState) void {
+        state.lock.lock();
     }
 
-    fn acquire(state: *LsmState) bool {
+    pub fn unfreeze(state: *LsmState) void {
+        state.lock.unlock();
+    }
+
+    pub fn acquire(state: *LsmState) bool {
         return state.lock.tryLockShared();
     }
 
@@ -72,7 +76,7 @@ pub fn init(alloc: Allocator, o: opts.Opts) !Database {
     return .{
         .Opts = o,
         .state = state,
-        .snapshots = try std.ArrayList(*LsmState).initCapacity(alloc, 256),
+        .snapshots = try std.ArrayList(*LsmState).initCapacity(alloc, 4),
         .wal = wal,
     };
 }
@@ -129,6 +133,7 @@ pub fn close(self: *Database, alloc: Allocator) !void {
     try self.flush(alloc);
 
     self.state_lease.lock();
+    defer self.state_lease.unlock();
 
     var buf = self.state.read_buffer;
     buf.freeze();
@@ -144,12 +149,10 @@ pub fn close(self: *Database, alloc: Allocator) !void {
 }
 
 pub fn transaction(self: *Database) !?*LsmState {
-    const state: *LsmState = blk: {
-        self.state_lease.lockShared();
-        defer self.state_lease.unlockShared();
-        break :blk self.state;
-    };
+    self.state_lease.lockShared();
+    defer self.state_lease.unlockShared();
 
+    const state = self.state;
     if (state.acquire()) {
         return state;
     } else {
@@ -236,7 +239,6 @@ pub fn flush(self: *Database, alloc: Allocator) !void {
         defer self.state_lease.unlock();
 
         prev.freeze();
-
         prev.write_buffer.freeze();
 
         const nxt = try alloc.create(LsmState);
@@ -293,12 +295,10 @@ pub fn iterator(self: *Database, alloc: Allocator) !Iterator(KV) {
 
     merger.* = try iter.MergeIterator(KV, compare).init(alloc);
 
-    const state: *LsmState = blk: {
-        self.state_lease.lockShared();
-        defer self.state_lease.unlockShared();
-        break :blk self.state;
-    };
+    self.state_lease.lockShared();
+    defer self.state_lease.unlockShared();
 
+    const state = self.state;
     if (state.acquire()) {
         var hot_iter = try state.write_buffer.iterator(alloc);
         errdefer hot_iter.deinit();
@@ -380,15 +380,18 @@ pub fn scan(
 
 test "KV compare" {
     const Order = std.math.Order;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
 
-    const alloc = arena.allocator();
+    const alloc = std.testing.allocator;
 
     // given
-    const kv1 = try KV.init(alloc, "key1", "value1");
-    const kv2 = try KV.init(alloc, "key2", "value2");
+    var kv1 = try KV.init(alloc, "key1", "value1");
+    defer kv1.deinit(alloc);
+
+    var kv2 = try KV.init(alloc, "key2", "value2");
+    defer kv2.deinit(alloc);
+
     var kv3 = try KV.init(alloc, "key1", "different_value");
+    defer kv3.deinit(alloc);
     kv3.timestamp = kv1.timestamp + 1;
 
     // then
