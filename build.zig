@@ -145,6 +145,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         }),
+        .use_llvm = true,
     });
     lib.step.dependOn(&rust.step);
     lib.step.dependOn(&lsm_headers.step);

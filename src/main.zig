@@ -26,8 +26,10 @@ const usage =
     \\-s, --scan             Run the read and scan tests.
     \\-b, --bench            Run the benchmark tests.
     \\-p, --perf             Run the debug perf tests.
-    \\--debug                Run the debug build tests. 
+    \\--debug                Run the debug build tests.
     \\--sst_capacity <usize> Max capacity for an SST block.
+    \\--scan_start <str>     Start key for scan operation.
+    \\--scan_end <str>       End key for scan operation.
     \\
 ;
 
@@ -130,6 +132,10 @@ pub fn main() !void {
         read(allocator, db, res.args.input.?);
     } else if (res.args.write != 0) {
         write(allocator, db, res.args.input.?);
+    } else if (res.args.scan != 0) {
+        const start_key = res.args.scan_start orelse "Atlanta";
+        const end_key = res.args.scan_end orelse "New York";
+        scan(allocator, db, start_key, end_key);
     } else if (res.args.bench != 0) {
         benchmark(allocator, db);
     } else if (res.args.perf != 0 or res.args.debug != 0) {
@@ -137,8 +143,29 @@ pub fn main() !void {
         read(allocator, db, res.args.input.?);
     } else {
         // Fallback runnable used for simple scanning of the database files.
-        read(allocator, db, res.args.input.?);
+        const start_key = res.args.scan_start orelse "Atlanta";
+        const end_key = res.args.scan_end orelse "New York";
+        scan(allocator, db, start_key, end_key);
     }
+}
+
+fn scan(alloc: Allocator, db: *lsm.Database, start_key: []const u8, end_key: []const u8) void {
+    var timer = std.time.Timer.start() catch unreachable;
+    var read_time: u64 = 0;
+
+    var it = db.scan(alloc, start_key, end_key) catch unreachable;
+    defer it.deinit();
+
+    var i: usize = 0;
+    while (it.next()) |nxt| {
+        i += 1;
+        std.log.info("{d}) {s} {s}", .{ i, nxt.key, nxt.value });
+    }
+
+    read_time = timer.read();
+    const total_time = @as(f64, @floatFromInt(read_time)) / std.time.ns_per_s;
+
+    std.log.info("\n---\n\t[{d:.2} ms] total rows {d}", .{ total_time, i });
 }
 
 fn read(alloc: Allocator, db: *lsm.Database, input: []const u8) void {

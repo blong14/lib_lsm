@@ -39,6 +39,7 @@ help:
 	@echo "make fmt            - Format code"
 	@echo "make test           - Run tests"
 	@echo "make run            - Run lsmctl with default options"
+	@echo "make scan START END - Run scan operation with custom start and end keys"
 	@echo "make perf           - Run optimized profiling for Hotspot"
 	@echo "make perf-detailed  - Run comprehensive profiling with more events"
 	@echo "make perf-memory    - Run memory-focused profiling"
@@ -67,11 +68,14 @@ go: $(SOURCES)
 	$(ZIG) build $(ZIG_RELEASE_OPTS) $(ZIG_COMMON_FLAGS) go
 
 # Development targets
-.PHONY: clean debug fmt perf write read scan test 
+.PHONY: clean setup debug fmt perf write read scan test 
 clean:
 	@$(ZIG) build uninstall $(ZIG_COMMON_FLAGS)
 	@$(GO) clean -cache -v
 	@rm -rf $(BUILD_OUT) $(BUILD_CACHE)
+
+setup:
+	rm -rf .tmp/data/*
 
 debug:
 	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
@@ -83,8 +87,7 @@ debug:
 fmt:
 	@$(ZIG) build $(ZIG_COMMON_FLAGS) fmt
 
-perf:
-	rm -rf .tmp/data/*
+perf: setup
 	# Optimized perf recording for Hotspot visualization
 	perf record \
 		--call-graph dwarf,65528 \
@@ -97,15 +100,14 @@ perf:
 		--mmap-pages 512 \
 		--output perf-lsm.data \
 		$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
-			--bench \
+			--perf \
 			--input data/measurements.txt \
 			--data_dir $(DATA_DIR) \
 			--sst_capacity $(SST_CAPACITY)
 	@echo "Perf data saved to perf-lsm.data - open with: hotspot perf-lsm.data"
 
 # Alternative comprehensive profiling with more events
-perf-detailed:
-	rm -rf .tmp/data/*
+perf-detailed: setup
 	perf record \
 		--call-graph dwarf,65528 \
 		--freq 1997 \
@@ -126,7 +128,6 @@ perf-detailed:
 
 # Memory-focused profiling for allocation analysis
 perf-memory:
-	rm -rf .tmp/data/*
 	perf record \
 		--call-graph dwarf,65528 \
 		--freq 997 \
@@ -144,9 +145,16 @@ perf-memory:
 
 scan:
 	$(ZIG) build $(ZIG_DEBUG_OPTS) lsmctl -- \
+		--scan \
+		--scan_start "$(word 2,$(MAKECMDGOALS))" \
+		--scan_end "$(word 3,$(MAKECMDGOALS))" \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
+
+# Prevent make from interpreting the scan arguments as targets
+%:
+	@:
 read:
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--read \
@@ -154,18 +162,14 @@ read:
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 
-write:
-	rm -rf .tmp/data/*.dat
-	rm -rf .tmp/data/*.mtab
+write: setup
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--write \
 		--input data/measurements.txt \
 		--data_dir $(DATA_DIR) \
 		--sst_capacity $(SST_CAPACITY)
 
-bench:
-	rm -rf .tmp/data/*.dat
-	rm -rf .tmp/data/*.mtab
+bench: setup
 	$(ZIG) build $(ZIG_RELEASE_OPTS) lsmctl -- \
 		--bench \
 		--input data/measurements.txt \
@@ -183,13 +187,12 @@ poop: build
 		'./$(EXEC) --data_dir .tmp/data/data1 --bench --input data/measurements.txt --sst_capacity 1_000_000' \
 		'./$(EXEC) --data_dir .tmp/data/data2 --write --input data/measurements.txt --sst_capacity 1_000_000'
 
-massif.o: $(EXEC)
-	rm -rf .tmp/data/*.dat .tmp/data/*.mtab
+massif.o: setup $(EXEC)
 	# ms_print
 	valgrind --tool=massif --time-unit=B --massif-out-file=$@ \
 		./$(EXEC) --bench --data_dir $(DATA_DIR) --input data/measurements.txt
 
-callgrind.o: $(EXEC)
+callgrind.o: setup $(EXEC)
 	# kcachegrind
 	valgrind --tool=callgrind --callgrind-out-file=$@ \
 		./$(EXEC) --bench --data_dir $(DATA_DIR) --input data/measurements.txt
