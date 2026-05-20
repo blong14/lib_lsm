@@ -1,4 +1,4 @@
-FROM debian:bookworm AS builder
+FROM debian:bookworm-20260518 AS builder
 
 ARG GO_VERSION=1.24.2
 ARG RUST_VERSION=1.86.0
