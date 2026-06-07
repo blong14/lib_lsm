@@ -46,6 +46,12 @@ pub const Segment = struct {
     const Self = @This();
 
     pub fn init(alloc: Allocator, id: u64, conf: WalConfig) !Self {
+        // Ensure directory exists
+        std.fs.cwd().makePath(conf.Dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
         const wal_path = try std.fmt.allocPrint(
             alloc,
             "{s}/wal_{d}.dat",
@@ -53,21 +59,40 @@ pub const Segment = struct {
         );
         defer alloc.free(wal_path);
 
-        const wal_file = try std.fs.cwd().createFile(wal_path, .{ .read = true, .truncate = false });
+        const wal_file = std.fs.cwd().createFile(wal_path, .{ .read = true, .truncate = false }) catch |err| {
+            var buffer: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buffer,
+                "*Dir - {s} err - {s}",
+                .{ wal_path, @errorName(err) },
+            ) catch unreachable;
+
+            @panic(msg);
+        };
+
         try wal_file.setEndPos(conf.Segment.MaxStoreBytes);
         errdefer wal_file.close();
 
         const stat = try wal_file.stat();
         const file_size = stat.size;
 
-        const stream: []align(std.heap.page_size_min) u8 = try std.posix.mmap(
+        const stream: []align(std.heap.page_size_min) u8 = std.posix.mmap(
             null,
             file_size,
             std.posix.PROT.READ | std.posix.PROT.WRITE,
             .{ .TYPE = .SHARED, .ANONYMOUS = false },
             wal_file.handle,
             0,
-        );
+        ) catch |err| {
+            var buffer: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buffer,
+                "*Dir - {s} err - {s}",
+                .{ wal_path, @errorName(err) },
+            ) catch unreachable;
+
+            @panic(msg);
+        };
         errdefer std.posix.munmap(stream);
 
         const max_offset = @divTrunc(conf.Segment.MaxStoreBytes, 4);
@@ -235,10 +260,11 @@ test WAL {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    const test_dir = testing.tmpDir(.{});
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+
     const pathname = try test_dir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(pathname);
-    defer test_dir.dir.deleteTree(pathname) catch {};
 
     // given
     var st = try WAL.init(alloc, .{ .Dir = pathname });
