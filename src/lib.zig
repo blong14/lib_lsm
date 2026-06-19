@@ -11,8 +11,6 @@ const Iterator = iter.Iterator;
 
 var allocator = std.heap.smp_allocator;
 
-var supervisor: *DatabaseSupervisor = undefined;
-
 // Public Interface
 
 pub const Opts = opt.Opts;
@@ -38,17 +36,27 @@ pub fn init(alloc: Allocator, opts: Opts) !*Database {
 
     try db.open(alloc);
 
-    supervisor = try DatabaseSupervisor.init(alloc, db, .{});
-    try supervisor.start();
+    const supervisor_ptr = try DatabaseSupervisor.init(alloc, db, .{});
+    errdefer {
+        supervisor_ptr.deinit();
+        alloc.destroy(supervisor_ptr);
+    }
+
+    try supervisor_ptr.start();
+    db.supervisor = supervisor_ptr;
 
     return db;
 }
 
 pub fn deinit(alloc: Allocator, db: *Database) void {
-    supervisor.stop();
-    supervisor.deinit();
+    if (db.supervisor) |sup| {
+        sup.stop();
+        sup.deinit();
+        alloc.destroy(sup);
+        db.supervisor = null;
+    }
 
-    db.close(alloc) catch unreachable;
+    db.close(alloc) catch |err| @panic(@errorName(err));
     db.deinit(alloc);
     alloc.destroy(db);
 }
@@ -58,7 +66,9 @@ pub fn read(db: *Database, key: []const u8) !?KV {
         error.InvalidLsmState => return read(db, key),
         else => return err,
     }) |value| {
-        supervisor.submitEvent(.{ .read_completed = .{ .bytes = value.len() } });
+        if (db.supervisor) |sup| {
+            sup.submitEvent(.{ .read_completed = .{ .bytes = value.len() } });
+        }
         return value;
     }
 
@@ -70,14 +80,16 @@ pub fn write(db: *Database, kv: KV) !void {
         error.InvalidLsmState => return write(db, kv),
         else => return err,
     };
-    supervisor.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+    if (db.supervisor) |sup| {
+        sup.submitEvent(.{ .write_completed = .{ .bytes = kv.len() } });
+    }
 }
 
 // Public C Interface
 
 export fn lsm_init() ?*anyopaque {
     const opts = defaultOpts();
-    return init(allocator, opts) catch return null;
+    return init(allocator, opts) catch |err| @panic(@errorName(err));
 }
 
 export fn lsm_init_with_config(addr: *anyopaque) ?*anyopaque {
@@ -142,10 +154,15 @@ export fn lsm_scan(addr: *anyopaque, start_key: [*c]const u8, end_key: [*c]const
 export fn lsm_iter_next(addr: *anyopaque) [*c]const u8 {
     const it: *Iterator(KV) = @ptrCast(@alignCast(addr));
     if (it.next()) |nxt| {
-        if (nxt.value.len == 0) return null;
+        const json_str = std.json.Stringify.valueAlloc(
+            allocator,
+            .{ .key = nxt.key, .value = nxt.value },
+            .{},
+        ) catch return null;
+        defer allocator.free(json_str);
 
-        const c_str = allocator.allocSentinel(u8, nxt.value.len, 0) catch return null;
-        @memcpy(c_str, nxt.value);
+        const c_str = allocator.allocSentinel(u8, json_str.len, 0) catch return null;
+        @memcpy(c_str, json_str);
 
         return c_str.ptr;
     }
@@ -245,15 +262,15 @@ test "C interface lsm_scan" {
     const scanner = lsm_scan(&db, "__1__", "__3__");
 
     try std.testing.expectEqualStrings(
-        "__key_1__",
+        "{\"key\":\"__1__\",\"value\":\"__key_1__\"}",
         std.mem.span(lsm_iter_next(scanner.?)),
     );
     try std.testing.expectEqualStrings(
-        "__key_2__",
+        "{\"key\":\"__2__\",\"value\":\"__key_2__\"}",
         std.mem.span(lsm_iter_next(scanner.?)),
     );
     try std.testing.expectEqualStrings(
-        "__key_3__",
+        "{\"key\":\"__3__\",\"value\":\"__key_3__\"}",
         std.mem.span(lsm_iter_next(scanner.?)),
     );
     try std.testing.expectEqual(null, lsm_iter_next(scanner.?));

@@ -2,9 +2,10 @@ const std = @import("std");
 
 const opts = @import("opts.zig");
 const iter = @import("iterator.zig");
+const sup = @import("supervisor.zig");
 
 const Allocator = std.mem.Allocator;
-
+const DatabaseSupervisor = sup.DatabaseSupervisor;
 const KV = @import("KV.zig");
 const Memtable = @import("Memtable.zig");
 const WAL = @import("WAL.zig");
@@ -45,6 +46,7 @@ state_lease: std.Thread.RwLock = .{},
 state: *LsmState,
 snapshots: std.ArrayList(*LsmState),
 wal: *WAL,
+supervisor: ?*DatabaseSupervisor = null,
 
 const Database = @This();
 
@@ -99,8 +101,8 @@ pub fn deinit(self: *Database, alloc: Allocator) void {
 
 pub fn open(self: *Database, alloc: Allocator) !void {
     const data_dir = try std.fs.cwd().openDir(self.Opts.data_dir, .{ .iterate = true });
-    var dir_iter = data_dir.iterate();
 
+    var dir_iter = data_dir.iterate();
     while (try dir_iter.next()) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".mtab")) {
             var file_path_buf: [256]u8 = undefined;
@@ -110,18 +112,23 @@ pub fn open(self: *Database, alloc: Allocator) !void {
                 .{ self.Opts.data_dir, entry.name },
             );
 
-            var read_buffer = try alloc.create(Memtable);
-            read_buffer.deserialize(alloc, file_path) catch |err|
-                @panic(@errorName(err));
+            var new_read_buffer = try alloc.create(Memtable);
+            errdefer alloc.destroy(new_read_buffer);
+
+            try new_read_buffer.deserialize(alloc, file_path);
 
             self.state_lease.lock();
-            self.state.read_buffer = read_buffer;
+
+            self.state.read_buffer.deinit();
+            alloc.destroy(self.state.read_buffer);
+
+            self.state.read_buffer = new_read_buffer;
             self.state_lease.unlock();
 
-            std.log.info("serialized memtable {d} from {s} w/ {d} bytes", .{
-                read_buffer.getId(),
+            std.log.info("deserialized memtable {d} from {s} w/ {d} bytes", .{
+                new_read_buffer.getId(),
                 file_path,
-                read_buffer.size(),
+                new_read_buffer.size(),
             });
 
             break;
@@ -136,8 +143,6 @@ pub fn close(self: *Database, alloc: Allocator) !void {
     defer self.state_lease.unlock();
 
     var buf = self.state.read_buffer;
-    buf.freeze();
-    buf.flush();
 
     var buffer: [256]u8 = undefined;
     const file_path = std.fmt.bufPrint(&buffer, "{s}/memtable_{d}.mtab", .{
@@ -146,6 +151,12 @@ pub fn close(self: *Database, alloc: Allocator) !void {
     }) catch unreachable;
 
     try buf.serialize(alloc, file_path);
+
+    std.log.info("serialized memtable {d} to {s} w/ {d} bytes", .{
+        buf.getId(),
+        file_path,
+        buf.size(),
+    });
 }
 
 pub fn transaction(self: *Database) !?*LsmState {
@@ -324,21 +335,17 @@ pub fn iterator(self: *Database, alloc: Allocator) !Iterator(KV) {
 
 const ScanWrapper = struct {
     alloc: Allocator,
-    scanner: *iter.ScanIterator(KV, userKeyCompare),
     it: Iterator(KV),
+    start: KV,
+    end: KV,
 
     const Wrapper = @This();
 
     pub fn deinit(ctx: *anyopaque) void {
         const sw: *Wrapper = @ptrCast(@alignCast(ctx));
+        sw.start.deinit(sw.alloc);
+        sw.end.deinit(sw.alloc);
         sw.it.deinit();
-        if (sw.scanner.start) |start| {
-            @constCast(&start).deinit(sw.alloc);
-        }
-        if (sw.scanner.end) |end| {
-            @constCast(&end).deinit(sw.alloc);
-        }
-        sw.alloc.destroy(sw.scanner);
         sw.alloc.destroy(sw);
     }
 
@@ -360,19 +367,20 @@ pub fn scan(
     var end = try KV.init(alloc, end_key, "");
     errdefer end.deinit(alloc);
 
-    var si = try alloc.create(iter.ScanIterator(KV, userKeyCompare));
-    errdefer alloc.destroy(si);
-
     var base_iter = try self.iterator(alloc);
     errdefer base_iter.deinit();
+
+    const si = try alloc.create(iter.ScanIterator(KV, userKeyCompare));
+    errdefer alloc.destroy(si);
 
     si.* = iter.ScanIterator(KV, userKeyCompare).init(base_iter, start, end);
 
     const wrapper = try alloc.create(ScanWrapper);
     wrapper.* = .{
         .alloc = alloc,
-        .scanner = si,
         .it = si.iterator(),
+        .start = start,
+        .end = end,
     };
 
     return Iterator(KV).init(wrapper, ScanWrapper.next, ScanWrapper.deinit);
